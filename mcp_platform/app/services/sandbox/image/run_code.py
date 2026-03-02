@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
 from importlib.util import spec_from_file_location, module_from_spec
 import io
@@ -87,8 +88,16 @@ def main() -> int:
         write_output(output_path, {"compressed": compressed})
         return 0
 
-    except Exception:
-        write_output(output_path)
+    except Exception as exc:
+        err_trace = traceback.format_exc()
+        try:
+            print(err_trace, file=sys.stderr)
+        except Exception:
+            pass
+        write_output(
+            output_path,
+            {"compressed": [], "error": str(exc), "traceback": err_trace},
+        )
         return 1
 
 

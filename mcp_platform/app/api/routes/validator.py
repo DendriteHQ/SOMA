@@ -417,6 +417,11 @@ async def request_challenge(
             compression_ratios=compression_ratios,
             ttl=timedelta(seconds=settings.sandbox_container_ttl_seconds),
         )
+        compressed_lengths = [len(text or "") for text in compressed_texts]
+        bt.logging.info(
+            "request_challenge: compressed text lengths "
+            f"request_id={request_id} lengths={compressed_lengths}"
+        )
     except RuntimeError as exc:
         if "Platform is at capacity" in str(exc):
             bt.logging.warning(
