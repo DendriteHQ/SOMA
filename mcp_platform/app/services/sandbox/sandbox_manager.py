@@ -331,10 +331,37 @@ class SandboxManager(AbstractSandboxManager):
                                 sandbox.sandbox_id,
                             )
                         raise
+                    status_code = (
+                        result.get("StatusCode") if isinstance(result, dict) else result
+                    )
                     logging.info(
                         "[Sandbox] Container finished with status=%s",
-                        result.get("StatusCode") if isinstance(result, dict) else result,
+                        status_code,
                     )
+                    if status_code not in (0, None):
+                        logs_tail = ""
+                        try:
+                            raw_logs = container.logs(tail=200)
+                            logs_tail = raw_logs.decode("utf-8", errors="replace").strip()
+                        except Exception as exc:
+                            logging.warning(
+                                "[Sandbox] Failed to fetch container logs for %s: %s",
+                                sandbox.sandbox_id,
+                                exc,
+                            )
+                        if logs_tail:
+                            if len(logs_tail) > 2000:
+                                logs_tail = logs_tail[-2000:]
+                            logging.warning(
+                                "[Sandbox] Container exited non-zero status=%s logs_tail=%s",
+                                status_code,
+                                logs_tail,
+                            )
+                        else:
+                            logging.warning(
+                                "[Sandbox] Container exited non-zero status=%s (no logs)",
+                                status_code,
+                            )
                 finally:
                     if container is not None:
                         container.remove(force=True)
@@ -353,6 +380,10 @@ class SandboxManager(AbstractSandboxManager):
                         )
 
                         if isinstance(compressed, list):
+                            if not compressed:
+                                logging.warning(
+                                    "[Sandbox] output.json has empty 'compressed' list"
+                                )
                             for idx, item in enumerate(compressed):
                                 if isinstance(item, list):
                                     item = tuple(item)
@@ -364,7 +395,19 @@ class SandboxManager(AbstractSandboxManager):
                                         text = text_raw[0] if text_raw else ""
                                     else:
                                         text = str(text_raw or "")
+                                    logs_text = ""
+                                    if len(item) >= 2:
+                                        logs_text = str(item[1] or "")
                                     responses.append(text)
+                                    if not text and logs_text:
+                                        logs_preview = " ".join(logs_text.split())
+                                        if len(logs_preview) > 500:
+                                            logs_preview = logs_preview[-500:]
+                                        logging.warning(
+                                            "[Sandbox] Empty output for idx=%s logs=%s",
+                                            idx,
+                                            logs_preview,
+                                        )
                                     logging.info(
                                         "[Sandbox]   Output %s: %s bytes",
                                         idx,
@@ -387,16 +430,31 @@ class SandboxManager(AbstractSandboxManager):
                     logging.warning(
                         "[Sandbox] output.json does not exist at %s", output_path
                     )
+                if not responses:
+                    logging.warning("[Sandbox] No responses parsed from output.json")
 
                 if len(responses) < len(challenge_texts):
                     responses.extend([""] * (len(challenge_texts) - len(responses)))
                 elif len(responses) > len(challenge_texts):
                     responses = responses[: len(challenge_texts)]
+                if responses and all(not resp for resp in responses):
+                    logging.warning(
+                        "[Sandbox] All responses empty after parsing output.json (count=%s)",
+                        len(responses),
+                    )
 
                 for idx, (original, ratio) in enumerate(
                     zip(challenge_texts, compression_ratios)
                 ):
                     if not _is_compressed_enough(original, responses[idx], ratio):
+                        logging.warning(
+                            "[Sandbox] Compression check failed; blanking response "
+                            "idx=%s ratio=%s original_len=%s compressed_len=%s",
+                            idx,
+                            ratio,
+                            len(original or ""),
+                            len(responses[idx] or ""),
+                        )
                         responses[idx] = ""
 
                 return responses
