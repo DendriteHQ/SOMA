@@ -15,8 +15,8 @@ class Sandbox(AbstractSandbox):
         command: List[str],
         created_at: Optional[datetime] = None,
         metadata: Optional[Dict[str, Any]] = None,
-        max_log_entries: int = 256,
-        max_log_line_chars: int = 2048,
+        max_log_entries: int = 1024,
+        max_log_line_chars: int = 8192,
     ):
         super().__init__(sandbox_id, image, command, created_at, metadata)
         self._running = False
