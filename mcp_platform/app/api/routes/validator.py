@@ -58,6 +58,7 @@ from app.api.routes.utils import (
     _get_active_competition_id,
     _get_screener_challenges,
     _get_ratio_count,
+    _is_compressed_enough,
     fetch_miner_challenge_code,
 )
 
@@ -383,9 +384,11 @@ async def request_challenge(
         ) from exc
 
     qa_by_challenge = {}
+    question_ids_by_challenge: dict[int, list[int]] = {}
     for question, answer in qa_pairs:
         if question.challenge_fk not in qa_by_challenge:
             qa_by_challenge[question.challenge_fk] = []
+        question_ids_by_challenge.setdefault(question.challenge_fk, []).append(question.id)
         qa_by_challenge[question.challenge_fk].append(
             QA(
                 question_id=str(question.id),
@@ -460,10 +463,48 @@ async def request_challenge(
             detail="Failed to prepare challenges for miner",
         ) from exc
 
-    # Build challenges list for response
+    # Build challenges list for response and zero-score entries for compression failures
+    zero_score_answers: list[BatchQuestionAnswer] = []
+    zero_score_questions: list[BatchQuestionScore] = []
+    zero_score_rollups: list[BatchChallengeScore] = []
     challenges_response = []
     for idx, (batch_challenge, challenge) in enumerate(response_items):
         compressed_text = compressed_texts[idx] if idx < len(compressed_texts) else ""
+        ratio = (
+            float(batch_challenge.compression_ratio)
+            if batch_challenge.compression_ratio is not None
+            else None
+        )
+        if not _is_compressed_enough(
+            original=challenge.challenge_text or "",
+            compressed=compressed_text,
+            ratio=ratio,
+        ):
+            for question_id in question_ids_by_challenge.get(challenge.id, []):
+                zero_score_answers.append(
+                    BatchQuestionAnswer(
+                        batch_challenge_fk=batch_challenge.id,
+                        question_fk=question_id,
+                        produced_answer="",
+                    )
+                )
+                zero_score_questions.append(
+                    BatchQuestionScore(
+                        batch_challenge_fk=batch_challenge.id,
+                        question_fk=question_id,
+                        validator_fk=validator.id,
+                        score=0.0,
+                        details={"reason": "not_compressed_enough"},
+                    )
+                )
+            zero_score_rollups.append(
+                BatchChallengeScore(
+                    batch_challenge_fk=batch_challenge.id,
+                    validator_fk=validator.id,
+                    score=0.0,
+                )
+            )
+            continue
         challenges_response.append(
             ChallengeContract(
                 batch_challenge_id=str(batch_challenge.id),
