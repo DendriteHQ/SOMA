@@ -1,5 +1,6 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
 
 from .abstract_sandbox import AbstractSandbox
 
@@ -14,13 +15,17 @@ class Sandbox(AbstractSandbox):
         command: List[str],
         created_at: Optional[datetime] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        max_log_entries: int = 256,
+        max_log_line_chars: int = 2048,
     ):
         super().__init__(sandbox_id, image, command, created_at, metadata)
         self._running = False
         self._removed = False
         self._exit_code: Optional[int] = None
-        self._stdout: List[str] = []
-        self._stderr: List[str] = []
+        self._max_log_entries = max(1, int(max_log_entries))
+        self._max_log_line_chars = max(1, int(max_log_line_chars))
+        self._stdout: Deque[str] = deque(maxlen=self._max_log_entries)
+        self._stderr: Deque[str] = deque(maxlen=self._max_log_entries)
 
     def start(self) -> None:
         if self._removed:
@@ -48,8 +53,13 @@ class Sandbox(AbstractSandbox):
     def exec(self, command: List[str]) -> int:
         if not self._running:
             return 1
-        self._stdout.append(" ".join(command))
+        self._append_log(self._stdout, " ".join(command))
         return 0
+
+    def _append_log(self, target: Deque[str], line: str) -> None:
+        if len(line) > self._max_log_line_chars:
+            line = line[: self._max_log_line_chars]
+        target.append(line)
 
     def health(self) -> Dict[str, Any]:
         return {
