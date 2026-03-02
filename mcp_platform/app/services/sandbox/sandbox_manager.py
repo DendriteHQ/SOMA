@@ -28,7 +28,7 @@ class SandboxManager(AbstractSandboxManager):
         network_name: Optional[str] = None,
         reap_interval_seconds: int = 60,
         exec_timeout_seconds: float | None = None,
-        artifact_log_max_chars: int = 65536,
+        artifact_log_max_chars: int = 1048576,
     ):
         max_sandboxes = max((os.cpu_count() or 1) - 2, 1)
         super().__init__(max_sandboxes=max_sandboxes, default_ttl=default_ttl)
