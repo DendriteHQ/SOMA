@@ -5,12 +5,10 @@ import json
 import logging
 import os
 import re
-from collections import Counter
 from pydantic import BaseModel
-from typing import Any, AsyncIterator
+from typing import Any
 import spacy
 from validator.evaluation.prompts import ANSWERS_GENERATION_PROMPT
-import logging
 
 
 class ScoringResult(BaseModel):
@@ -32,16 +30,10 @@ class LLMClient:
         self.model = model
         self.timeout_seconds = timeout_seconds
 
-        # Debug: log token presence and first few characters
         token_status = "SET" if self.api_token else "NOT SET"
         token_length = len(self.api_token) if self.api_token else 0
-        token_preview = (
-            self.api_token[:8] + "..."
-            if self.api_token and len(self.api_token) > 8
-            else (self.api_token or "")
-        )
         logging.info(
-            f"LLMClient initialized: token={token_status} (len={token_length}, preview='{token_preview}'), "
+            f"LLMClient initialized: token={token_status} (len={token_length}), "
             f"url={self.url}, model={self.model}, timeout={self.timeout_seconds}s"
         )
 
@@ -53,7 +45,7 @@ class LLMClient:
         body = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
+            "stream": False,
             "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "1024")),
             "temperature": float(os.getenv("LLM_TEMPERATURE", "0.2")),
         }
@@ -62,27 +54,20 @@ class LLMClient:
             "Content-Type": "application/json",
         }
 
-        # Debug: log request details
-        token_preview = (
-            self.api_token[:8] + "..." if len(self.api_token) > 8 else self.api_token
-        )
         logging.debug(
             f"LLM API Request: url={self.url}, model={self.model}, "
-            f"token_preview={token_preview}, max_tokens={body['max_tokens']}, "
+            f"max_tokens={body['max_tokens']}, "
             f"temperature={body['temperature']}"
         )
 
-        return await self._stream_chat(self.url, headers, body)
+        return await self._chat(self.url, headers, body)
 
-    async def _stream_chat(
-        self, url: str, headers: dict[str, str], body: dict
-    ) -> dict[str, Any]:
+    async def _chat(self, url: str, headers: dict[str, str], body: dict) -> dict[str, Any]:
         try:
             import aiohttp
         except Exception as exc:
-            raise RuntimeError("aiohttp is required for streaming LLM calls") from exc
+            raise RuntimeError("aiohttp is required for LLM HTTP calls") from exc
 
-        content: list[str] = []
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=headers, json=body) as response:
@@ -93,37 +78,20 @@ class LLMClient:
                         f"body={error_body[:500]}"
                     )
                 response.raise_for_status()
-                async for line in self._iter_sse_lines(response.content):
-                    if line == "[DONE]":
-                        break
-                    try:
-                        payload = json.loads(line)
-                    except Exception:
-                        continue
-                    delta = self._extract_delta_content(payload)
-                    if delta:
-                        content.append(delta)
-        return {"text": "".join(content)}
 
-    async def _iter_sse_lines(self, stream: AsyncIterator[bytes]) -> AsyncIterator[str]:
-        async for raw in stream:
-            line = raw.decode("utf-8").strip()
-            if not line.startswith("data: "):
-                continue
-            yield line[6:].strip()
+                payload = await response.json()
 
-    def _extract_delta_content(self, payload: dict[str, Any]) -> str:
-        choices = payload.get("choices")
-        if not choices:
-            return ""
-        choice = choices[0]
-        delta = choice.get("delta") or {}
-        if "content" in delta:
-            return str(delta.get("content") or "")
-        message = choice.get("message") or {}
-        if "content" in message:
-            return str(message.get("content") or "")
-        return ""
+        text = ""
+        if isinstance(payload, dict):
+            choices = payload.get("choices")
+            if isinstance(choices, list) and choices:
+                choice0 = choices[0] if isinstance(choices[0], dict) else {}
+                message = choice0.get("message") if isinstance(choice0, dict) else None
+                if isinstance(message, dict) and isinstance(message.get("content"), str):
+                    text = message.get("content") or ""
+                elif isinstance(choice0, dict) and isinstance(choice0.get("text"), str):
+                    text = choice0.get("text") or ""
+        return {"text": str(text)}
 
 
 class Scoring:
