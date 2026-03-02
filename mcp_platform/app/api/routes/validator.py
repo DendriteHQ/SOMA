@@ -754,6 +754,24 @@ async def score_challenges(
         db,
         ss58=_req.sig.signer_ss58,
     )
+    assignment_result = await db.execute(
+        select(BatchAssignment)
+        .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
+        .where(BatchAssignment.validator_fk == validator.id)
+        .where(BatchAssignment.done_at.is_(None))
+    )
+    assignment = assignment_result.scalars().first()
+    if assignment is None:
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_403_FORBIDDEN,
+            "Batch is not assigned to this validator",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Batch is not assigned to this validator",
+        )
     validator.current_status = "active"
 
     answer_rows: list[BatchQuestionAnswer] = []
