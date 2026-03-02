@@ -28,6 +28,7 @@ class SandboxManager(AbstractSandboxManager):
         network_name: Optional[str] = None,
         reap_interval_seconds: int = 60,
         exec_timeout_seconds: float | None = None,
+        artifact_log_max_chars: int = 65536,
     ):
         max_sandboxes = max((os.cpu_count() or 1) - 2, 1)
         super().__init__(max_sandboxes=max_sandboxes, default_ttl=default_ttl)
@@ -41,6 +42,7 @@ class SandboxManager(AbstractSandboxManager):
             if exec_timeout_seconds is not None and exec_timeout_seconds > 0
             else None
         )
+        self._artifact_log_max_chars = max(1, int(artifact_log_max_chars))
         self._semaphore = asyncio.Semaphore(max_sandboxes)
         self._reaper_stop = threading.Event()
         self._reaper_thread = threading.Thread(
@@ -168,7 +170,10 @@ class SandboxManager(AbstractSandboxManager):
         with self._sandboxes_lock:
             items = list(self.sandboxes.items())
         for sandbox_id, sandbox in items:
-            artifacts.append((sandbox_id, sandbox.logs()))
+            logs = sandbox.logs()
+            if len(logs) > self._artifact_log_max_chars:
+                logs = logs[-self._artifact_log_max_chars :]
+            artifacts.append((sandbox_id, logs))
         return artifacts
 
     def _reaper_loop(self) -> None:

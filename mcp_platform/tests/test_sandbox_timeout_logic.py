@@ -1,6 +1,9 @@
 import os
 import sys
+from contextlib import contextmanager
 from datetime import timedelta
+
+import pytest
 
 TESTS_DIR = os.path.dirname(__file__)
 MCP_PLATFORM_DIR = os.path.abspath(os.path.join(TESTS_DIR, ".."))
@@ -11,21 +14,36 @@ os.environ.setdefault("PRIVATE_NETWORK_CIDRS", '["127.0.0.1/32"]')
 os.environ.setdefault("TRUSTED_PROXY_CIDRS", '["127.0.0.1/32"]')
 
 from app.services.sandbox.sandbox_manager import SandboxManager
+from app.services.sandbox.sanbox import Sandbox
 
 
-def _make_manager(*, default_ttl_seconds: int = 120, exec_timeout_seconds: float | None = None) -> SandboxManager:
+def _make_manager(
+    *,
+    default_ttl_seconds: int = 120,
+    exec_timeout_seconds: float | None = None,
+    artifact_log_max_chars: int = 65536,
+) -> SandboxManager:
     return SandboxManager(
         default_ttl=timedelta(seconds=default_ttl_seconds),
         docker_manager=None,
         network_name=None,
         reap_interval_seconds=3600,
         exec_timeout_seconds=exec_timeout_seconds,
+        artifact_log_max_chars=artifact_log_max_chars,
     )
 
 
-def test_create_sandbox_stores_ttl_in_metadata():
-    manager = _make_manager()
+@contextmanager
+def _manager(**kwargs):
+    manager = _make_manager(**kwargs)
     try:
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def test_create_sandbox_stores_ttl_in_metadata():
+    with _manager() as manager:
         sandbox = manager.create_sandbox(
             sandbox_id="test-ttl-meta",
             image="test-image",
@@ -33,63 +51,75 @@ def test_create_sandbox_stores_ttl_in_metadata():
             ttl=timedelta(seconds=45),
         )
         assert sandbox.metadata.get("ttl_seconds") == 45
-    finally:
-        manager.shutdown()
 
 
-def test_container_timeout_uses_ttl_when_no_exec_timeout():
-    manager = _make_manager(exec_timeout_seconds=None)
-    try:
+@pytest.mark.parametrize(
+    "default_ttl_seconds,exec_timeout_seconds,sandbox_ttl_seconds,expected",
+    [
+        (120, None, 30, 30.0),
+        (120, 60, 30, 30.0),
+        (120, 25, None, 25.0),
+        (90, None, None, 90.0),
+    ],
+)
+def test_container_timeout_resolution(
+    default_ttl_seconds: int,
+    exec_timeout_seconds: float | None,
+    sandbox_ttl_seconds: int | None,
+    expected: float,
+):
+    with _manager(
+        default_ttl_seconds=default_ttl_seconds,
+        exec_timeout_seconds=exec_timeout_seconds,
+    ) as manager:
+        ttl = (
+            timedelta(seconds=sandbox_ttl_seconds)
+            if sandbox_ttl_seconds is not None
+            else None
+        )
         sandbox = manager.create_sandbox(
-            sandbox_id="test-timeout-ttl",
+            sandbox_id="test-timeout-resolution",
             image="test-image",
             command=["python", "-V"],
-            ttl=timedelta(seconds=30),
+            ttl=ttl,
         )
-        timeout = manager._resolve_container_timeout_seconds(sandbox)
-        assert timeout == 30.0
-    finally:
-        manager.shutdown()
+        assert manager._resolve_container_timeout_seconds(sandbox) == expected
 
 
-def test_container_timeout_uses_min_of_ttl_and_exec_timeout():
-    manager = _make_manager(exec_timeout_seconds=60)
-    try:
+def test_sandbox_exec_log_buffer_is_bounded():
+    sandbox = Sandbox(
+        sandbox_id="test-log-bound",
+        image="test-image",
+        command=["python", "-V"],
+        max_log_entries=3,
+        max_log_line_chars=8,
+    )
+    sandbox.start()
+    sandbox.exec(["line-000001"])
+    sandbox.exec(["line-000002"])
+    sandbox.exec(["line-000003"])
+    sandbox.exec(["line-000004"])
+
+    logs = sandbox.logs()
+    lines = logs.split("\n") if logs else []
+    assert len(lines) == 3
+    assert all(len(line) <= 8 for line in lines)
+    assert lines[-1] == "line-000"
+
+
+def test_collect_artifacts_truncates_large_logs():
+    with _manager(artifact_log_max_chars=20) as manager:
         sandbox = manager.create_sandbox(
-            sandbox_id="test-timeout-min",
-            image="test-image",
-            command=["python", "-V"],
-            ttl=timedelta(seconds=30),
-        )
-        timeout = manager._resolve_container_timeout_seconds(sandbox)
-        assert timeout == 30.0
-    finally:
-        manager.shutdown()
-
-
-def test_container_timeout_falls_back_to_exec_timeout_without_ttl():
-    manager = _make_manager(exec_timeout_seconds=25)
-    try:
-        sandbox = manager.create_sandbox(
-            sandbox_id="test-timeout-exec-only",
-            image="test-image",
-            command=["python", "-V"],
-        )
-        timeout = manager._resolve_container_timeout_seconds(sandbox)
-        assert timeout == 25.0
-    finally:
-        manager.shutdown()
-
-
-def test_container_timeout_falls_back_to_default_ttl():
-    manager = _make_manager(default_ttl_seconds=90, exec_timeout_seconds=None)
-    try:
-        sandbox = manager.create_sandbox(
-            sandbox_id="test-timeout-default",
+            sandbox_id="test-artifacts-truncate",
             image="test-image",
             command=["python", "-V"],
         )
-        timeout = manager._resolve_container_timeout_seconds(sandbox)
-        assert timeout == 90.0
-    finally:
-        manager.shutdown()
+        sandbox.exec(["aaaaaaaaaa"])
+        sandbox.exec(["bbbbbbbbbb"])
+        sandbox.exec(["cccccccccc"])
+
+        artifacts = manager.collect_artifacts()
+        assert len(artifacts) == 1
+        _, logs = artifacts[0]
+        assert len(logs) <= 20
+        assert logs.endswith("cccccccccc")
