@@ -24,11 +24,15 @@ class LLMClient:
         api_token: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
     ):
         self.url = url
         self.api_token = api_token
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.max_tokens = max_tokens
+        self.temperature = temperature
 
         token_status = "SET" if self.api_token else "NOT SET"
         token_length = len(self.api_token) if self.api_token else 0
@@ -46,8 +50,8 @@ class LLMClient:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "1024")),
-            "temperature": float(os.getenv("LLM_TEMPERATURE", "0.2")),
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
         }
         headers = {
             "Authorization": f"Bearer {self.api_token}",
@@ -117,6 +121,8 @@ class Scoring:
                 api_token=settings.openrouter_api_token,
                 model=settings.openrouter_model,
                 timeout_seconds=settings.llm_timeout_seconds,
+                max_tokens=settings.llm_max_tokens,
+                temperature=settings.llm_temperature
             )
         else:
             logging.info("Initializing default LLMClient for Scoring")
