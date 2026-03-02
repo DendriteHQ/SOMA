@@ -19,10 +19,10 @@ class TestLLMClient:
             },
         ):
             client = LLMClient()
-            assert client.url == "https://test.api/v1"
-            assert client.api_token == "test-token"
-            assert client.model == "test-model"
-            assert client.timeout_seconds == 60.0
+            assert client.url is None
+            assert client.api_token is None
+            assert client.model is None
+            assert client.timeout_seconds is None
 
     def test_init_with_custom_params(self):
         client = LLMClient(
@@ -43,24 +43,24 @@ class TestLLMClient:
             with pytest.raises(RuntimeError, match="OPENROUTER_API_TOKEN is not set"):
                 await client.ask("test prompt")
 
-    def test_extract_delta_content_with_delta(self):
-        client = LLMClient(api_token="test")
-        payload = {"choices": [{"delta": {"content": "test content"}}]}
-        result = client._extract_delta_content(payload)
-        assert result == "test content"
+    @pytest.mark.asyncio
+    async def test_ask_uses_non_stream_request_body(self):
+        client = LLMClient(
+            url="https://test.api/v1",
+            api_token="test-token",
+            model="test-model",
+            timeout_seconds=1.0,
+            max_tokens=123,
+            temperature=0.7,
+        )
+        client._chat = AsyncMock(return_value={"text": "[]"})
+        await client.ask("hello")
 
-    def test_extract_delta_content_with_message(self):
-        client = LLMClient(api_token="test")
-        payload = {"choices": [{"message": {"content": "test content"}}]}
-        result = client._extract_delta_content(payload)
-        assert result == "test content"
-
-    def test_extract_delta_content_empty(self):
-        client = LLMClient(api_token="test")
-        payload = {"choices": []}
-        result = client._extract_delta_content(payload)
-        assert result == ""
-
+        assert client._chat.await_count == 1
+        _url, _headers, body = client._chat.await_args.args
+        assert body["stream"] is False
+        assert body["max_tokens"] == 123
+        assert body["temperature"] == 0.7
 
 class TestScoring:
     def test_init_with_defaults(self):
