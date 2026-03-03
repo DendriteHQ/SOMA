@@ -48,7 +48,8 @@ from app.services.challenge_factory import (
 )
 from app.services.sandbox.sandbox_manager import SandboxManager
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
-from soma_shared.utils.verifier import verify_request_dep, verify_validator_stake_dep
+from soma_shared.utils.verifier import verify_validator_stake_dep
+from app.api.deps import verify_request_dep_tz
 from app.core.config import settings
 from app.api.routes.utils import (
     _get_request_row,
@@ -86,7 +87,7 @@ def _get_sandbox_manager(request: Request) -> SandboxManager:
 async def register(
     request: Request,
     _req: SignedEnvelope[ValidatorRegisterRequest] = Depends(
-        verify_request_dep(ValidatorRegisterRequest)
+        verify_request_dep_tz(ValidatorRegisterRequest)
     ),
     db: AsyncSession = Depends(get_db_session),
     _stake_check: None = Depends(
@@ -231,7 +232,7 @@ async def register(
 async def request_challenge(
     request: Request,
     _req: SignedEnvelope[GetChallengesRequest] = Depends(
-        verify_request_dep(GetChallengesRequest)
+        verify_request_dep_tz(GetChallengesRequest)
     ),
     db: AsyncSession = Depends(get_db_session),
     _stake_check: None = Depends(
@@ -617,7 +618,7 @@ async def request_challenge(
 async def score_challenges(
     request: Request,
     _req: SignedEnvelope[PostChallengeScores] = Depends(
-        verify_request_dep(PostChallengeScores)
+        verify_request_dep_tz(PostChallengeScores)
     ),
     db: AsyncSession = Depends(get_db_session),
     _stake_check: None = Depends(
@@ -937,7 +938,7 @@ async def score_challenges(
 async def get_best_miners(
     request: Request,
     _req: SignedEnvelope[GetBestMinersUidRequest] = Depends(
-        verify_request_dep(GetBestMinersUidRequest)
+        verify_request_dep_tz(GetBestMinersUidRequest)
     ),
     db: AsyncSession = Depends(get_db_session),
 ) -> SignedEnvelope[GetBestMinersUidResponse]:

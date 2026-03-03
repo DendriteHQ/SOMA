@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
 
@@ -20,7 +20,13 @@ class AbstractSandbox(ABC):
         self.sandbox_id = sandbox_id
         self.image = image
         self.command = command
-        self.created_at = created_at or datetime.utcnow()
+        if created_at is None:
+            created_at = datetime.now(timezone.utc)
+        elif created_at.tzinfo is None or created_at.tzinfo.utcoffset(created_at) is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        else:
+            created_at = created_at.astimezone(timezone.utc)
+        self.created_at = created_at
         self.metadata = metadata or {}
 
     @abstractmethod
@@ -71,7 +77,7 @@ class AbstractSandbox(ABC):
         raise NotImplementedError
 
     def uptime_seconds(self) -> float:
-        return (datetime.utcnow() - self.created_at).total_seconds()
+        return (datetime.now(timezone.utc) - self.created_at).total_seconds()
 
     @abstractmethod
     def has_exceeded_ttl(self, ttl_seconds: int) -> bool:
