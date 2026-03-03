@@ -16,9 +16,8 @@ class ExecuteBatchRequest(BaseModel):
     compression_ratios: List[Optional[float]] = Field(
         ..., description="Target compression ratios"
     )
-    ttl_seconds: Optional[int] = Field(
-        default=120, description="Execution timeout in seconds"
-    )
+    timeout_per_task: float = Field(..., description="Timeout for each individual task in seconds")
+    container_timeout: float = Field(..., description="Global timeout for entire container execution in seconds")
 
 
 class ExecuteBatchResponse(BaseModel):

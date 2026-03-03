@@ -84,7 +84,8 @@ class SandboxExecutor:
         challenge_code: str,
         challenge_texts: List[str],
         compression_ratios: List[Optional[float]],
-        ttl_seconds: int,
+        timeout_per_task: float,
+        container_timeout: float,
     ) -> List[str]:
         """Execute a batch of compression tasks.
         
@@ -92,7 +93,8 @@ class SandboxExecutor:
             challenge_code: Python code to execute
             challenge_texts: Texts to compress
             compression_ratios: Target compression ratios
-            ttl_seconds: Execution timeout in seconds
+            timeout_per_task: Timeout for each individual task
+            container_timeout: Global timeout for entire execution
             
         Returns:
             List of compressed texts
@@ -104,7 +106,8 @@ class SandboxExecutor:
             challenge_code,
             challenge_texts,
             compression_ratios,
-            ttl_seconds,
+            timeout_per_task,
+            container_timeout,
         )
     
     def _execute_batch_sync(
@@ -112,7 +115,8 @@ class SandboxExecutor:
         challenge_code: str,
         challenge_texts: List[str],
         compression_ratios: List[Optional[float]],
-        ttl_seconds: int,
+        timeout_per_task: float,
+        container_timeout: float,
     ) -> List[str]:
         """Synchronous batch execution.
         
@@ -120,11 +124,13 @@ class SandboxExecutor:
             challenge_code: Python code to execute
             challenge_texts: Texts to compress
             compression_ratios: Target compression ratios
-            ttl_seconds: Execution timeout
+            timeout_per_task: Timeout for each individual task
+            container_timeout: Global timeout for entire execution
             
         Returns:
             List of compressed texts
         """
+        import asyncio
         try:
             client = self._get_docker_client()
         except Exception as exc:
@@ -157,20 +163,24 @@ class SandboxExecutor:
             )
             
             logger.info(
-                "Running sandbox: id=%s, texts=%d, timeout=%d",
+                "Running sandbox: id=%s, texts=%d, timeout_per_task=%ss, container_timeout=%ss",
                 sandbox_id,
                 len(challenge_texts),
-                ttl_seconds,
+                timeout_per_task,
+                container_timeout,
             )
             
             container = None
             try:
-                # Run container
+                # Run container with timeout environment variable
                 container = client.containers.run(
                     self.image,
                     command=["python", "/sandbox/run_code.py"],
                     name=sandbox_id,
                     detach=True,
+                    environment={
+                        "TASK_TIMEOUT": str(timeout_per_task),
+                    },
                     volumes={
                         str(input_dir): {"bind": "/sandbox/input", "mode": "ro"},
                         str(output_dir): {"bind": "/sandbox/output", "mode": "rw"},
@@ -188,11 +198,11 @@ class SandboxExecutor:
                 
                 # Wait for completion
                 try:
-                    result = container.wait(timeout=ttl_seconds)
+                    result = container.wait(timeout=container_timeout)
                 except Exception as exc:
                     logger.error(
-                        "Container wait failed (timeout=%s): %s",
-                        ttl_seconds,
+                        "Container wait failed (timeout=%ss): %s",
+                        container_timeout,
                         exc,
                         exc_info=True,
                     )

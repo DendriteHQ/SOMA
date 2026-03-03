@@ -22,32 +22,35 @@ class RemoteSandboxManager:
         *,
         sandbox_service_url: str,
         compressed_text_storage: CompressedTextStorage,
-        default_ttl: timedelta,
-        exec_timeout_seconds: float | None = None,
+        timeout_per_task: float,
+        container_timeout_offset: float,
+        request_timeout_offset: float,
         max_sandboxes: int = 10,
-        request_timeout: float = 120.0,
     ):
         """Initialize remote sandbox manager.
         
         Args:
             sandbox_service_url: Base URL of the sandbox service
             compressed_text_storage: Storage for compressed texts
-            default_ttl: Default time-to-live for sandbox operations
-            exec_timeout_seconds: Execution timeout for sandbox operations
+            timeout_per_task: Timeout for executing one compression task (seconds)
+            container_timeout_offset: Extra time for container overhead (seconds)
+            request_timeout_offset: Extra time for HTTP request overhead (seconds, must be > container_offset)
             max_sandboxes: Maximum concurrent sandbox operations (for semaphore)
-            request_timeout: HTTP request timeout in seconds
         """
         self.max_sandboxes = max_sandboxes
-        self.default_ttl = default_ttl
+        self._timeout_per_task = timeout_per_task
+        self._container_timeout_offset = container_timeout_offset
+        self._request_timeout_offset = request_timeout_offset
         self._sandbox_service_url = sandbox_service_url.rstrip("/")
         self._compressed_text_storage = compressed_text_storage
-        self._exec_timeout_seconds = (
-            float(exec_timeout_seconds)
-            if exec_timeout_seconds is not None and exec_timeout_seconds > 0
-            else None
-        )
-        self._request_timeout = request_timeout
         self._semaphore = asyncio.Semaphore(max_sandboxes)
+        
+        # Validate that request timeout offset > container timeout offset
+        if request_timeout_offset <= container_timeout_offset:
+            raise ValueError(
+                f"request_timeout_offset ({request_timeout_offset}s) must be greater than "
+                f"container_timeout_offset ({container_timeout_offset}s) for network overhead"
+            )
 
     async def run_batch(
         self,
@@ -56,7 +59,6 @@ class RemoteSandboxManager:
         challenge_code: str,
         challenge_texts: list[str],
         compression_ratios: list[float | None],
-        ttl: timedelta | None = None,
         acquire_timeout: float = 10.0,
     ) -> list[str]:
         """Execute a batch of challenges on remote sandbox service.
@@ -94,7 +96,6 @@ class RemoteSandboxManager:
                 challenge_code,
                 challenge_texts,
                 compression_ratios,
-                ttl,
             )
         except Exception as exc:
             logger.error(
@@ -110,7 +111,6 @@ class RemoteSandboxManager:
         challenge_code: str,
         challenge_texts: list[str],
         compression_ratios: list[float | None],
-        ttl: timedelta | None = None,
     ) -> list[str]:
         """Execute batch on remote sandbox service and retrieve results from S3.
         
@@ -119,23 +119,15 @@ class RemoteSandboxManager:
             challenge_code: Python code to compress texts
             challenge_texts: List of texts to compress
             compression_ratios: Target compression ratios
-            ttl: Time-to-live for the operation
             
         Returns:
             List of compressed texts
         """
+        num_tasks = len(challenge_texts)
         
-        ttl_seconds = None
-        if ttl is not None:
-            ttl_seconds = int(ttl.total_seconds())
-        elif self.default_ttl is not None:
-            ttl_seconds = int(self.default_ttl.total_seconds())
-        
-        if self._exec_timeout_seconds is not None and self._exec_timeout_seconds > 0:
-            if ttl_seconds is None:
-                ttl_seconds = int(self._exec_timeout_seconds)
-            else:
-                ttl_seconds = min(ttl_seconds, int(self._exec_timeout_seconds))
+        # Calculate timeouts based on number of tasks
+        container_timeout = (self._timeout_per_task * num_tasks) + self._container_timeout_offset
+        request_timeout = (self._timeout_per_task * num_tasks) + self._request_timeout_offset
         
         # Prepare request payload
         payload = {
@@ -143,13 +135,18 @@ class RemoteSandboxManager:
             "challenge_code": challenge_code,
             "challenge_texts": challenge_texts,
             "compression_ratios": compression_ratios,
-            "ttl_seconds": ttl_seconds,
+            "timeout_per_task": self._timeout_per_task,
+            "container_timeout": container_timeout,
         }
         
         logger.info(
-            "[RemoteSandbox] Sending batch to sandbox service: batch_id=%s, texts=%d",
+            "[RemoteSandbox] Sending batch to sandbox service: batch_id=%s, texts=%d, "
+            "timeout_per_task=%ss, container_timeout=%ss, request_timeout=%ss",
             batch_id,
-            len(challenge_texts),
+            num_tasks,
+            self._timeout_per_task,
+            container_timeout,
+            request_timeout,
         )
         
         # Send request to sandbox service
@@ -158,7 +155,7 @@ class RemoteSandboxManager:
                 response = await client.post(
                     f"{self._sandbox_service_url}/execute_batch",
                     json=payload,
-                    timeout=self._request_timeout,
+                    timeout=request_timeout,
                 )
                 response.raise_for_status()
                 result = response.json()

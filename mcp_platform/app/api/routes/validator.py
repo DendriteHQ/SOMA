@@ -87,9 +87,9 @@ def _get_sandbox_manager(request: Request) -> RemoteSandboxManager:
         sandbox_manager = RemoteSandboxManager(
             sandbox_service_url=settings.sandbox_service_url,
             compressed_text_storage=compressed_text_storage,
-            default_ttl=timedelta(seconds=settings.sandbox_container_ttl_seconds),
-            exec_timeout_seconds=settings.sandbox_exec_timeout_seconds,
-            request_timeout=settings.sandbox_service_timeout,
+            timeout_per_task=settings.sandbox_timeout_per_task_seconds,
+            container_timeout_offset=settings.sandbox_container_timeout_offset,
+            request_timeout_offset=settings.sandbox_request_timeout_offset,
         )
         request.app.state.sandbox_manager = sandbox_manager
     return sandbox_manager
@@ -437,7 +437,6 @@ async def request_challenge(
             challenge_code=challenge_code,
             challenge_texts=challenge_texts,
             compression_ratios=compression_ratios,
-            ttl=timedelta(seconds=settings.sandbox_container_ttl_seconds),
         )
         compressed_lengths = [len(text or "") for text in compressed_texts]
         bt.logging.info(

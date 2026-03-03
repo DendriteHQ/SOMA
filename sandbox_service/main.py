@@ -82,7 +82,8 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
             challenge_code=request.challenge_code,
             challenge_texts=request.challenge_texts,
             compression_ratios=request.compression_ratios,
-            ttl_seconds=request.ttl_seconds or 120,
+            timeout_per_task=request.timeout_per_task,
+            container_timeout=request.container_timeout,
         )
         
         # Save to S3
