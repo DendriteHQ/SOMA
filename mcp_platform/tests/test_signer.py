@@ -121,7 +121,7 @@ def test_sign_and_verify_payload_model(wallet_path):
 
     payload = _DummyPayload(message="hello", count=1)
     nonce = generate_nonce()
-    signature = sign_payload_model(payload, nonce=nonce)
+    signature = sign_payload_model(payload, nonce=nonce, wallet=wallet)
 
     assert signature.signer_ss58 == wallet.hotkey.ss58_address
     assert verify_payload_model(
@@ -160,7 +160,7 @@ def test_verify_request_expected_key_mismatch(wallet_path):
 
     payload = _DummyPayload(message="hello", count=2)
     nonce = generate_nonce()
-    signature = sign_payload_model(payload, nonce=nonce)
+    signature = sign_payload_model(payload, nonce=nonce, wallet=wallet)
     env = SignedEnvelope(payload=payload, sig=signature)
 
     _set_wallet_settings("test-coldkey", "test-hotkey", str(wallet_path))
@@ -188,7 +188,7 @@ def test_verify_request_expected_key_matches_but_signature_invalid(wallet_path):
 
     payload = _DummyPayload(message="hello", count=3)
     nonce = generate_nonce()
-    signature = sign_payload_model(payload, nonce=nonce)
+    signature = sign_payload_model(payload, nonce=nonce, wallet=wallet)
     tampered = signature.signature[:-1] + (
         "A" if signature.signature[-1] != "A" else "B"
     )
@@ -218,7 +218,7 @@ def test_verify_request_expected_key_matches_and_signature_valid(wallet_path):
 
     payload = _DummyPayload(message="hello", count=4)
     nonce = generate_nonce()
-    signature = sign_payload_model(payload, nonce=nonce)
+    signature = sign_payload_model(payload, nonce=nonce, wallet=wallet)
     env = SignedEnvelope(payload=payload, sig=signature)
 
     request = _build_request()

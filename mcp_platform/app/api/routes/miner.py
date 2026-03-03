@@ -394,7 +394,11 @@ async def upload_miner_script(
 
     response_payload = UploadSolutionResponse(ok=True)
     response_nonce = generate_nonce()
-    response_sig = sign_payload_model(response_payload, nonce=response_nonce)
+    response_sig = sign_payload_model(
+        response_payload,
+        nonce=response_nonce,
+        wallet=settings.wallet,
+    )
     response = SignedEnvelope(payload=response_payload, sig=response_sig)
     logger.info(
         "miner_upload_response",
