@@ -101,23 +101,38 @@ class Settings(BaseSettings):
         default=300,
         alias="BATCH_CLEANUP_INTERVAL_SECS",
     )
-    sandbox_container_ttl_seconds: float = Field(
-        default=120.0,
-        alias="SANDBOX_CONTAINER_TTL_SECONDS",
-    )
-    sandbox_exec_timeout_seconds: float = Field(
-        default=60.0,
-        alias="SANDBOX_EXEC_TIMEOUT_SECONDS",
-    )
     batch_assignment_timeout_hours: float = Field(
         default=0.5,
         alias="BATCH_ASSIGNMENT_TIMEOUT_HOURS",
+    )
+
+    # Sandbox timeout configuration
+    sandbox_timeout_per_task_seconds: float = Field(
+        default=10.0,
+        alias="SANDBOX_TIMEOUT_PER_TASK_SECONDS",
+        description="Timeout for executing one compression task",
+    )
+    sandbox_container_timeout_offset: float = Field(
+        default=10.0,
+        alias="SANDBOX_CONTAINER_TIMEOUT_OFFSET",
+        description="Extra time for container overhead (startup, I/O, etc.)",
+    )
+    sandbox_request_timeout_offset: float = Field(
+        default=20.0,
+        alias="SANDBOX_REQUEST_TIMEOUT_OFFSET",
+        description="Extra time for HTTP request (must be > container offset)",
     )
 
     # Validator stake requirements (in alpha tokens)
     min_validator_stake: float = Field(
         default=10000.0,
         alias="MIN_VALIDATOR_STAKE",
+    )
+
+    # Remote sandbox service configuration (required)
+    sandbox_service_url: str = Field(
+        ...,
+        alias="SANDBOX_SERVICE_URL",
     )
 
     @field_validator("log_levels", mode="before")

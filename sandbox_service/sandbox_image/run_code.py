@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import sys
 import traceback
 from pathlib import Path
@@ -8,6 +9,16 @@ import io
 from contextlib import redirect_stdout, redirect_stderr
 
 DEFAULT_OUTPUT = {"compressed": []}
+
+
+class TimeoutError(Exception):
+    """Raised when task execution times out."""
+    pass
+
+
+def timeout_handler(signum, frame):
+    """Signal handler for task timeout."""
+    raise TimeoutError("Task execution timed out")
 
 
 def write_output(path: Path, data=DEFAULT_OUTPUT) -> None:
@@ -40,9 +51,16 @@ def load_user_main(input_path: Path):
 
 
 def run_batch(
-    main_fn, batch: list, compression_ratios: list[float | None]
+    main_fn, batch: list, compression_ratios: list[float | None], timeout_per_task: float
 ) -> list[tuple[str, str]]:
-    """Run user main() on all tasks and return [(result, logs), ...]."""
+    """Run user main() on all tasks and return [(result, logs), ...].
+    
+    Args:
+        main_fn: User's main function
+        batch: List of tasks to process
+        compression_ratios: Compression ratios for each task
+        timeout_per_task: Timeout in seconds for each task execution
+    """
 
     outputs: list[tuple[str, str]] = []
 
@@ -56,15 +74,27 @@ def run_batch(
         )
 
         try:
+            # Set alarm for this task execution
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(int(timeout_per_task) if timeout_per_task > 0 else 0)
+            
             with redirect_stdout(buf_out), redirect_stderr(buf_err):
                 out = main_fn(task, compression_ratio)
+
+            # Cancel alarm if task completed successfully
+            signal.alarm(0)
 
             text = out if isinstance(out, str) else str(out or "")
             logs = buf_out.getvalue() + buf_err.getvalue()
 
             outputs.append((text, logs))
 
+        except TimeoutError:
+            signal.alarm(0)  # Cancel alarm
+            outputs.append(("", f"ERROR: Task execution timed out after {timeout_per_task}s"))
+            
         except Exception as exc:
+            signal.alarm(0)  # Cancel alarm
             outputs.append(("", f"ERROR: {exc}"))
 
     return outputs
@@ -74,6 +104,12 @@ def main() -> int:
     input_path = Path(os.getenv("INPUT_PATH", "/sandbox/input/code.py"))
     task_path = Path(os.getenv("TASK_PATH", "/sandbox/input/task.json"))
     output_path = Path(os.getenv("OUTPUT_PATH", "/sandbox/output/output.json"))
+    
+    # Get task timeout from environment variable (default: 10 seconds)
+    try:
+        timeout_per_task = float(os.getenv("TASK_TIMEOUT", "10.0"))
+    except ValueError:
+        timeout_per_task = 10.0
 
     # Default output if anything fails
     if not input_path.exists() or not task_path.exists():
@@ -83,7 +119,7 @@ def main() -> int:
     try:
         batch, compression_ratios = load_task(task_path)
         main_fn = load_user_main(input_path)
-        compressed = run_batch(main_fn, batch, compression_ratios)
+        compressed = run_batch(main_fn, batch, compression_ratios, timeout_per_task)
 
         write_output(output_path, {"compressed": compressed})
         return 0
@@ -98,6 +134,7 @@ def main() -> int:
             output_path,
             {"compressed": [], "error": str(exc), "traceback": err_trace},
         )
+        return 1
         return 1
 
 
