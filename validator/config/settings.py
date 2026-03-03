@@ -1,5 +1,6 @@
 import os
 import bittensor as bt
+from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict
 from typing import Any
 from bittensor.core.async_subtensor import AsyncSubtensor
@@ -36,13 +37,39 @@ class Settings(BaseModel):
         subtensor_network = os.getenv("BT_NETWORK", "finney")
         subtensor_endpoint = os.getenv("BT_CHAIN_ENDPOINT")
 
-        subtensor = AsyncSubtensor(network=subtensor_network)
+        wallet_name = cls._require_non_empty("WALLET_NAME", wallet_name)
+        hotkey = cls._require_non_empty("WALLET_HOTKEY", hotkey)
+        platform_url = cls._validate_platform_url(
+            os.getenv("PLATFORM_URL", "http://platform:8000")
+        )
+        platform_signer_ss58 = cls._require_non_empty(
+            "PLATFORM_SIGNER_SS58", os.getenv("PLATFORM_SIGNER_SS58", "")
+        )
+
+        try:
+            if subtensor_endpoint:
+                subtensor = AsyncSubtensor(
+                    network=subtensor_network,
+                    chain_endpoint=subtensor_endpoint,
+                )
+            else:
+                subtensor = AsyncSubtensor(network=subtensor_network)
+        except Exception as exc:
+            bt.logging.error(
+                "subtensor_init_failed",
+                extra={
+                    "network": subtensor_network,
+                    "chain_endpoint": subtensor_endpoint,
+                    "error": str(exc),
+                },
+            )
+            raise
 
         settings = cls(
             wallet_name=wallet_name,
             hotkey=hotkey,
-            platform_url=os.getenv("PLATFORM_URL", "http://platform:8000"),
-            platform_signer_ss58=os.getenv("PLATFORM_SIGNER_SS58"),
+            platform_url=platform_url,
+            platform_signer_ss58=platform_signer_ss58,
             validator_host=os.getenv("VALIDATOR_HOST", "0.0.0.0"),
             validator_port=cls._get_int("VALIDATOR_PORT", 8000),
             netuid=netuid,
@@ -86,3 +113,24 @@ class Settings(BaseModel):
             return float(raw)
         except ValueError:
             return default
+
+    @classmethod
+    def _require_non_empty(cls, name: str, value: str) -> str:
+        if not value:
+            bt.logging.error("missing_required_env", extra={"env": name})
+            raise ValueError(f"{name} is required and cannot be empty")
+        return value
+
+    @classmethod
+    def _validate_platform_url(cls, value: str) -> str:
+        if not value:
+            bt.logging.error("missing_required_env", extra={"env": "PLATFORM_URL"})
+            raise ValueError("PLATFORM_URL is required and cannot be empty")
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http"}:
+            bt.logging.error(
+                "platform_url_invalid_scheme",
+                extra={"platform_url": value},
+            )
+            raise ValueError("PLATFORM_URL must start with http://")
+        return value
