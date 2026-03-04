@@ -1051,18 +1051,18 @@ async def get_best_miners(
 
                         if total_uploads > 0:
                             # Calculate buffer size as % of total uploads
-                            top_screener_fraction = float(
-                                getattr(settings, "top_screener_fraction", 0.2)
+                            top_screener_scripts = float(
+                                getattr(settings, "top_screener_scripts", 0.2)
                             )
                             buffer_size = max(
-                                1, int(math.ceil(total_uploads * top_screener_fraction))
+                                1, int(math.ceil(total_uploads * top_screener_scripts))
                             )
                             logger.info(
                                 "get_best_miners_screener_buffer",
                                 extra={
                                     "request_id": request_id,
                                     "total_uploads": total_uploads,
-                                    "top_screener_fraction": top_screener_fraction,
+                                    "top_screener_scripts": top_screener_scripts,
                                     "buffer_size": buffer_size,
                                 },
                             )
