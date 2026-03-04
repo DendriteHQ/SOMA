@@ -71,12 +71,6 @@ class Settings(BaseSettings):
         alias="TOP_SCREENER_SCRIPTS",
     )
 
-    # Weight allocation for top screener miners
-    top_screener_fraction: float = Field(
-        default=0.2,
-        alias="TOP_SCREENER_FRACTION",
-    )
-
     screener_weight_per_miner: float = Field(
         default=0.00002,
         alias="SCREENER_WEIGHT_PER_MINER",
