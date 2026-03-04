@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.services.blob.base import BlobStorage
+from .base import BlobStorage
 
 
 class ScriptStorage:

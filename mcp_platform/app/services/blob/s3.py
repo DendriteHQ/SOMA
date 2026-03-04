@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import aioboto3
-from app.core.config import settings
-from app.services.blob.base import BlobStorage
-
+#from ...core.config import settings
+from .base import BlobStorage
+import os
 
 class S3BlobStorage(BlobStorage):
     def __init__(self) -> None:
-        if not settings.s3_bucket:
+        bucket = os.getenv("S3_BUCKET")
+        if not bucket:
             raise RuntimeError("S3_BUCKET must be set")
 
-        self._bucket = settings.s3_bucket
+        self._bucket = bucket
         self._session = aioboto3.Session()
 
         self._client_kwargs = {}

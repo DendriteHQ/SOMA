@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+from pathlib import Path
+
+# Add parent directory to path to find mcp_platform module
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import FastAPI
-
-from app.contracts import (
+from dotenv import load_dotenv
+from soma_shared.contracts.sandbox.v1.messages import (
     ExecuteBatchRequest,
     ExecuteBatchResponse,
 )
@@ -20,6 +25,9 @@ from app.sandbox_executor import SandboxExecutor
 from mcp_platform.app.services.blob.compressed_text_storage import CompressedTextStorage
 from mcp_platform.app.services.blob.s3 import S3BlobStorage
 
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(

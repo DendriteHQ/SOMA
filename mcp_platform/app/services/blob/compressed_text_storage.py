@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import List
 
-from app.services.blob.base import BlobStorage
+from .base import BlobStorage
 
 
 class CompressedTextStorage:
