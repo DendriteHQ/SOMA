@@ -500,6 +500,18 @@ async def request_challenge(
             compressed=compressed_text,
             ratio=ratio,
         ):
+            original_text = challenge.challenge_text or ""
+            bt.logging.warning(
+                "request_challenge: not compressed enough "
+                f"request_id={request_id} "
+                f"batch_id={challenge_batch.id} "
+                f"batch_challenge_id={batch_challenge.id} "
+                f"challenge_id={challenge.id} "
+                f"miner_ss58={miner.ss58} "
+                f"ratio_target={ratio} "
+                f"original_chars={len(original_text)} "
+                f"compressed_chars={len(compressed_text or '')}"
+            )
             for question_id in question_ids_by_challenge.get(challenge.id, []):
                 zero_score_answers.append(
                     BatchQuestionAnswer(
