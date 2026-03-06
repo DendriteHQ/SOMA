@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_script_storage, verify_miner_request_dep_tz
@@ -22,7 +22,7 @@ from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.script import Script
 from app.services.blob.script_storage import ScriptStorage
-from app.services.script_store import store_hot_script
+from app.services.script_store import DuplicateMinerUploadError, store_hot_script
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
 from app.core.config import settings
 
@@ -243,6 +243,22 @@ async def _ensure_single_upload_for_competition(
         )
 
 
+async def _acquire_miner_upload_lock(
+    db: AsyncSession,
+    *,
+    miner_hotkey: str,
+    competition_id: int,
+) -> None:
+    bind = db.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    lock_key = f"miner-upload:{competition_id}:{miner_hotkey}"
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+        {"lock_key": lock_key},
+    )
+
+
 @router.post(
     "/miner/upload",
     response_model=SignedEnvelope[UploadSolutionResponse],
@@ -300,12 +316,18 @@ async def upload_miner_script(
 
     try:
         competition_id = await _get_current_open_competition_id(db)
+        await _acquire_miner_upload_lock(
+            db,
+            miner_hotkey=payload.miner_hotkey,
+            competition_id=competition_id,
+        )
         await _ensure_single_upload_for_competition(
             db,
             miner_hotkey=payload.miner_hotkey,
             competition_id=competition_id,
         )
     except HTTPException as exc:
+        await db.rollback()
         await _log_error_response(
             request,
             db,
@@ -358,7 +380,25 @@ async def upload_miner_script(
             request_id=request_id or "",
             competition_id=competition_id,
         )
+    except DuplicateMinerUploadError as exc:
+        await db.rollback()
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_409_CONFLICT,
+            str(exc),
+            miner_hotkey=payload.miner_hotkey,
+            signer_ss58=_req.sig.signer_ss58,
+            nonce=_req.sig.nonce,
+            signature=_req.sig.signature,
+            exc=exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
     except LookupError as exc:
+        await db.rollback()
         await _log_error_response(
             request,
             db,
@@ -375,6 +415,7 @@ async def upload_miner_script(
             detail=str(exc),
         )
     except Exception as exc:
+        await db.rollback()
         await _log_error_response(
             request,
             db,

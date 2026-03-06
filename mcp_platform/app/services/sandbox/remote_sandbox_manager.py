@@ -217,3 +217,7 @@ class RemoteSandboxManager:
                 exc_info=True,
             )
             return [""] * len(challenge_texts)
+
+    def shutdown(self) -> None:
+        """Compatibility lifecycle hook used by app shutdown."""
+        logger.info("[RemoteSandbox] Shutdown complete")
