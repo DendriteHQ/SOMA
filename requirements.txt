@@ -131,4 +131,4 @@ wheel==0.45.1
 wrapt==1.17.3
 xxhash==3.6.0
 yarl==1.22.0
-git+https://github.com/DendriteHQ/SOMA-shared.git@db/auto_create_views
+git+https://github.com/DendriteHQ/SOMA-shared.git@ft/handle_banned_miners

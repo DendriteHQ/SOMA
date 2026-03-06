@@ -163,7 +163,12 @@ def _build_miner_data_subqueries(latest_active_competition_id: int):
                 V_MINER_SCREENER_STATS.c.screener_scored.label("scored_count"),
             )
             .select_from(V_MINER_SCREENER_STATS)
+            .join(
+                Miner,
+                Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
+            )
             .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
+            .where(Miner.miner_banned_status.is_(False))
             .subquery()
         )
 
@@ -290,6 +295,7 @@ def _miner_status(
     scored_competition_challanges: int | None,
     is_in_top_screener: bool = False,
     has_script: bool = False,
+    miner_banned_status: bool = False,
 ) -> str:
     """Determine miner status based on challenges and scores.
 
@@ -305,6 +311,9 @@ def _miner_status(
         - 'in queue': Miner uploaded script but waiting for challenges or scoring
         - 'idle': No script uploaded
     """
+    if miner_banned_status:
+        return "banned"
+
     if not has_script:
         return "idle"
 
@@ -597,7 +606,12 @@ async def list_miners(
                     V_MINER_SCREENER_STATS.c.screener_scored.label("scored_count"),
                 )
                 .select_from(V_MINER_SCREENER_STATS)
+                .join(
+                    Miner,
+                    Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
+                )
                 .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
+                .where(Miner.miner_banned_status.is_(False))
                 .subquery()
             )
 
@@ -779,6 +793,7 @@ async def list_miners(
                     scored_challenges,
                     is_top,
                     has_script=(has_script or 0) > 0,
+                    miner_banned_status=bool(miner.miner_banned_status),
                 ),
                 screener_score=(
                     float(screener_score) if screener_score is not None else None
@@ -1138,6 +1153,7 @@ async def get_miner(
                 competition_scored,
                 is_in_top,
                 has_script,
+                miner_banned_status=bool(miner.miner_banned_status),
             ),
             total_score=(
                 float(total_score_result) if total_score_result is not None else None

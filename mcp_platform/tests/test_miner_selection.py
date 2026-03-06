@@ -702,6 +702,270 @@ async def test_eval_phase_selects_top_screener_script(
 
 
 @pytest.mark.asyncio
+async def test_banned_miner_is_not_selected(
+    async_session: AsyncSession, setup_base_data
+):
+    """Test: banned miners are never selected for scoring."""
+    competition, _validator = setup_base_data
+    now = datetime.now(timezone.utc)
+
+    banned_miner = Miner(
+        id=80,
+        ss58="miner_banned",
+        miner_banned_status=True,
+    )
+    async_session.add(banned_miner)
+    await async_session.flush()
+
+    banned_script = Script(
+        id=80,
+        miner_fk=banned_miner.id,
+        script_uuid="80000000-0000-0000-0000-000000000013",
+        created_at=now - timedelta(hours=2),
+    )
+    async_session.add(banned_script)
+    await async_session.flush()
+
+    async_session.add(
+        MinerUpload(
+            id=80,
+            script_fk=banned_script.id,
+            competition_fk=competition.id,
+            created_at=now - timedelta(hours=2),
+        )
+    )
+
+    allowed_miner = Miner(id=81, ss58="miner_allowed")
+    async_session.add(allowed_miner)
+    await async_session.flush()
+
+    allowed_script = Script(
+        id=81,
+        miner_fk=allowed_miner.id,
+        script_uuid="81000000-0000-0000-0000-000000000014",
+        created_at=now - timedelta(hours=1),
+    )
+    async_session.add(allowed_script)
+    await async_session.flush()
+
+    async_session.add(
+        MinerUpload(
+            id=81,
+            script_fk=allowed_script.id,
+            competition_fk=competition.id,
+            created_at=now - timedelta(hours=1),
+        )
+    )
+
+    await async_session.commit()
+
+    request = Mock()
+    request.state = Mock()
+    request.state.request_id = "test-request-banned-1"
+
+    selected_miner, selected_script = await _select_miner_ss58(request, async_session)
+
+    assert selected_miner.ss58 == "miner_allowed"
+    assert selected_script.script_uuid == "81000000-0000-0000-0000-000000000014"
+
+
+@pytest.mark.asyncio
+async def test_eval_top_fraction_ignores_banned_miners(
+    async_session: AsyncSession, setup_base_data
+):
+    """Test: evaluation top fraction excludes banned miners from eligibility count."""
+    competition, validator = setup_base_data
+    now = datetime.now(timezone.utc)
+
+    timeframe = await async_session.scalar(select(CompetitionTimeframe))
+    timeframe.upload_starts_at = now - timedelta(days=2)
+    timeframe.upload_ends_at = now - timedelta(days=1)
+    timeframe.eval_starts_at = now - timedelta(hours=1)
+    timeframe.eval_ends_at = now + timedelta(hours=1)
+
+    original_top = settings.top_screener_scripts
+    settings.top_screener_scripts = 0.5
+
+    try:
+        # Non-banned high score; later upload.
+        miner_high = Miner(id=90, ss58="miner_high")
+        async_session.add(miner_high)
+        await async_session.flush()
+
+        script_high = Script(
+            id=90,
+            miner_fk=miner_high.id,
+            script_uuid="90000000-0000-0000-0000-000000000015",
+            created_at=now - timedelta(hours=1),
+        )
+        async_session.add(script_high)
+        await async_session.flush()
+
+        async_session.add(
+            MinerUpload(
+                id=90,
+                script_fk=script_high.id,
+                competition_fk=competition.id,
+                created_at=now - timedelta(hours=1),
+            )
+        )
+        await async_session.flush()
+
+        batch_high = ChallengeBatch(
+            id=90,
+            miner_fk=miner_high.id,
+            script_fk=script_high.id,
+            created_at=now - timedelta(hours=1),
+        )
+        async_session.add(batch_high)
+        await async_session.flush()
+
+        for i in range(1, 4):
+            batch_challenge = BatchChallenge(
+                id=900 + i,
+                challenge_batch_fk=batch_high.id,
+                challenge_fk=i,
+                compression_ratio=0.5,
+            )
+            async_session.add(batch_challenge)
+            await async_session.flush()
+            async_session.add(
+                BatchChallengeScore(
+                    id=900 + i,
+                    batch_challenge_fk=batch_challenge.id,
+                    validator_fk=validator.id,
+                    score=0.9,
+                )
+            )
+
+        # Non-banned medium score; earlier upload.
+        miner_medium = Miner(id=91, ss58="miner_medium")
+        async_session.add(miner_medium)
+        await async_session.flush()
+
+        script_medium = Script(
+            id=91,
+            miner_fk=miner_medium.id,
+            script_uuid="91000000-0000-0000-0000-000000000016",
+            created_at=now - timedelta(hours=2),
+        )
+        async_session.add(script_medium)
+        await async_session.flush()
+
+        async_session.add(
+            MinerUpload(
+                id=91,
+                script_fk=script_medium.id,
+                competition_fk=competition.id,
+                created_at=now - timedelta(hours=2),
+            )
+        )
+        await async_session.flush()
+
+        batch_medium = ChallengeBatch(
+            id=91,
+            miner_fk=miner_medium.id,
+            script_fk=script_medium.id,
+            created_at=now - timedelta(hours=2),
+        )
+        async_session.add(batch_medium)
+        await async_session.flush()
+
+        for i in range(1, 4):
+            batch_challenge = BatchChallenge(
+                id=910 + i,
+                challenge_batch_fk=batch_medium.id,
+                challenge_fk=i,
+                compression_ratio=0.5,
+            )
+            async_session.add(batch_challenge)
+            await async_session.flush()
+            async_session.add(
+                BatchChallengeScore(
+                    id=910 + i,
+                    batch_challenge_fk=batch_challenge.id,
+                    validator_fk=validator.id,
+                    score=0.8,
+                )
+            )
+
+        # Banned miner; included to verify it does not affect top-fraction denominator.
+        miner_banned = Miner(
+            id=92,
+            ss58="miner_banned_low",
+            miner_banned_status=True,
+        )
+        async_session.add(miner_banned)
+        await async_session.flush()
+
+        script_banned = Script(
+            id=92,
+            miner_fk=miner_banned.id,
+            script_uuid="92000000-0000-0000-0000-000000000017",
+            created_at=now - timedelta(hours=3),
+        )
+        async_session.add(script_banned)
+        await async_session.flush()
+
+        async_session.add(
+            MinerUpload(
+                id=92,
+                script_fk=script_banned.id,
+                competition_fk=competition.id,
+                created_at=now - timedelta(hours=3),
+            )
+        )
+        await async_session.flush()
+
+        batch_banned = ChallengeBatch(
+            id=92,
+            miner_fk=miner_banned.id,
+            script_fk=script_banned.id,
+            created_at=now - timedelta(hours=3),
+        )
+        async_session.add(batch_banned)
+        await async_session.flush()
+
+        for i in range(1, 4):
+            batch_challenge = BatchChallenge(
+                id=920 + i,
+                challenge_batch_fk=batch_banned.id,
+                challenge_fk=i,
+                compression_ratio=0.5,
+            )
+            async_session.add(batch_challenge)
+            await async_session.flush()
+            async_session.add(
+                BatchChallengeScore(
+                    id=920 + i,
+                    batch_challenge_fk=batch_challenge.id,
+                    validator_fk=validator.id,
+                    score=0.1,
+                )
+            )
+
+        await async_session.commit()
+
+        request = Mock()
+        request.state = Mock()
+        request.state.request_id = "test-request-banned-2"
+
+        selected_miner, selected_script = await _select_miner_ss58(
+            request, async_session
+        )
+
+        # If banned miners are excluded from denominator, only top 1 of 2 non-banned
+        # miners advances -> the higher scoring miner should be selected.
+        assert selected_miner.ss58 == "miner_high"
+        assert (
+            selected_script.script_uuid
+            == "90000000-0000-0000-0000-000000000015"
+        )
+    finally:
+        settings.top_screener_scripts = original_top
+
+
+@pytest.mark.asyncio
 async def test_no_miners_with_free_challenges_raises_error(
     async_session: AsyncSession, setup_base_data
 ):

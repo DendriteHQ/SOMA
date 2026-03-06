@@ -22,7 +22,11 @@ from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.script import Script
 from app.services.blob.script_storage import ScriptStorage
-from app.services.script_store import DuplicateMinerUploadError, store_hot_script
+from app.services.script_store import (
+    BannedMinerUploadError,
+    DuplicateMinerUploadError,
+    store_hot_script,
+)
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
 from app.core.config import settings
 
@@ -118,6 +122,21 @@ def _ensure_miner_registered(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Metagraph data incomplete",
+        )
+
+
+async def _ensure_miner_not_banned(
+    db: AsyncSession,
+    *,
+    miner_hotkey: str,
+) -> None:
+    banned = await db.scalar(
+        select(Miner.miner_banned_status).where(Miner.ss58 == miner_hotkey).limit(1)
+    )
+    if banned:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Miner is banned and cannot upload scripts",
         )
 
 
@@ -315,6 +334,10 @@ async def upload_miner_script(
         )
 
     try:
+        await _ensure_miner_not_banned(
+            db,
+            miner_hotkey=payload.miner_hotkey,
+        )
         competition_id = await _get_current_open_competition_id(db)
         await _acquire_miner_upload_lock(
             db,
@@ -395,6 +418,23 @@ async def upload_miner_script(
         )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+    except BannedMinerUploadError as exc:
+        await db.rollback()
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_403_FORBIDDEN,
+            str(exc),
+            miner_hotkey=payload.miner_hotkey,
+            signer_ss58=_req.sig.signer_ss58,
+            nonce=_req.sig.nonce,
+            signature=_req.sig.signature,
+            exc=exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         )
     except LookupError as exc:

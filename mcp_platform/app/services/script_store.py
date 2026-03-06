@@ -25,6 +25,10 @@ class DuplicateMinerUploadError(RuntimeError):
     pass
 
 
+class BannedMinerUploadError(RuntimeError):
+    pass
+
+
 async def _select_active_competition_id(session: AsyncSession) -> int | None:
     now = datetime.now(timezone.utc)
     result = await session.execute(
@@ -113,9 +117,16 @@ async def store_hot_script(
         if competition_id is None:
             raise LookupError("No active competition available for miner upload")
 
-        await session.execute(
-            select(Miner.id).where(Miner.id == miner_id).with_for_update()
+        miner_row = await session.scalar(
+            select(Miner).where(Miner.id == miner_id).with_for_update()
         )
+        if miner_row is None:
+            raise LookupError(f"Failed to resolve miner row for id={miner_id}")
+        if miner_row.miner_banned_status:
+            raise BannedMinerUploadError(
+                "Miner is banned and cannot upload scripts"
+            )
+
         existing_upload = await session.scalar(
             select(MinerUpload.id)
             .join(Script, Script.id == MinerUpload.script_fk)
@@ -147,6 +158,9 @@ async def store_hot_script(
         await session.refresh(script_row)
         write_succeeded = True
     except DuplicateMinerUploadError:
+        await session.rollback()
+        raise
+    except BannedMinerUploadError:
         await session.rollback()
         raise
     except SQLAlchemyError:

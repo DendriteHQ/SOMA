@@ -369,6 +369,18 @@ async def request_challenge(
                         detail="No tasks available - all miners are scored or no free challenges exist",
                     )
 
+                miner_is_banned = await db.scalar(
+                    select(Miner.miner_banned_status)
+                    .where(Miner.id == miner.id)
+                    .with_for_update()
+                )
+                if miner_is_banned:
+                    bt.logging.info(
+                        "request_challenge: skipping banned miner "
+                        f"miner_ss58={miner.ss58} request_id={request_id}"
+                    )
+                    continue
+
                 existing_batch_result = await db.execute(
                     select(ChallengeBatch)
                     .outerjoin(
@@ -971,6 +983,34 @@ async def score_challenges(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Batch is not assigned to this validator",
         )
+
+    miner_is_banned = await db.scalar(
+        select(Miner.miner_banned_status)
+        .select_from(ChallengeBatch)
+        .join(Miner, Miner.id == ChallengeBatch.miner_fk)
+        .where(ChallengeBatch.id == batch_entry.id)
+        .limit(1)
+    )
+    if miner_is_banned:
+        await db.execute(
+            update(BatchAssignment)
+            .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
+            .where(BatchAssignment.validator_fk == validator.id)
+            .where(BatchAssignment.done_at.is_(None))
+            .values(done_at=datetime.now(timezone.utc))
+        )
+        await db.commit()
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_409_CONFLICT,
+            "Miner is banned; scoring is disabled for this batch",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Miner is banned; scoring is disabled for this batch",
+        )
+
     validator.current_status = "active"
 
     answer_rows: list[BatchQuestionAnswer] = []
@@ -1181,7 +1221,12 @@ async def get_best_miners(
                         total_uploads = await db.scalar(
                             select(
                                 func.count(func.distinct(MinerUpload.script_fk))
-                            ).where(MinerUpload.competition_fk == active_competition_id)
+                            )
+                            .select_from(MinerUpload)
+                            .join(Script, Script.id == MinerUpload.script_fk)
+                            .join(Miner, Miner.id == Script.miner_fk)
+                            .where(MinerUpload.competition_fk == active_competition_id)
+                            .where(Miner.miner_banned_status.is_(False))
                         )
                         total_uploads = int(total_uploads or 0)
 
@@ -1230,6 +1275,7 @@ async def get_best_miners(
                                     V_MINER_SCREENER_STATS.c.screener_scored
                                     >= screener_challenges_count * ratio_count
                                 )
+                                .where(Miner.miner_banned_status.is_(False))
                             )
 
                             screener_scores = [

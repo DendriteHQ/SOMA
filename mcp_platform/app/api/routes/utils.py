@@ -370,7 +370,11 @@ async def _get_screener_backlog_count(
     )
     scripts_in_competition = (
         select(MinerUpload.script_fk.label("script_fk"))
+        .select_from(MinerUpload)
+        .join(Script, Script.id == MinerUpload.script_fk)
+        .join(Miner, Miner.id == Script.miner_fk)
         .where(MinerUpload.competition_fk == competition_id)
+        .where(Miner.miner_banned_status.is_(False))
         .distinct()
         .subquery()
     )
@@ -420,6 +424,14 @@ async def _build_top_screener_scripts_subq(
             ChallengeBatch.id == BatchChallenge.challenge_batch_fk,
         )
         .join(
+            Script,
+            Script.id == ChallengeBatch.script_fk,
+        )
+        .join(
+            Miner,
+            Miner.id == Script.miner_fk,
+        )
+        .join(
             MinerUpload,
             MinerUpload.script_fk == ChallengeBatch.script_fk,
         )
@@ -428,6 +440,7 @@ async def _build_top_screener_scripts_subq(
             screener_challenges.c.challenge_fk == BatchChallenge.challenge_fk,
         )
         .where(MinerUpload.competition_fk == competition_id)
+        .where(Miner.miner_banned_status.is_(False))
         .group_by(ChallengeBatch.script_fk)
         .subquery()
     )
@@ -585,6 +598,7 @@ async def _select_miner_ss58(
         .join(Script, Script.miner_fk == Miner.id)
         .join(MinerUpload, MinerUpload.script_fk == Script.id)
         .where(MinerUpload.competition_fk == active_competition_id)
+        .where(Miner.miner_banned_status.is_(False))
         .outerjoin(
             accounted_pairs_per_script,
             accounted_pairs_per_script.c.script_fk == Script.id,
