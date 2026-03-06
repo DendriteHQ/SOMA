@@ -32,6 +32,7 @@ from soma_shared.db.models.burn_request import BurnRequest
 from soma_shared.db.models.screener import Screener
 from soma_shared.db.models.screening_challenge import ScreeningChallenge
 from soma_shared.db.validator_log import log_validator_message
+from app.db.views import V_ACTIVE_COMPETITION, V_SCREENER_CHALLENGES_ACTIVE
 from app.core.config import settings
 from app.api.deps import get_script_storage
 
@@ -105,16 +106,7 @@ async def _log_error_response(
 
 
 async def _get_active_competition_id(db: AsyncSession) -> int | None:
-    return await db.scalar(
-        select(Competition.id)
-        .join(
-            CompetitionConfig,
-            CompetitionConfig.competition_fk == Competition.id,
-        )
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
-    )
+    return await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
 
 
 async def _get_current_burn_state(db: AsyncSession) -> tuple[bool, float]:
@@ -178,11 +170,10 @@ async def _get_screener_challenges(
 ):
     screener_challenges = (
         select(
-            ScreeningChallenge.challenge_fk.label("challenge_fk"),
+            V_SCREENER_CHALLENGES_ACTIVE.c.challenge_id.label("challenge_fk"),
         )
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .where(Screener.competition_fk == competition_id)
-        .where(Screener.is_active.is_(True))
+        .select_from(V_SCREENER_CHALLENGES_ACTIVE)
+        .where(V_SCREENER_CHALLENGES_ACTIVE.c.competition_id == competition_id)
         .subquery()
     )
     screener_challenges_count = await db.scalar(

@@ -47,6 +47,12 @@ from soma_shared.db.models.script import Script
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
 from soma_shared.db.session import get_db_session
+from app.db.views import (
+    V_ACTIVE_COMPETITION,
+    V_MINER_COMPETITION_RANK,
+    V_MINER_SCREENER_STATS,
+    V_SCREENER_CHALLENGES_ACTIVE,
+)
 from app.core.config import settings
 from app.api.routes.utils import _get_current_burn_state
 import logging
@@ -63,55 +69,31 @@ def _build_miner_data_subqueries(latest_active_competition_id: int):
     """
     # Get screener challenge IDs to exclude from competition counts
     screener_challenge_ids_subq = (
-        select(ScreeningChallenge.challenge_fk)
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .where(Screener.competition_fk == latest_active_competition_id)
-        .where(Screener.is_active.is_(True))
+        select(V_SCREENER_CHALLENGES_ACTIVE.c.challenge_id)
+        .select_from(V_SCREENER_CHALLENGES_ACTIVE)
+        .where(V_SCREENER_CHALLENGES_ACTIVE.c.competition_id == latest_active_competition_id)
         .scalar_subquery()
     )
 
     # Screener challenges assigned per miner
     screener_assigned_subq = (
         select(
-            ChallengeBatch.miner_fk.label("miner_fk"),
-            func.count(func.distinct(BatchChallenge.id)).label("screener_assigned"),
+            V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
+            V_MINER_SCREENER_STATS.c.screener_assigned.label("screener_assigned"),
         )
-        .select_from(BatchChallenge)
-        .join(ChallengeBatch, ChallengeBatch.id == BatchChallenge.challenge_batch_fk)
-        .join(
-            ScreeningChallenge,
-            ScreeningChallenge.challenge_fk == BatchChallenge.challenge_fk,
-        )
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .join(MinerUpload, MinerUpload.script_fk == ChallengeBatch.script_fk)
-        .where(Screener.competition_fk == latest_active_competition_id)
-        .where(Screener.is_active.is_(True))
-        .where(MinerUpload.competition_fk == latest_active_competition_id)
-        .group_by(ChallengeBatch.miner_fk)
+        .select_from(V_MINER_SCREENER_STATS)
+        .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
         .subquery()
     )
 
     # Screener challenges scored per miner
     screener_scored_subq = (
         select(
-            ChallengeBatch.miner_fk.label("miner_fk"),
-            func.count(func.distinct(BatchChallenge.id)).label("screener_scored"),
+            V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
+            V_MINER_SCREENER_STATS.c.screener_scored.label("screener_scored"),
         )
-        .select_from(BatchChallengeScore)
-        .join(
-            BatchChallenge, BatchChallenge.id == BatchChallengeScore.batch_challenge_fk
-        )
-        .join(ChallengeBatch, ChallengeBatch.id == BatchChallenge.challenge_batch_fk)
-        .join(
-            ScreeningChallenge,
-            ScreeningChallenge.challenge_fk == BatchChallenge.challenge_fk,
-        )
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .join(MinerUpload, MinerUpload.script_fk == ChallengeBatch.script_fk)
-        .where(Screener.competition_fk == latest_active_competition_id)
-        .where(Screener.is_active.is_(True))
-        .where(MinerUpload.competition_fk == latest_active_competition_id)
-        .group_by(ChallengeBatch.miner_fk)
+        .select_from(V_MINER_SCREENER_STATS)
+        .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
         .subquery()
     )
 
@@ -176,36 +158,12 @@ def _build_miner_data_subqueries(latest_active_competition_id: int):
     if top_fraction > 0:
         eligible_subq = (
             select(
-                ChallengeBatch.miner_fk.label("miner_fk"),
-                (
-                    func.sum(
-                        BatchChallengeScore.score
-                        / func.sqrt(BatchChallenge.compression_ratio)
-                    )
-                    / func.sum(
-                        literal(1.0) / func.sqrt(BatchChallenge.compression_ratio)
-                    )
-                ).label("avg_score"),
-                func.count(func.distinct(BatchChallenge.id)).label("scored_count"),
+                V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
+                V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
+                V_MINER_SCREENER_STATS.c.screener_scored.label("scored_count"),
             )
-            .select_from(BatchChallengeScore)
-            .join(
-                BatchChallenge,
-                BatchChallenge.id == BatchChallengeScore.batch_challenge_fk,
-            )
-            .join(
-                ChallengeBatch, ChallengeBatch.id == BatchChallenge.challenge_batch_fk
-            )
-            .join(MinerUpload, MinerUpload.script_fk == ChallengeBatch.script_fk)
-            .join(
-                ScreeningChallenge,
-                ScreeningChallenge.challenge_fk == BatchChallenge.challenge_fk,
-            )
-            .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-            .where(Screener.competition_fk == latest_active_competition_id)
-            .where(Screener.is_active.is_(True))
-            .where(MinerUpload.competition_fk == latest_active_competition_id)
-            .group_by(ChallengeBatch.miner_fk)
+            .select_from(V_MINER_SCREENER_STATS)
+            .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
             .subquery()
         )
 
@@ -479,20 +437,14 @@ async def list_miners(
 
     # Get the latest active competition
     latest_active_competition_subq = (
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
-        .scalar_subquery()
+        select(V_ACTIVE_COMPETITION.c.competition_id).limit(1).scalar_subquery()
     )
 
     # Get screener challenge IDs to exclude from competition counts
     screener_challenge_ids_subq = (
-        select(ScreeningChallenge.challenge_fk)
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .where(Screener.competition_fk == latest_active_competition_subq)
-        .where(Screener.is_active.is_(True))
+        select(V_SCREENER_CHALLENGES_ACTIVE.c.challenge_id)
+        .select_from(V_SCREENER_CHALLENGES_ACTIVE)
+        .where(V_SCREENER_CHALLENGES_ACTIVE.c.competition_id == latest_active_competition_subq)
         .scalar_subquery()
     )
 
@@ -593,47 +545,26 @@ async def list_miners(
 
     # Get screening challenges for the latest active competition
     screening_challenges_subq = (
-        select(ScreeningChallenge.challenge_fk)
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .where(Screener.competition_fk == latest_active_competition_subq)
-        .where(Screener.is_active.is_(True))
+        select(V_SCREENER_CHALLENGES_ACTIVE.c.challenge_id)
+        .select_from(V_SCREENER_CHALLENGES_ACTIVE)
+        .where(V_SCREENER_CHALLENGES_ACTIVE.c.competition_id == latest_active_competition_subq)
         .subquery()
     )
 
     # Screener score per miner: only for screener batch_challenges, only for latest active competition
     screener_score_subq = (
         select(
-            ChallengeBatch.miner_fk.label("miner_fk"),
-            (
-                func.sum(
-                    BatchChallengeScore.score
-                    / func.sqrt(BatchChallenge.compression_ratio)
-                )
-                / func.sum(literal(1.0) / func.sqrt(BatchChallenge.compression_ratio))
-            ).label("screener_score"),
+            V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
+            V_MINER_SCREENER_STATS.c.avg_score.label("screener_score"),
         )
-        .select_from(ChallengeBatch)
-        .join(BatchChallenge, BatchChallenge.challenge_batch_fk == ChallengeBatch.id)
-        .join(
-            BatchChallengeScore,
-            BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
-        )
-        .join(Challenge, Challenge.id == BatchChallenge.challenge_fk)
-        .join(CompetitionChallenge, CompetitionChallenge.challenge_fk == Challenge.id)
-        .where(BatchChallenge.challenge_fk.in_(select(screening_challenges_subq)))
-        .where(CompetitionChallenge.competition_fk == latest_active_competition_subq)
-        .where(CompetitionChallenge.is_active.is_(True))
-        .group_by(ChallengeBatch.miner_fk)
+        .select_from(V_MINER_SCREENER_STATS)
+        .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_subq)
         .subquery()
     )
 
     # Get latest active competition ID
     latest_active_competition_id = await db.scalar(
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
+        select(V_ACTIVE_COMPETITION.c.competition_id).limit(1)
     )
 
     # Build subqueries for screener data (optimized - no per-miner queries)
@@ -645,50 +576,22 @@ async def list_miners(
         # Screener challenges assigned per miner
         screener_assigned_subq = (
             select(
-                ChallengeBatch.miner_fk.label("miner_fk"),
-                func.count(func.distinct(BatchChallenge.id)).label("screener_assigned"),
+                V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
+                V_MINER_SCREENER_STATS.c.screener_assigned.label("screener_assigned"),
             )
-            .select_from(BatchChallenge)
-            .join(
-                ChallengeBatch, ChallengeBatch.id == BatchChallenge.challenge_batch_fk
-            )
-            .join(
-                ScreeningChallenge,
-                ScreeningChallenge.challenge_fk == BatchChallenge.challenge_fk,
-            )
-            .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-            .join(MinerUpload, MinerUpload.script_fk == ChallengeBatch.script_fk)
-            .where(Screener.competition_fk == latest_active_competition_id)
-            .where(Screener.is_active.is_(True))
-            .where(MinerUpload.competition_fk == latest_active_competition_id)
-            .group_by(ChallengeBatch.miner_fk)
+            .select_from(V_MINER_SCREENER_STATS)
+            .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
             .subquery()
         )
 
         # Screener challenges scored per miner
         screener_scored_subq = (
             select(
-                ChallengeBatch.miner_fk.label("miner_fk"),
-                func.count(func.distinct(BatchChallenge.id)).label("screener_scored"),
+                V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
+                V_MINER_SCREENER_STATS.c.screener_scored.label("screener_scored"),
             )
-            .select_from(BatchChallengeScore)
-            .join(
-                BatchChallenge,
-                BatchChallenge.id == BatchChallengeScore.batch_challenge_fk,
-            )
-            .join(
-                ChallengeBatch, ChallengeBatch.id == BatchChallenge.challenge_batch_fk
-            )
-            .join(
-                ScreeningChallenge,
-                ScreeningChallenge.challenge_fk == BatchChallenge.challenge_fk,
-            )
-            .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-            .join(MinerUpload, MinerUpload.script_fk == ChallengeBatch.script_fk)
-            .where(Screener.competition_fk == latest_active_competition_id)
-            .where(Screener.is_active.is_(True))
-            .where(MinerUpload.competition_fk == latest_active_competition_id)
-            .group_by(ChallengeBatch.miner_fk)
+            .select_from(V_MINER_SCREENER_STATS)
+            .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
             .subquery()
         )
 
@@ -698,37 +601,12 @@ async def list_miners(
             # Get eligible miners who completed all their assigned screener challenges
             eligible_subq = (
                 select(
-                    ChallengeBatch.miner_fk.label("miner_fk"),
-                    (
-                        func.sum(
-                            BatchChallengeScore.score
-                            / func.sqrt(BatchChallenge.compression_ratio)
-                        )
-                        / func.sum(
-                            literal(1.0) / func.sqrt(BatchChallenge.compression_ratio)
-                        )
-                    ).label("avg_score"),
-                    func.count(func.distinct(BatchChallenge.id)).label("scored_count"),
+                    V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
+                    V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
+                    V_MINER_SCREENER_STATS.c.screener_scored.label("scored_count"),
                 )
-                .select_from(BatchChallengeScore)
-                .join(
-                    BatchChallenge,
-                    BatchChallenge.id == BatchChallengeScore.batch_challenge_fk,
-                )
-                .join(
-                    ChallengeBatch,
-                    ChallengeBatch.id == BatchChallenge.challenge_batch_fk,
-                )
-                .join(MinerUpload, MinerUpload.script_fk == ChallengeBatch.script_fk)
-                .join(
-                    ScreeningChallenge,
-                    ScreeningChallenge.challenge_fk == BatchChallenge.challenge_fk,
-                )
-                .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-                .where(Screener.competition_fk == latest_active_competition_id)
-                .where(Screener.is_active.is_(True))
-                .where(MinerUpload.competition_fk == latest_active_competition_id)
-                .group_by(ChallengeBatch.miner_fk)
+                .select_from(V_MINER_SCREENER_STATS)
+                .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
                 .subquery()
             )
 
@@ -950,11 +828,7 @@ async def get_miner(
 
     # Get the latest active competition
     latest_active_competition_id = await db.scalar(
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
+        select(V_ACTIVE_COMPETITION.c.competition_id).limit(1)
     )
 
     # Build subqueries for miner data
@@ -1056,11 +930,7 @@ async def get_miner(
 
     # Get the latest active competition
     latest_active_competition_id = await db.scalar(
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
+        select(V_ACTIVE_COMPETITION.c.competition_id).limit(1)
     )
 
     # Get last competition with its score (properly filtered by competition)
@@ -1201,33 +1071,11 @@ async def get_miner(
     total_score_result = None
     if latest_active_competition_id is not None:
         total_score_result = await db.scalar(
-            select(
-                func.sum(
-                    BatchChallengeScore.score
-                    / func.sqrt(BatchChallenge.compression_ratio)
-                )
-                / func.sum(literal(1.0) / func.sqrt(BatchChallenge.compression_ratio))
-            )
-            .select_from(ChallengeBatch)
-            .join(
-                BatchChallenge,
-                BatchChallenge.challenge_batch_fk == ChallengeBatch.id,
-            )
-            .join(
-                BatchChallengeScore,
-                BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
-            )
-            .join(
-                Challenge,
-                Challenge.id == BatchChallenge.challenge_fk,
-            )
-            .join(
-                CompetitionChallenge,
-                CompetitionChallenge.challenge_fk == Challenge.id,
-            )
-            .where(ChallengeBatch.miner_fk == miner.id)
-            .where(CompetitionChallenge.competition_fk == latest_active_competition_id)
-            .where(CompetitionChallenge.is_active.is_(True))
+            select(V_MINER_COMPETITION_RANK.c.total_score)
+            .select_from(V_MINER_COMPETITION_RANK)
+            .where(V_MINER_COMPETITION_RANK.c.competition_id == latest_active_competition_id)
+            .where(V_MINER_COMPETITION_RANK.c.miner_id == miner.id)
+            .limit(1)
         )
 
     last_competition = None
@@ -1236,65 +1084,25 @@ async def get_miner(
 
     # Calculate miner rank based on average of all scores from the latest active competition
     if latest_active_competition_id is not None:
-        all_miners_scores = await db.execute(
-            select(
-                ChallengeBatch.miner_fk,
-                (
-                    func.sum(
-                        BatchChallengeScore.score
-                        / func.sqrt(BatchChallenge.compression_ratio)
-                    )
-                    / func.sum(
-                        literal(1.0) / func.sqrt(BatchChallenge.compression_ratio)
-                    )
-                ).label("total_score"),
-                func.min(Script.created_at).label("first_upload"),
+        rank_row = (
+            await db.execute(
+                select(
+                    V_MINER_COMPETITION_RANK.c.rank,
+                    V_MINER_COMPETITION_RANK.c.total_miners,
+                )
+                .select_from(V_MINER_COMPETITION_RANK)
+                .where(
+                    V_MINER_COMPETITION_RANK.c.competition_id
+                    == latest_active_competition_id
+                )
+                .where(V_MINER_COMPETITION_RANK.c.miner_id == miner.id)
+                .limit(1)
             )
-            .select_from(ChallengeBatch)
-            .join(
-                Script,
-                Script.id == ChallengeBatch.script_fk,
-            )
-            .join(
-                MinerUpload,
-                MinerUpload.script_fk == Script.id,
-            )
-            .join(
-                BatchChallenge,
-                BatchChallenge.challenge_batch_fk == ChallengeBatch.id,
-            )
-            .join(
-                BatchChallengeScore,
-                BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
-            )
-            .join(
-                Challenge,
-                Challenge.id == BatchChallenge.challenge_fk,
-            )
-            .join(
-                CompetitionChallenge,
-                CompetitionChallenge.challenge_fk == Challenge.id,
-            )
-            .where(CompetitionChallenge.competition_fk == latest_active_competition_id)
-            .where(CompetitionChallenge.is_active.is_(True))
-            .where(MinerUpload.competition_fk == latest_active_competition_id)
-            .group_by(ChallengeBatch.miner_fk)
-        )
+        ).first()
 
-        miners_scores = [
-            (miner_fk, total_score, first_upload)
-            for miner_fk, total_score, first_upload in all_miners_scores.all()
-        ]
-        # Sort by: 1) score desc, 2) upload time asc (earlier = better)
-        miners_scores.sort(
-            key=lambda x: (x[1] is None, -x[1] if x[1] is not None else 0, x[2])
-        )
-        total_miners_count = len(miners_scores)
-
-        for idx, (miner_fk, _, _) in enumerate(miners_scores, start=1):
-            if miner_fk == miner.id:
-                miner_rank = idx
-                break
+        if rank_row is not None:
+            miner_rank = int(rank_row.rank) if rank_row.rank is not None else None
+            total_miners_count = int(rank_row.total_miners or 0)
 
     if last_competition_data is not None:
         competition_id, competition_name, last_upload_date, competition_score = (
@@ -1521,11 +1329,7 @@ async def get_miner_contests_challenges(
 
     # Get the latest active competition
     latest_active_competition_id = await db.scalar(
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
+        select(V_ACTIVE_COMPETITION.c.competition_id).limit(1)
     )
 
     if latest_active_competition_id is None:
@@ -1627,11 +1431,7 @@ async def get_miner_contests(
 
     # Get the latest active competition
     latest_active_competition_id = await db.scalar(
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
+        select(V_ACTIVE_COMPETITION.c.competition_id).limit(1)
     )
 
     # If no active competition, return empty response
@@ -1693,64 +1493,25 @@ async def get_miner_contests(
     # Calculate miner's rank based on scores from the latest active competition
     miner_rank = None
     total_miners_count = 0
-
-    all_miners_sum = await db.execute(
-        select(
-            ChallengeBatch.miner_fk,
-            (
-                func.sum(
-                    BatchChallengeScore.score
-                    / func.sqrt(BatchChallenge.compression_ratio)
+    if latest_active_competition_id is not None:
+        rank_row = (
+            await db.execute(
+                select(
+                    V_MINER_COMPETITION_RANK.c.rank,
+                    V_MINER_COMPETITION_RANK.c.total_miners,
                 )
-                / func.sum(literal(1.0) / func.sqrt(BatchChallenge.compression_ratio))
-            ).label("total_score"),
-            func.min(Script.created_at).label("first_upload"),
-        )
-        .select_from(ChallengeBatch)
-        .join(
-            Script,
-            Script.id == ChallengeBatch.script_fk,
-        )
-        .join(
-            MinerUpload,
-            MinerUpload.script_fk == Script.id,
-        )
-        .join(
-            BatchChallenge,
-            BatchChallenge.challenge_batch_fk == ChallengeBatch.id,
-        )
-        .join(
-            BatchChallengeScore,
-            BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
-        )
-        .join(
-            Challenge,
-            Challenge.id == BatchChallenge.challenge_fk,
-        )
-        .join(
-            CompetitionChallenge,
-            CompetitionChallenge.challenge_fk == Challenge.id,
-        )
-        .where(CompetitionChallenge.competition_fk == latest_active_competition_id)
-        .where(CompetitionChallenge.is_active.is_(True))
-        .where(MinerUpload.competition_fk == latest_active_competition_id)
-        .group_by(ChallengeBatch.miner_fk)
-    )
-
-    miners_scores = [
-        (miner_fk, total_score, first_upload)
-        for miner_fk, total_score, first_upload in all_miners_sum.all()
-    ]
-    # Sort by: 1) score desc, 2) upload time asc (earlier = better)
-    miners_scores.sort(
-        key=lambda x: (x[1] is None, -x[1] if x[1] is not None else 0, x[2])
-    )
-    total_miners_count = len(miners_scores)
-
-    for idx, (miner_fk, _, _) in enumerate(miners_scores, start=1):
-        if miner_fk == miner.id:
-            miner_rank = idx
-            break
+                .select_from(V_MINER_COMPETITION_RANK)
+                .where(
+                    V_MINER_COMPETITION_RANK.c.competition_id
+                    == latest_active_competition_id
+                )
+                .where(V_MINER_COMPETITION_RANK.c.miner_id == miner.id)
+                .limit(1)
+            )
+        ).first()
+        if rank_row is not None:
+            miner_rank = int(rank_row.rank) if rank_row.rank is not None else None
+            total_miners_count = int(rank_row.total_miners or 0)
 
     competitions = [
         ContestSummary(
@@ -1795,11 +1556,7 @@ async def get_miner_screener_contests(
 
     # Get the latest active competition
     latest_active_competition_id = await db.scalar(
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
+        select(V_ACTIVE_COMPETITION.c.competition_id).limit(1)
     )
 
     if latest_active_competition_id is None:
@@ -1807,10 +1564,9 @@ async def get_miner_screener_contests(
 
     # Get screening challenges for this competition
     screening_challenges_subq = (
-        select(ScreeningChallenge.challenge_fk)
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .where(Screener.competition_fk == latest_active_competition_id)
-        .where(Screener.is_active.is_(True))
+        select(V_SCREENER_CHALLENGES_ACTIVE.c.challenge_id)
+        .select_from(V_SCREENER_CHALLENGES_ACTIVE)
+        .where(V_SCREENER_CHALLENGES_ACTIVE.c.competition_id == latest_active_competition_id)
         .subquery()
     )
 
@@ -1859,23 +1615,11 @@ async def get_miner_screener_contests(
         return ScreenerChallengesResponse(avg_score=None, challenges=[], total=0)
 
     avg_score_result = await db.scalar(
-        select(
-            func.sum(
-                BatchChallengeScore.score / func.sqrt(BatchChallenge.compression_ratio)
-            )
-            / func.sum(literal(1.0) / func.sqrt(BatchChallenge.compression_ratio))
-        )
-        .select_from(ChallengeBatch)
-        .join(
-            BatchChallenge,
-            BatchChallenge.challenge_batch_fk == ChallengeBatch.id,
-        )
-        .join(
-            BatchChallengeScore,
-            BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
-        )
-        .where(ChallengeBatch.miner_fk == miner.id)
-        .where(BatchChallenge.challenge_fk.in_(select(screening_challenges_subq)))
+        select(V_MINER_SCREENER_STATS.c.avg_score)
+        .select_from(V_MINER_SCREENER_STATS)
+        .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
+        .where(V_MINER_SCREENER_STATS.c.miner_id == miner.id)
+        .limit(1)
     )
     avg_score = float(avg_score_result) if avg_score_result is not None else None
 
@@ -1883,54 +1627,36 @@ async def get_miner_screener_contests(
     miner_rank = None
     total_miners_count = 0
 
-    all_miners_screener_scores = await db.execute(
+    ranked_subq = (
         select(
-            ChallengeBatch.miner_fk,
-            (
-                func.sum(
-                    BatchChallengeScore.score
-                    / func.sqrt(BatchChallenge.compression_ratio)
+            V_MINER_SCREENER_STATS.c.miner_id.label("miner_id"),
+            func.row_number()
+            .over(
+                order_by=(
+                    V_MINER_SCREENER_STATS.c.avg_score.desc().nullslast(),
+                    V_MINER_SCREENER_STATS.c.first_upload_at.asc().nullsfirst(),
+                    V_MINER_SCREENER_STATS.c.miner_id.asc(),
                 )
-                / func.sum(literal(1.0) / func.sqrt(BatchChallenge.compression_ratio))
-            ).label("avg_score"),
-            func.min(Script.created_at).label("first_upload"),
+            )
+            .label("rank"),
+            func.count(literal(1)).over().label("total_miners"),
         )
-        .select_from(ChallengeBatch)
-        .join(
-            Script,
-            Script.id == ChallengeBatch.script_fk,
-        )
-        .join(
-            MinerUpload,
-            MinerUpload.script_fk == Script.id,
-        )
-        .join(
-            BatchChallenge,
-            BatchChallenge.challenge_batch_fk == ChallengeBatch.id,
-        )
-        .join(
-            BatchChallengeScore,
-            BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
-        )
-        .where(BatchChallenge.challenge_fk.in_(select(screening_challenges_subq)))
-        .where(MinerUpload.competition_fk == latest_active_competition_id)
-        .group_by(ChallengeBatch.miner_fk)
+        .select_from(V_MINER_SCREENER_STATS)
+        .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
+        .subquery()
     )
 
-    miners_scores = [
-        (miner_fk, avg_score_m, first_upload)
-        for miner_fk, avg_score_m, first_upload in all_miners_screener_scores.all()
-    ]
-    # Sort by: 1) score desc, 2) upload time asc (earlier = better)
-    miners_scores.sort(
-        key=lambda x: (x[1] is None, -x[1] if x[1] is not None else 0, x[2])
-    )
-    total_miners_count = len(miners_scores)
+    rank_row = (
+        await db.execute(
+            select(ranked_subq.c.rank, ranked_subq.c.total_miners)
+            .where(ranked_subq.c.miner_id == miner.id)
+            .limit(1)
+        )
+    ).first()
 
-    for idx, (miner_fk, _, _) in enumerate(miners_scores, start=1):
-        if miner_fk == miner.id:
-            miner_rank = idx
-            break
+    if rank_row is not None:
+        miner_rank = int(rank_row.rank) if rank_row.rank is not None else None
+        total_miners_count = int(rank_row.total_miners or 0)
 
     # Get detailed questions for each challenge
     challenges = []

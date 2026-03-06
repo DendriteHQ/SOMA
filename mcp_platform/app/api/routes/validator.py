@@ -65,6 +65,7 @@ from app.api.routes.utils import (
     _is_compressed_enough,
     fetch_miner_challenge_code,
 )
+from app.db.views import V_MINER_SCREENER_STATS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["validator"])
@@ -1073,53 +1074,25 @@ async def get_best_miners(
                             screener_scores_result = await db.execute(
                                 select(
                                     Miner.ss58,
-                                    func.count(func.distinct(BatchChallenge.id)).label(
+                                    V_MINER_SCREENER_STATS.c.screener_scored.label(
                                         "scored_count"
                                     ),
-                                    (
-                                        func.sum(
-                                            BatchChallengeScore.score
-                                            / func.sqrt(
-                                                BatchChallenge.compression_ratio
-                                            )
-                                        )
-                                        / func.sum(
-                                            literal(1.0)
-                                            / func.sqrt(
-                                                BatchChallenge.compression_ratio
-                                            )
-                                        )
-                                    ).label("avg_score"),
-                                    func.min(MinerUpload.created_at).label(
+                                    V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
+                                    V_MINER_SCREENER_STATS.c.first_upload_at.label(
                                         "earliest_upload"
                                     ),
                                 )
-                                .select_from(BatchChallengeScore)
+                                .select_from(V_MINER_SCREENER_STATS)
                                 .join(
-                                    BatchChallenge,
-                                    BatchChallenge.id
-                                    == BatchChallengeScore.batch_challenge_fk,
+                                    Miner,
+                                    Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
                                 )
-                                .join(
-                                    ChallengeBatch,
-                                    ChallengeBatch.id
-                                    == BatchChallenge.challenge_batch_fk,
+                                .where(
+                                    V_MINER_SCREENER_STATS.c.competition_id
+                                    == active_competition_id
                                 )
-                                .join(Miner, Miner.id == ChallengeBatch.miner_fk)
-                                .join(
-                                    MinerUpload,
-                                    MinerUpload.competition_fk == active_competition_id,
-                                )
-                                .join(Script, Script.id == MinerUpload.script_fk)
-                                .join(
-                                    screener_challenges,
-                                    screener_challenges.c.challenge_fk
-                                    == BatchChallenge.challenge_fk,
-                                )
-                                .where(Script.miner_fk == Miner.id)
-                                .group_by(Miner.ss58)
-                                .having(
-                                    func.count(func.distinct(BatchChallenge.id))
+                                .where(
+                                    V_MINER_SCREENER_STATS.c.screener_scored
                                     >= screener_challenges_count * ratio_count
                                 )
                             )
