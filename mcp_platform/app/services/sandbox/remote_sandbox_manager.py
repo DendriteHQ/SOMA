@@ -59,16 +59,17 @@ class RemoteSandboxManager:
         challenge_code: str,
         challenge_texts: list[str],
         compression_ratios: list[float | None],
+        storage_uuids: list[str],
         acquire_timeout: float = 10.0,
     ) -> list[str]:
         """Execute a batch of challenges on remote sandbox service.
         
         Args:
-            batch_id: Unique batch identifier from ChallengeBatch
+            batch_id: Unique batch identifier from ChallengeBatch (for logging)
             challenge_code: Python code to compress texts
             challenge_texts: List of texts to compress
             compression_ratios: Target compression ratios
-            ttl: Time-to-live for the operation
+            storage_uuids: S3 storage UUIDs, one per challenge_text entry
             acquire_timeout: Timeout for acquiring semaphore slot
             
         Returns:
@@ -96,6 +97,7 @@ class RemoteSandboxManager:
                 challenge_code,
                 challenge_texts,
                 compression_ratios,
+                storage_uuids,
             )
         except Exception as exc:
             logger.error(
@@ -111,14 +113,16 @@ class RemoteSandboxManager:
         challenge_code: str,
         challenge_texts: list[str],
         compression_ratios: list[float | None],
+        storage_uuids: list[str],
     ) -> list[str]:
         """Execute batch on remote sandbox service and retrieve results from S3.
         
         Args:
-            batch_id: Unique batch identifier from ChallengeBatch
+            batch_id: Unique batch identifier from ChallengeBatch (for logging)
             challenge_code: Python code to compress texts
             challenge_texts: List of texts to compress
             compression_ratios: Target compression ratios
+            storage_uuids: S3 storage UUIDs, one per challenge_text entry
             
         Returns:
             List of compressed texts
@@ -135,6 +139,7 @@ class RemoteSandboxManager:
             "challenge_code": challenge_code,
             "challenge_texts": challenge_texts,
             "compression_ratios": compression_ratios,
+            "storage_uuids": storage_uuids,
             "timeout_per_task": self._timeout_per_task,
             "container_timeout": container_timeout,
         }
@@ -194,29 +199,26 @@ class RemoteSandboxManager:
                 )
                 return [""] * len(challenge_texts)
         
-        # Retrieve compressed texts from S3
-        try:
-            compressed_texts = await self._compressed_text_storage.get_batch(batch_id)
-            logger.info(
-                "[RemoteSandbox] Retrieved %d compressed texts from storage",
-                len(compressed_texts),
-            )
-            
-            # Normalize the result to match expected length
-            if len(compressed_texts) < len(challenge_texts):
-                compressed_texts.extend([""] * (len(challenge_texts) - len(compressed_texts)))
-            elif len(compressed_texts) > len(challenge_texts):
-                compressed_texts = compressed_texts[:len(challenge_texts)]
-            
-            return compressed_texts
-            
-        except Exception as exc:
-            logger.error(
-                "[RemoteSandbox] Failed to retrieve compressed texts from storage: %s",
-                exc,
-                exc_info=True,
-            )
-            return [""] * len(challenge_texts)
+        # Retrieve individual compressed texts from S3 using per-challenge UUIDs
+        compressed_texts: list[str] = []
+        for storage_uuid in storage_uuids:
+            try:
+                text = await self._compressed_text_storage.get_single(storage_uuid)
+                compressed_texts.append(text)
+            except Exception as exc:
+                logger.error(
+                    "[RemoteSandbox] Failed to retrieve compressed text for uuid=%s: %s",
+                    storage_uuid,
+                    exc,
+                    exc_info=True,
+                )
+                compressed_texts.append("")
+
+        logger.info(
+            "[RemoteSandbox] Retrieved %d compressed texts from storage",
+            len(compressed_texts),
+        )
+        return compressed_texts
 
     def shutdown(self) -> None:
         """Compatibility lifecycle hook used by app shutdown."""

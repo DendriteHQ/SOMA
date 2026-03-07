@@ -103,9 +103,10 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
             container_timeout=request.container_timeout,
         )
         
-        # Save to S3
+        # Save each compressed text individually to S3 using the per-challenge UUID
         storage = get_compressed_text_storage()
-        await storage.save_batch(request.batch_id, compressed_texts)
+        for storage_uuid, compressed_text in zip(request.storage_uuids, compressed_texts):
+            await storage.save_single(storage_uuid, compressed_text)
         
         logger.info(
             "Batch execution completed: batch_id=%s, results=%d",
