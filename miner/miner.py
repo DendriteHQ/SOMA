@@ -2,7 +2,7 @@
 
 import spacy
 
-NLP = spacy.blank("en_core_web_sm")
+NLP = spacy.blank("en")
 
 
 def token_count(text: str) -> int:
@@ -11,11 +11,15 @@ def token_count(text: str) -> int:
     return sum(1 for tok in NLP.make_doc(text) if not tok.is_space)
 
 
+def target_token_count(text: str, compression_ratio: float) -> int:
+    return int(token_count(text) * compression_ratio)
+
+
 def main(task: str, compression_ratio: float | None = None) -> str:
     if compression_ratio is None:
         compression_ratio = 0.2
 
-    target_tokens = int(token_count(task) * compression_ratio)
+    target_tokens = target_token_count(task, compression_ratio)
     return compress_text(task, target_tokens)
 
 
