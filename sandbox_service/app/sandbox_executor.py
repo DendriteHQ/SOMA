@@ -189,120 +189,121 @@ class SandboxExecutor:
 
             fs_img, output_dir = self._create_limited_fs(tmp_path, size_mb=64)
             try:
-                output_dir.chmod(0o777)
-            except OSError as exc:
-                logger.warning("Failed to chmod output dir %s: %s", output_dir, exc)
-            
-            # Write input files
-            (input_dir / "code.py").write_text(challenge_code)
-            (input_dir / "task.json").write_text(
-                json.dumps(
-                    {
-                        "batch": challenge_texts,
-                        "compression_ratios": compression_ratios,
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            
-            logger.info(
-                "Running sandbox: id=%s, texts=%d, timeout_per_task=%ss, container_timeout=%ss",
-                sandbox_id,
-                len(challenge_texts),
-                timeout_per_task,
-                container_timeout,
-            )
-            
-            container = None
-            try:
-                # Run container with timeout environment variable
-                container = client.containers.run(
-                    self.image,
-                    command=["python", "/sandbox/run_code.py"],
-                    name=sandbox_id,
-                    detach=True,
-                    environment={
-                        "TASK_TIMEOUT": str(timeout_per_task),
-                    },
-                    volumes={
-                        str(input_dir): {"bind": "/sandbox/input", "mode": "ro"},
-                        str(output_dir): {"bind": "/sandbox/output", "mode": "rw"},
-                    },
-                    **CONTAINER_CONFIG,
-                )
-                
-                # Wait for completion
                 try:
-                    result = container.wait(timeout=container_timeout)
-                except Exception as exc:
-                    logger.error(
-                        "Container wait failed (timeout=%ss): %s",
-                        container_timeout,
-                        exc,
-                        exc_info=True,
+                    output_dir.chmod(0o777)
+                except OSError as exc:
+                    logger.warning("Failed to chmod output dir %s: %s", output_dir, exc)
+
+                # Write input files
+                (input_dir / "code.py").write_text(challenge_code)
+                (input_dir / "task.json").write_text(
+                    json.dumps(
+                        {
+                            "batch": challenge_texts,
+                            "compression_ratios": compression_ratios,
+                        },
+                        ensure_ascii=False,
                     )
+                )
+
+                logger.info(
+                    "Running sandbox: id=%s, texts=%d, timeout_per_task=%ss, container_timeout=%ss",
+                    sandbox_id,
+                    len(challenge_texts),
+                    timeout_per_task,
+                    container_timeout,
+                )
+
+                container = None
+                try:
+                    # Run container with timeout environment variable
+                    container = client.containers.run(
+                        self.image,
+                        command=["python", "/sandbox/run_code.py"],
+                        name=sandbox_id,
+                        detach=True,
+                        environment={
+                            "TASK_TIMEOUT": str(timeout_per_task),
+                        },
+                        volumes={
+                            str(input_dir): {"bind": "/sandbox/input", "mode": "ro"},
+                            str(output_dir): {"bind": "/sandbox/output", "mode": "rw"},
+                        },
+                        **CONTAINER_CONFIG,
+                    )
+
+                    # Wait for completion
                     try:
-                        container.kill()
-                    except Exception:
-                        logger.exception("Failed to kill container %s", sandbox_id)
-                    raise
-                
-                status_code = (
-                    result.get("StatusCode") if isinstance(result, dict) else result
-                )
-                logger.info("Container finished with status=%s", status_code)
-                
-                if status_code not in (0, None):
-                    logger.warning(
-                        "Container exited with non-zero status=%s", status_code
+                        result = container.wait(timeout=container_timeout)
+                    except Exception as exc:
+                        logger.error(
+                            "Container wait failed (timeout=%ss): %s",
+                            container_timeout,
+                            exc,
+                            exc_info=True,
+                        )
+                        try:
+                            container.kill()
+                        except Exception:
+                            logger.exception("Failed to kill container %s", sandbox_id)
+                        raise
+
+                    status_code = (
+                        result.get("StatusCode") if isinstance(result, dict) else result
                     )
-                
-            finally:
-                if container is not None:
-                    container.remove(force=True)
-            
-            # Read output
-            output_path = output_dir / "output.json"
-            responses: List[str] = []
-            
-            if output_path.exists():
-                try:
-                    payload = json.loads(output_path.read_text())
-                    compressed = payload.get("compressed", [])
-                    
-                    if isinstance(compressed, list):
-                        for idx, item in enumerate(compressed):
-                            if isinstance(item, list):
-                                item = tuple(item)
-                            if isinstance(item, tuple) and len(item) >= 1:
-                                text_raw = item[0]
-                                if isinstance(text_raw, list):
-                                    text = text_raw[0] if text_raw else ""
+                    logger.info("Container finished with status=%s", status_code)
+
+                    if status_code not in (0, None):
+                        logger.warning(
+                            "Container exited with non-zero status=%s", status_code
+                        )
+
+                finally:
+                    if container is not None:
+                        container.remove(force=True)
+
+                # Read output
+                output_path = output_dir / "output.json"
+                responses: List[str] = []
+
+                if output_path.exists():
+                    try:
+                        payload = json.loads(output_path.read_text())
+                        compressed = payload.get("compressed", [])
+
+                        if isinstance(compressed, list):
+                            for idx, item in enumerate(compressed):
+                                if isinstance(item, list):
+                                    item = tuple(item)
+                                if isinstance(item, tuple) and len(item) >= 1:
+                                    text_raw = item[0]
+                                    if isinstance(text_raw, list):
+                                        text = text_raw[0] if text_raw else ""
+                                    else:
+                                        text = str(text_raw or "")
+                                    responses.append(text)
+                                    logger.info("Output %d: %d bytes", idx, len(text))
                                 else:
-                                    text = str(text_raw or "")
-                                responses.append(text)
-                                logger.info("Output %d: %d bytes", idx, len(text))
-                            else:
-                                responses.append(str(item or ""))
-                except Exception as exc:
-                    logger.error(
-                        "Failed to parse output.json: %s",
-                        exc,
-                        exc_info=True,
-                    )
-                    responses = []
-            else:
-                logger.warning("output.json does not exist at %s", output_path)
-            
-            # Normalize result length
-            if len(responses) < len(challenge_texts):
-                responses.extend([""] * (len(challenge_texts) - len(responses)))
-            elif len(responses) > len(challenge_texts):
-                responses = responses[:len(challenge_texts)]
+                                    responses.append(str(item or ""))
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to parse output.json: %s",
+                            exc,
+                            exc_info=True,
+                        )
+                        responses = []
+                else:
+                    logger.warning("output.json does not exist at %s", output_path)
 
-            self._cleanup_limited_fs(fs_img, output_dir)
+                # Normalize result length
+                if len(responses) < len(challenge_texts):
+                    responses.extend([""] * (len(challenge_texts) - len(responses)))
+                elif len(responses) > len(challenge_texts):
+                    responses = responses[:len(challenge_texts)]
 
-            return responses
+                return responses
+            finally:
+                self._cleanup_limited_fs(fs_img, output_dir)
 
     def _cleanup_orphaned_mounts(self, prefix: str = "/tmp/sandbox-") -> None:
         """Kill orphaned sandbox containers then unmount their loop mounts."""
