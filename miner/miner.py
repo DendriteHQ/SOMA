@@ -1,8 +1,16 @@
-"""Naive base miner that shortens words by dropping characters."""
+"""Naive base miner that compresses by token budget."""
 
 import re
 
 WORD_TOKENIZER = re.compile(r"\S+|\s+")
+TOKEN_PATTERN = re.compile(r"\S+")
+
+
+def token_count(text: str) -> int:
+    """Count non-whitespace tokens."""
+    if not text:
+        return 0
+    return len(TOKEN_PATTERN.findall(text))
 
 
 def main(task: str, compression_ratio: float | None = None) -> str:
@@ -10,37 +18,62 @@ def main(task: str, compression_ratio: float | None = None) -> str:
     if compression_ratio is None:
         compression_ratio = 0.2
 
-    target_len = int(len(task.encode("utf-8")) * compression_ratio)
-    compressed = compress_text(task, target_len)
+    original_tokens = token_count(task)
+    target_tokens = int(original_tokens * compression_ratio)
+    compressed = compress_text(task, target_tokens)
 
     return compressed
 
 
-def compress_text(text: str, target_len: int) -> str:
-    """Drop characters from words to reach approximately the target length."""
-    if not text or target_len <= 0:
+def compress_text(text: str, target_tokens: int) -> str:
+    """Drop characters and truncate tokens to satisfy token budget."""
+    if not text or target_tokens <= 0:
         return ""
 
-    original_len = len(text.encode("utf-8"))
-    if original_len <= target_len:
+    original_tokens = token_count(text)
+    if original_tokens <= target_tokens:
         return text
 
-    ratio = max(0.01, min(1.0, target_len / original_len))
+    ratio = max(0.01, min(1.0, target_tokens / original_tokens))
     tokens = WORD_TOKENIZER.findall(text)
     compressed_parts: list[str] = []
+    words_kept = 0
 
     for token in tokens:
         if token.isspace():
             compressed_parts.append(token)
             continue
+
+        if words_kept >= target_tokens:
+            continue
+
         compressed_parts.append(_downsample_word(token, ratio))
+        words_kept += 1
 
-    result = "".join(compressed_parts)
+    result = "".join(compressed_parts).strip()
 
-    while result and len(result.encode("utf-8")) > target_len:
-        result = result[:-1]
+    return _trim_to_token_limit(result, target_tokens)
 
-    return result
+
+def _trim_to_token_limit(text: str, token_limit: int) -> str:
+    """Ensure output has at most token_limit non-whitespace tokens."""
+    if token_limit <= 0:
+        return ""
+
+    parts = WORD_TOKENIZER.findall(text)
+    out: list[str] = []
+    words = 0
+    for part in parts:
+        if part.isspace():
+            if out and not out[-1].isspace():
+                out.append(part)
+            continue
+        if words >= token_limit:
+            continue
+        out.append(part)
+        words += 1
+
+    return "".join(out).strip()
 
 
 def _downsample_word(word: str, ratio: float) -> str:
