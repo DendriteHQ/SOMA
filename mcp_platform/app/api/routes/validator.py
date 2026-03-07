@@ -6,7 +6,7 @@ import uuid
 import bittensor as bt
 
 from fastapi import APIRouter, HTTPException, status, Depends, Request
-from sqlalchemy import func, select, update, literal
+from sqlalchemy import delete, func, select, update, literal
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -47,7 +47,10 @@ from app.services.challenge_factory import (
     create_challenge_batch,
     get_qa_pairs_for_challenge,
 )
-from app.services.sandbox.remote_sandbox_manager import RemoteSandboxManager
+from app.services.sandbox.remote_sandbox_manager import (
+    RemoteSandboxManager,
+    SandboxExecutionError,
+)
 from app.services.blob.s3 import S3BlobStorage
 from app.services.blob.compressed_text_storage import CompressedTextStorage
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
@@ -187,6 +190,51 @@ async def _upsert_batch_scoring_rows(
             set_={"score": rollup_stmt.excluded.score},
         )
         await db.execute(rollup_stmt)
+
+
+async def _revert_challenge_batch_changes(
+    db: AsyncSession,
+    *,
+    batch_id: int,
+    created_new_batch: bool,
+    validator_id: int | None,
+    request_id: str | None,
+) -> None:
+    """Undo request_challenge DB writes after sandbox failure."""
+    try:
+        async with db.begin():
+            if created_new_batch:
+                await db.execute(
+                    delete(ChallengeBatch).where(ChallengeBatch.id == batch_id)
+                )
+                bt.logging.info(
+                    "request_challenge: Reverted created batch after sandbox failure, "
+                    f"request_id={request_id} batch_id={batch_id}"
+                )
+                return
+
+            assignment_stmt = delete(BatchAssignment).where(
+                BatchAssignment.challenge_batch_fk == batch_id
+            )
+            if validator_id is not None:
+                assignment_stmt = assignment_stmt.where(
+                    BatchAssignment.validator_fk == validator_id
+                )
+            await db.execute(assignment_stmt)
+            bt.logging.info(
+                "request_challenge: Reverted batch assignment after sandbox failure, "
+                f"request_id={request_id} batch_id={batch_id}"
+            )
+    except Exception as exc:
+        logger.error(
+            "request_challenge: failed reverting db changes after sandbox failure "
+            f"request_id={request_id} batch_id={batch_id}: {exc}",
+            exc_info=True,
+        )
+        bt.logging.error(
+            "request_challenge: failed reverting db changes after sandbox failure "
+            f"request_id={request_id} batch_id={batch_id}: {exc}"
+        )
 
 
 @router.post(
@@ -352,10 +400,14 @@ async def request_challenge(
     request_id = getattr(request.state, "request_id", None)
     bt.logging.info(f"request_challenge: Starting, request_id={request_id}")
     max_attempts = 3
+    batch_created_in_request = False
+    challenge_batch: ChallengeBatch | None = None
+    validator: Validator | None = None
 
     try:
         async with db.begin():
             for attempt in range(max_attempts):
+                created_new_batch = False
                 miner, script = await _select_miner_ss58(request, db)
 
                 # Handle case when no tasks are available
@@ -430,6 +482,7 @@ async def request_challenge(
                         f"request_challenge: Creating challenge batch for miner_ss58={miner.ss58}, "
                         f"script_id={script.id}, request_id={request_id}"
                     )
+                    created_new_batch = True
                     challenge_batch = await create_challenge_batch(
                         miner=miner, script=script, session=db
                     )
@@ -471,6 +524,7 @@ async def request_challenge(
                         validator_fk=validator.id,
                     )
                 )
+                batch_created_in_request = created_new_batch
                 break
             else:
                 bt.logging.info(
@@ -506,6 +560,18 @@ async def request_challenge(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Challenge batch persistence failed",
         ) from exc
+
+    if challenge_batch is None or validator is None:
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Challenge batch setup failed",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Challenge batch setup failed",
+        )
 
     qa_by_challenge = {}
     batch_id = challenge_batch.id
@@ -551,8 +617,35 @@ async def request_challenge(
             "request_challenge: compressed text lengths "
             f"request_id={request_id} lengths={compressed_lengths}"
         )
+    except SandboxExecutionError as exc:
+        await _revert_challenge_batch_changes(
+            db,
+            batch_id=batch_id,
+            created_new_batch=batch_created_in_request,
+            validator_id=validator.id,
+            request_id=request_id,
+        )
+        detail = f"Sandbox execution failed: {exc}"
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail,
+            exc=exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        ) from exc
     except RuntimeError as exc:
         if "Platform is at capacity" in str(exc):
+            await _revert_challenge_batch_changes(
+                db,
+                batch_id=batch_id,
+                created_new_batch=batch_created_in_request,
+                validator_id=validator.id,
+                request_id=request_id,
+            )
             bt.logging.warning(
                 f"request_challenge: Platform at capacity, request_id={request_id}"
             )
@@ -568,6 +661,13 @@ async def request_challenge(
             )
         raise
     except Exception as exc:
+        await _revert_challenge_batch_changes(
+            db,
+            batch_id=batch_id,
+            created_new_batch=batch_created_in_request,
+            validator_id=validator.id,
+            request_id=request_id,
+        )
         logger.error(
             "request_challenge: error preparing sandbox batch "
             f"miner_ss58={miner.ss58} request_id={request_id}: {exc}",

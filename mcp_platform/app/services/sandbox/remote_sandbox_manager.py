@@ -14,6 +14,10 @@ from app.services.blob.compressed_text_storage import CompressedTextStorage
 logger = logging.getLogger(__name__)
 
 
+class SandboxExecutionError(RuntimeError):
+    """Raised when remote sandbox execution fails."""
+
+
 class RemoteSandboxManager:
     """Remote sandbox manager that delegates execution to a separate sandbox service."""
 
@@ -97,11 +101,15 @@ class RemoteSandboxManager:
                 challenge_texts,
                 compression_ratios,
             )
+        except SandboxExecutionError:
+            raise
         except Exception as exc:
             logger.error(
                 "[RemoteSandbox] Batch execution failed: %s", exc, exc_info=True
             )
-            return [""] * len(challenge_texts)
+            raise SandboxExecutionError(
+                f"Sandbox batch execution failed: {exc}"
+            ) from exc
         finally:
             self._semaphore.release()
 
@@ -166,8 +174,10 @@ class RemoteSandboxManager:
                         "[RemoteSandbox] Sandbox service returned error: %s",
                         error_msg,
                     )
-                    return [""] * len(challenge_texts)
-                
+                    raise SandboxExecutionError(
+                        f"Sandbox service returned error: {error_msg}"
+                    )
+
                 logger.info(
                     "[RemoteSandbox] Sandbox execution successful: batch_id=%s",
                     batch_id,
@@ -178,22 +188,29 @@ class RemoteSandboxManager:
                     "[RemoteSandbox] Request to sandbox service timed out: %s",
                     exc,
                 )
-                return [""] * len(challenge_texts)
+                raise SandboxExecutionError(
+                    f"Sandbox request timed out: {exc}"
+                ) from exc
             except httpx.HTTPStatusError as exc:
                 logger.error(
                     "[RemoteSandbox] Sandbox service returned error status %d: %s",
                     exc.response.status_code,
                     exc.response.text,
                 )
-                return [""] * len(challenge_texts)
+                raise SandboxExecutionError(
+                    "Sandbox service HTTP error "
+                    f"{exc.response.status_code}: {exc.response.text}"
+                ) from exc
             except Exception as exc:
                 logger.error(
                     "[RemoteSandbox] Failed to communicate with sandbox service: %s",
                     exc,
                     exc_info=True,
                 )
-                return [""] * len(challenge_texts)
-        
+                raise SandboxExecutionError(
+                    f"Failed to communicate with sandbox service: {exc}"
+                ) from exc
+
         # Retrieve compressed texts from S3
         try:
             compressed_texts = await self._compressed_text_storage.get_batch(batch_id)
@@ -201,22 +218,28 @@ class RemoteSandboxManager:
                 "[RemoteSandbox] Retrieved %d compressed texts from storage",
                 len(compressed_texts),
             )
-            
-            # Normalize the result to match expected length
-            if len(compressed_texts) < len(challenge_texts):
-                compressed_texts.extend([""] * (len(challenge_texts) - len(compressed_texts)))
-            elif len(compressed_texts) > len(challenge_texts):
-                compressed_texts = compressed_texts[:len(challenge_texts)]
-            
+
+            expected_count = len(challenge_texts)
+            received_count = len(compressed_texts)
+            if received_count != expected_count:
+                raise SandboxExecutionError(
+                    "Sandbox output count mismatch: "
+                    f"expected={expected_count} received={received_count}"
+                )
+
             return compressed_texts
-            
+
         except Exception as exc:
             logger.error(
                 "[RemoteSandbox] Failed to retrieve compressed texts from storage: %s",
                 exc,
                 exc_info=True,
             )
-            return [""] * len(challenge_texts)
+            if isinstance(exc, SandboxExecutionError):
+                raise
+            raise SandboxExecutionError(
+                f"Failed to retrieve compressed texts from storage: {exc}"
+            ) from exc
 
     def shutdown(self) -> None:
         """Compatibility lifecycle hook used by app shutdown."""
