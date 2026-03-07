@@ -215,6 +215,7 @@ class SandboxExecutor:
                 )
 
                 container = None
+                timed_out = False
                 try:
                     # Run container with timeout environment variable
                     container = client.containers.run(
@@ -242,26 +243,29 @@ class SandboxExecutor:
                             exc,
                             exc_info=True,
                         )
+                        timed_out = True
                         try:
                             container.kill()
                         except Exception:
                             logger.exception("Failed to kill container %s", sandbox_id)
-                        raise
 
-                    status_code = (
-                        result.get("StatusCode") if isinstance(result, dict) else result
-                    )
-                    logger.info("Container finished with status=%s", status_code)
-
-                    if status_code not in (0, None):
-                        logger.warning(
-                            "Container exited with non-zero status=%s", status_code
+                    if not timed_out:
+                        status_code = (
+                            result.get("StatusCode") if isinstance(result, dict) else result
                         )
+                        logger.info("Container finished with status=%s", status_code)
+
+                        if status_code not in (0, None):
+                            logger.warning(
+                                "Container exited with non-zero status=%s", status_code
+                            )
 
                 finally:
                     if container is not None:
                         container.remove(force=True)
 
+                if timed_out:
+                    return [""] * len(challenge_texts)
                 # Read output
                 output_path = output_dir / "output.json"
                 responses: List[str] = []
