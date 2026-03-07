@@ -1,32 +1,25 @@
-"""Naive base miner that compresses by token budget."""
+"""Token-budget miner."""
 
-import re
+import spacy
 
-WORD_TOKENIZER = re.compile(r"\S+|\s+")
-TOKEN_PATTERN = re.compile(r"\S+")
+NLP = spacy.blank("en")
 
 
 def token_count(text: str) -> int:
-    """Count non-whitespace tokens."""
     if not text:
         return 0
-    return len(TOKEN_PATTERN.findall(text))
+    return sum(1 for tok in NLP.make_doc(text) if not tok.is_space)
 
 
 def main(task: str, compression_ratio: float | None = None) -> str:
-    """Compress single task to target ratio."""
     if compression_ratio is None:
         compression_ratio = 0.2
 
-    original_tokens = token_count(task)
-    target_tokens = int(original_tokens * compression_ratio)
-    compressed = compress_text(task, target_tokens)
-
-    return compressed
+    target_tokens = int(token_count(task) * compression_ratio)
+    return compress_text(task, target_tokens)
 
 
 def compress_text(text: str, target_tokens: int) -> str:
-    """Drop characters and truncate tokens to satisfy token budget."""
     if not text or target_tokens <= 0:
         return ""
 
@@ -35,49 +28,40 @@ def compress_text(text: str, target_tokens: int) -> str:
         return text
 
     ratio = max(0.01, min(1.0, target_tokens / original_tokens))
-    tokens = WORD_TOKENIZER.findall(text)
-    compressed_parts: list[str] = []
-    words_kept = 0
-
-    for token in tokens:
-        if token.isspace():
-            compressed_parts.append(token)
+    out: list[str] = []
+    kept = 0
+    for tok in NLP.make_doc(text):
+        if tok.is_space:
+            if out:
+                out.append(tok.text)
             continue
-
-        if words_kept >= target_tokens:
-            continue
-
-        compressed_parts.append(_downsample_word(token, ratio))
-        words_kept += 1
-
-    result = "".join(compressed_parts).strip()
-
-    return _trim_to_token_limit(result, target_tokens)
+        if kept >= target_tokens:
+            break
+        out.append(_downsample_word(tok.text, ratio))
+        out.append(tok.whitespace_)
+        kept += 1
+    return _enforce_token_limit("".join(out).strip(), target_tokens)
 
 
-def _trim_to_token_limit(text: str, token_limit: int) -> str:
-    """Ensure output has at most token_limit non-whitespace tokens."""
+def _enforce_token_limit(text: str, token_limit: int) -> str:
     if token_limit <= 0:
         return ""
-
-    parts = WORD_TOKENIZER.findall(text)
     out: list[str] = []
-    words = 0
-    for part in parts:
-        if part.isspace():
-            if out and not out[-1].isspace():
-                out.append(part)
+    kept = 0
+    for tok in NLP.make_doc(text):
+        if tok.is_space:
+            if out:
+                out.append(tok.text)
             continue
-        if words >= token_limit:
-            continue
-        out.append(part)
-        words += 1
-
+        if kept >= token_limit:
+            break
+        out.append(tok.text)
+        out.append(tok.whitespace_)
+        kept += 1
     return "".join(out).strip()
 
 
 def _downsample_word(word: str, ratio: float) -> str:
-    """Keep characters proportionally to the requested ratio."""
     if len(word) <= 2:
         return word
 
