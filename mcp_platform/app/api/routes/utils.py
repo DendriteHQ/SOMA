@@ -511,12 +511,12 @@ async def _select_miner_ss58(
     Returns:
         (Miner, Script): miner + selected script
     """
-    bt.logging.info("_select_miner_ss58: Starting miner selection")
+    logger.info("_select_miner_ss58: Starting miner selection")
     now = datetime.now(timezone.utc)
 
     active_competition_id = await _get_active_competition_id(db)
     if active_competition_id is None:
-        bt.logging.info("_select_miner_ss58: No active competition found")
+        logger.info("_select_miner_ss58: No active competition found")
         return None, None
 
     phase = await _get_competition_phase(db, active_competition_id, now)
@@ -529,7 +529,7 @@ async def _select_miner_ss58(
 
     if phase == "upload":
         if screener_challenges_count == 0:
-            bt.logging.info("_select_miner_ss58: No screener challenges found")
+            logger.info("_select_miner_ss58: No screener challenges found")
             return None, None
         expected_pair_count = expected_screener_pairs
         scored_pairs, assigned_pairs, pending_scripts = _build_screener_task_queries(
@@ -551,10 +551,10 @@ async def _select_miner_ss58(
         else:
             top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
             if top_fraction <= 0:
-                bt.logging.info("_select_miner_ss58: Top screener fraction is 0")
+                logger.info("_select_miner_ss58: Top screener fraction is 0")
                 return None, None
             if screener_challenges_count == 0:
-                bt.logging.info(
+                logger.info(
                     "_select_miner_ss58: No screener challenges found for evaluation"
                 )
                 return None, None
@@ -567,7 +567,7 @@ async def _select_miner_ss58(
                 top_fraction,
             )
             if top_scripts_subq is None:
-                bt.logging.info(
+                logger.info(
                     "_select_miner_ss58: No eligible screener scripts found"
                 )
                 return None, None
@@ -575,7 +575,7 @@ async def _select_miner_ss58(
                 db, active_competition_id, ratio_count
             )
             if expected_pair_count <= 0:
-                bt.logging.info("_select_miner_ss58: No active competition challenges")
+                logger.info("_select_miner_ss58: No active competition challenges")
                 return None, None
             scored_pairs, assigned_pairs, pending_scripts = (
                 _build_competition_task_queries(active_competition_id)
@@ -619,7 +619,7 @@ async def _select_miner_ss58(
 
     row = result.first()
     if not row:
-        bt.logging.info(
+        logger.info(
             "_select_miner_ss58: No miners with free unscored challenges found"
         )
         return None, None
@@ -656,7 +656,7 @@ async def _select_miner_ss58(
             },
             exc_info=exc,
         )
-    bt.logging.info(
+    logger.info(
         f"_select_miner_ss58: Selected miner_ss58={miner.ss58}, "
         f"script_id={script.id}, script_uuid={script.script_uuid}, "
         f"tasks_remaining={remaining_tasks}"

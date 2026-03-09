@@ -351,7 +351,7 @@ async def request_challenge(
     ),
 ) -> SignedEnvelope[GetChallengesResponse]:
     request_id = getattr(request.state, "request_id", None)
-    bt.logging.info(f"request_challenge: Starting, request_id={request_id}")
+    logger.info(f"request_challenge: Starting, request_id={request_id}")
     max_attempts = 3
 
     try:
@@ -361,7 +361,7 @@ async def request_challenge(
 
                 # Handle case when no tasks are available
                 if miner is None or script is None:
-                    bt.logging.info(
+                    logger.info(
                         "request_challenge: Returning 503 - no tasks available, "
                         f"request_id={request_id}"
                     )
@@ -376,7 +376,7 @@ async def request_challenge(
                     .with_for_update()
                 )
                 if miner_is_banned:
-                    bt.logging.info(
+                    logger.info(
                         "request_challenge: skipping banned miner "
                         f"miner_ss58={miner.ss58} request_id={request_id}"
                     )
@@ -398,7 +398,7 @@ async def request_challenge(
                 existing_batch = existing_batch_result.scalars().first()
 
                 if existing_batch is not None:
-                    bt.logging.info(
+                    logger.info(
                         "request_challenge: Returning existing unassigned batch "
                         f"batch_id={existing_batch.id} miner_ss58={miner.ss58} "
                         f"script_id={script.id} request_id={request_id}"
@@ -427,7 +427,7 @@ async def request_challenge(
                         challenge_list, session=db
                     )
                 else:
-                    bt.logging.info(
+                    logger.info(
                         f"request_challenge: Creating challenge batch for miner_ss58={miner.ss58}, "
                         f"script_id={script.id}, request_id={request_id}"
                     )
@@ -474,7 +474,7 @@ async def request_challenge(
                 )
                 break
             else:
-                bt.logging.info(
+                logger.info(
                     "request_challenge: Returning 503 - no tasks available after retries, "
                     f"request_id={request_id}"
                 )
@@ -558,13 +558,13 @@ async def request_challenge(
             storage_uuids=storage_uuids,
         )
         compressed_lengths = [len(text or "") for text in compressed_texts]
-        bt.logging.info(
+        logger.info(
             "request_challenge: compressed text lengths "
             f"request_id={request_id} lengths={compressed_lengths}"
         )
     except RuntimeError as exc:
         if "Platform is at capacity" in str(exc):
-            bt.logging.warning(
+            logger.warning(
                 f"request_challenge: Platform at capacity, request_id={request_id}"
             )
             await _log_error_response(
@@ -584,7 +584,7 @@ async def request_challenge(
             f"miner_ss58={miner.ss58} request_id={request_id}: {exc}",
             exc_info=True,
         )
-        bt.logging.error(
+        logger.error(
             "request_challenge: error preparing sandbox batch "
             f"miner_ss58={miner.ss58} request_id={request_id}: {exc}"
         )
@@ -618,7 +618,7 @@ async def request_challenge(
             ratio=ratio,
         ):
             original_text = challenge.challenge_text or ""
-            bt.logging.warning(
+            logger.warning(
                 "request_challenge: not compressed enough "
                 f"request_id={request_id} "
                 f"batch_id={challenge_batch.id} "
@@ -663,7 +663,7 @@ async def request_challenge(
         )
     # Handle case where all challenges failed compression ratio check
     if not challenges_response:
-        bt.logging.warning(
+        logger.warning(
             f"request_challenge: All challenges failed compression ratio check, "
             f"request_id={request_id} batch_id={batch_id} "
             f"zero_scores={len(zero_score_rollups)}"
@@ -683,13 +683,13 @@ async def request_challenge(
                 .values(done_at=datetime.now(timezone.utc))
             )
             await db.commit()
-            bt.logging.info(
+            logger.info(
                 f"request_challenge: Marked batch as done with zero scores, "
                 f"request_id={request_id} batch_id={batch_id}"
             )
         except Exception as exc:
             await db.rollback()
-            bt.logging.error(
+            logger.error(
                 f"request_challenge: Failed to save zero scores and mark batch done, "
                 f"request_id={request_id} error={str(exc)}"
             )
@@ -716,21 +716,21 @@ async def request_challenge(
                 rollup_rows=zero_score_rollups,
             )
             await db.commit()
-            bt.logging.info(
+            logger.info(
                 f"request_challenge: Saved/upserted zero scores for compression failures, "
                 f"request_id={request_id} answers={len(zero_score_answers)} "
                 f"questions={len(zero_score_questions)} rollups={len(zero_score_rollups)}"
             )
         except Exception as exc:
             await db.rollback()
-            bt.logging.error(
+            logger.error(
                 f"request_challenge: Failed to save zero scores, "
                 f"request_id={request_id} error={str(exc)}"
             )
     
     total_challenges = len(challenges_response)
     total_questions = sum(len(qa_list) for qa_list in qa_by_challenge.values())
-    bt.logging.info(
+    logger.info(
         "request_challenge: Built response challenges, "
         f"request_id={request_id} challenges={total_challenges} "
         f"questions={total_questions} answers={total_questions}"

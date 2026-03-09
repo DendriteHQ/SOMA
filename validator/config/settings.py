@@ -4,7 +4,9 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict
 from typing import Any
 from bittensor.core.async_subtensor import AsyncSubtensor
+import logging
 
+logger = logging.getLogger(__name__)
 
 class Settings(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -55,7 +57,7 @@ class Settings(BaseModel):
             else:
                 subtensor = AsyncSubtensor(network=subtensor_network)
         except Exception as exc:
-            bt.logging.error(
+            logger.error(
                 "subtensor_init_failed",
                 extra={
                     "network": subtensor_network,
@@ -104,10 +106,10 @@ class Settings(BaseModel):
                 response = requests.get("https://api.ipify.org?format=text", timeout=5)
                 response.raise_for_status()
                 public_ip = response.text.strip()
-                bt.logging.info("resolved_public_ip", extra={"public_ip": public_ip})
+                logger.info("resolved_public_ip", extra={"public_ip": public_ip})
                 return public_ip
             except Exception as exc:
-                bt.logging.error(
+                logger.error(
                     "resolve_public_ip_failed",
                     extra={"error": str(exc)},
                 )
@@ -140,18 +142,18 @@ class Settings(BaseModel):
     @classmethod
     def _require_non_empty(cls, name: str, value: str) -> str:
         if not value:
-            bt.logging.error("missing_required_env", extra={"env": name})
+            logger.error("missing_required_env", extra={"env": name})
             raise ValueError(f"{name} is required and cannot be empty")
         return value
 
     @classmethod
     def _validate_platform_url(cls, value: str) -> str:
         if not value:
-            bt.logging.error("missing_required_env", extra={"env": "PLATFORM_URL"})
+            logger.error("missing_required_env", extra={"env": "PLATFORM_URL"})
             raise ValueError("PLATFORM_URL is required and cannot be empty")
         parsed = urlparse(value)
         if parsed.scheme not in {"http"}:
-            bt.logging.error(
+            logger.error(
                 "platform_url_invalid_scheme",
                 extra={"platform_url": value},
             )

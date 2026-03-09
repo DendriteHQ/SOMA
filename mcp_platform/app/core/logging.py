@@ -149,6 +149,7 @@ def _apply_extras_filter(include_extras: bool) -> None:
     _remove_filter_type(_ExtrasFilter)
     if include_extras:
         return
+    root = logging.getLogger()
     root.addFilter(_ExtrasFilter(include_extras=False))
     for logger in logging.root.manager.loggerDict.values():
         if not isinstance(logger, logging.Logger):

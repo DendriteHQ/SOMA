@@ -73,7 +73,7 @@ class MetagraphService:
 
     def _build_subtensor(self) -> bt.subtensor:
         try:
-            bt.logging.set_info()
+            logger.set_info()
         except Exception:
             logger.exception("bittensor_logging_set_info_failed")
         # Bittensor reconfigures logging; restore app logging settings.

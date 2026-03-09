@@ -22,9 +22,10 @@ sys.path.insert(0, str(ROOT / "mcp_platform"))
 
 import bittensor as bt
 import httpx
+import logging
 
-# Ensure info-level bittensor logs are visible without extra CLI flags
-bt.logging.set_info()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 
 from soma_shared.contracts.miner.v1.messages import (
@@ -44,19 +45,19 @@ async def main(
 ):
 
     # Load wallet
-    bt.logging.info(f"Loading wallet: {wallet_name}/{hotkey_name}")
+    logger.info(f"Loading wallet: {wallet_name}/{hotkey_name}")
     wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
     miner_hotkey = wallet.hotkey.ss58_address
-    bt.logging.info(f"Miner hotkey: {miner_hotkey}")
+    logger.info(f"Miner hotkey: {miner_hotkey}")
 
     # Read solution code
     solution_file = solution_file.expanduser().resolve()
     if not solution_file.exists():
-        bt.logging.error(f"Solution file not found: {solution_file}")
+        logger.error(f"Solution file not found: {solution_file}")
         sys.exit(1)
 
     solution_code = solution_file.read_text()
-    bt.logging.info(f"Loaded solution code ({len(solution_code)} bytes)")
+    logger.info(f"Loaded solution code ({len(solution_code)} bytes)")
 
     # Create payload
     payload = UploadSolutionRequest(
@@ -75,9 +76,9 @@ async def main(
         sig=signature,
     )
 
-    bt.logging.info(f"Sending upload request to {platform_url}/miner/upload")
-    bt.logging.info(f"Nonce: {nonce}")
-    bt.logging.debug(f"Signature: {signature.signature[:50]}...")
+    logger.info(f"Sending upload request to {platform_url}/miner/upload")
+    logger.info(f"Nonce: {nonce}")
+    logger.debug(f"Signature: {signature.signature[:50]}...")
 
     # Send request
     try:
@@ -87,10 +88,10 @@ async def main(
                 json=signed_request.dict(),
             )
 
-            bt.logging.info(f"Response status: {response.status_code}")
+            logger.info(f"Response status: {response.status_code}")
 
             if response.status_code != 200:
-                bt.logging.error(f"Error response: {response.text}")
+                logger.error(f"Error response: {response.text}")
                 sys.exit(1)
 
             # Verify response
@@ -100,16 +101,16 @@ async def main(
                 expected_key=os.getenv("PLATFORM_SIGNER_SS58"),
             )
 
-            bt.logging.info(f"Upload successful: {signed_response.payload.ok}")
-            bt.logging.debug(
+            logger.info(f"Upload successful: {signed_response.payload.ok}")
+            logger.debug(
                 f"Response signature: {signed_response.sig.signature[:50]}..."
             )
 
     except httpx.HTTPError as e:
-        bt.logging.error(f"HTTP error: {e}")
+        logger.error(f"HTTP error: {e}")
         sys.exit(1)
     except Exception as e:
-        bt.logging.error(f"Error: {e}")
+        logger.error(f"Error: {e}")
         import traceback
 
         traceback.print_exc()
@@ -142,8 +143,8 @@ if __name__ == "__main__":
         if not args.solution_file:
             raise ValueError("solution_file")
     except ValueError as missing:
-        bt.logging.error(f"Missing required argument: {missing.args[0]}.")
-        bt.logging.error("\n" + parser.format_help())
+        logger.error(f"Missing required argument: {missing.args[0]}.")
+        logger.error("\n" + parser.format_help())
         sys.exit(1)
 
     asyncio.run(
