@@ -138,27 +138,30 @@ async def _get_competition_phase(
     competition_id: int,
     now: datetime,
 ) -> str:
-    timeframe = await db.scalar(
-        select(CompetitionTimeframe)
-        .join(
-            CompetitionConfig,
-            CompetitionConfig.id == CompetitionTimeframe.competition_config_fk,
+    timeframe_row = (
+        await db.execute(
+            select(
+                CompetitionTimeframe.eval_starts_at,
+                CompetitionTimeframe.eval_ends_at,
+            )
+            .select_from(V_ACTIVE_COMPETITION)
+            .join(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk
+                == V_ACTIVE_COMPETITION.c.competition_config_id,
+            )
+            .where(V_ACTIVE_COMPETITION.c.competition_id == competition_id)
+            .order_by(CompetitionTimeframe.created_at.desc())
+            .limit(1)
         )
-        .where(CompetitionConfig.competition_fk == competition_id)
-        .order_by(CompetitionTimeframe.created_at.desc())
-        .limit(1)
-    )
-    if timeframe:
-        # Ensure both datetimes are timezone-aware for comparison
-        eval_starts = timeframe.eval_starts_at
-        eval_ends = timeframe.eval_ends_at
-
-        # Make naive datetimes timezone-aware (assume UTC)
+    ).first()
+    if timeframe_row:
+        eval_starts, eval_ends = timeframe_row
+        # Ensure both datetimes are timezone-aware for comparison.
         if eval_starts and eval_starts.tzinfo is None:
             eval_starts = eval_starts.replace(tzinfo=timezone.utc)
         if eval_ends and eval_ends.tzinfo is None:
             eval_ends = eval_ends.replace(tzinfo=timezone.utc)
-
         if eval_starts and eval_ends and eval_starts <= now <= eval_ends:
             return "evaluation"
     return "upload"

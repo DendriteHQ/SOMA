@@ -38,7 +38,7 @@ from soma_shared.db.models.screener import Screener
 from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.competition_challenge import CompetitionChallenge
-from soma_shared.db.models.competition_config import CompetitionConfig
+from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.question import Question
@@ -60,6 +60,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/private/frontend", tags=["frontend"])
+TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
 
 
 def _build_miner_data_subqueries(latest_active_competition_id: int):
@@ -230,24 +231,34 @@ def _build_miner_data_subqueries(latest_active_competition_id: int):
 
 
 def _latest_active_competition_id_subquery():
-    return (
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
-        .scalar_subquery()
-    )
+    return select(V_ACTIVE_COMPETITION.c.competition_id).limit(1).scalar_subquery()
 
 
 async def _get_latest_active_competition_id(db: AsyncSession) -> int | None:
-    return await db.scalar(
-        select(Competition.id)
-        .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
+    return await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
+
+
+async def _should_mask_challenge_text(
+    db: AsyncSession,
+    competition_id: int,
+) -> bool:
+    eval_starts_at = await db.scalar(
+        select(CompetitionTimeframe.eval_starts_at)
+        .select_from(V_ACTIVE_COMPETITION)
+        .join(
+            CompetitionTimeframe,
+            CompetitionTimeframe.competition_config_fk
+            == V_ACTIVE_COMPETITION.c.competition_config_id,
+        )
+        .where(V_ACTIVE_COMPETITION.c.competition_id == competition_id)
+        .order_by(CompetitionTimeframe.created_at.desc())
         .limit(1)
     )
+    if eval_starts_at is None:
+        return True
+    if eval_starts_at.tzinfo is None:
+        eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) < eval_starts_at
 
 
 def _extract_client_ip(request: Request) -> str | None:
@@ -1298,6 +1309,7 @@ async def get_miner_contest_challenge_detail(
         created_at,
         overall_score,
     ) = batch_challenge_data
+    mask_text = await _should_mask_challenge_text(db, competition_id)
 
     # Get all questions for this challenge with answers and scores
     questions_result = await db.execute(
@@ -1337,9 +1349,13 @@ async def get_miner_contest_challenge_detail(
     questions = [
         QuestionDetail(
             question_id=question.id,
-            question_text=question.question,
-            miner_answer=produced_answer,
-            ground_truth_answer=ground_truth,
+            question_text=(
+                TEXT_HIDDEN_PLACEHOLDER if mask_text else question.question
+            ),
+            miner_answer=TEXT_HIDDEN_PLACEHOLDER if mask_text else produced_answer,
+            ground_truth_answer=(
+                TEXT_HIDDEN_PLACEHOLDER if mask_text else ground_truth
+            ),
             score=float(avg_score) if avg_score is not None else None,
             score_details=(
                 score_details[0]
@@ -1355,7 +1371,9 @@ async def get_miner_contest_challenge_detail(
             batch_challenge_id=batch_challenge_id,
             challenge_id=challenge.id,
             challenge_name=challenge.challenge_name,
-            challenge_text=challenge.challenge_text,
+            challenge_text=(
+                TEXT_HIDDEN_PLACEHOLDER if mask_text else challenge.challenge_text
+            ),
             competition_name=competition_name,
             competition_id=competition_id,
             compression_ratio=batch_challenge.compression_ratio,
@@ -1734,6 +1752,7 @@ async def get_miner_screener_contests(
     if rank_row is not None:
         miner_rank = int(rank_row.rank) if rank_row.rank is not None else None
         total_miners_count = int(rank_row.total_miners or 0)
+    mask_text = await _should_mask_challenge_text(db, latest_active_competition_id)
 
     # Get detailed questions for each challenge
     challenges = []
@@ -1786,9 +1805,13 @@ async def get_miner_screener_contests(
         questions = [
             QuestionDetail(
                 question_id=question.id,
-                question_text=question.question,
-                miner_answer=produced_answer,
-                ground_truth_answer=ground_truth,
+                question_text=(
+                    TEXT_HIDDEN_PLACEHOLDER if mask_text else question.question
+                ),
+                miner_answer=TEXT_HIDDEN_PLACEHOLDER if mask_text else produced_answer,
+                ground_truth_answer=(
+                    TEXT_HIDDEN_PLACEHOLDER if mask_text else ground_truth
+                ),
                 score=float(avg_score_q) if avg_score_q is not None else None,
                 score_details=(
                     score_details[0]
@@ -1803,7 +1826,7 @@ async def get_miner_screener_contests(
             batch_challenge_id=batch_challenge_id,
             challenge_id=challenge_id,
             challenge_name=challenge_name,
-            challenge_text=challenge_text,
+            challenge_text=TEXT_HIDDEN_PLACEHOLDER if mask_text else challenge_text,
             competition_name=competition_name,
             competition_id=competition_id,
             compression_ratio=compression_ratio,
