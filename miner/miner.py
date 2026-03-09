@@ -1,50 +1,71 @@
-"""Naive base miner that shortens words by dropping characters."""
+"""Token-budget miner."""
 
-import re
+import spacy
 
-WORD_TOKENIZER = re.compile(r"\S+|\s+")
+NLP = spacy.blank("en")
+
+
+def token_count(text: str) -> int:
+    if not text:
+        return 0
+    return sum(1 for tok in NLP.make_doc(text) if not tok.is_space)
+
+
+def target_token_count(text: str, compression_ratio: float) -> int:
+    return int(token_count(text) * compression_ratio)
 
 
 def main(task: str, compression_ratio: float | None = None) -> str:
-    """Compress single task to target ratio."""
     if compression_ratio is None:
         compression_ratio = 0.2
 
-    target_len = int(len(task.encode("utf-8")) * compression_ratio)
-    compressed = compress_text(task, target_len)
-
-    return compressed
+    target_tokens = target_token_count(task, compression_ratio)
+    return compress_text(task, target_tokens)
 
 
-def compress_text(text: str, target_len: int) -> str:
-    """Drop characters from words to reach approximately the target length."""
-    if not text or target_len <= 0:
+def compress_text(text: str, target_tokens: int) -> str:
+    if not text or target_tokens <= 0:
         return ""
 
-    original_len = len(text.encode("utf-8"))
-    if original_len <= target_len:
+    original_tokens = token_count(text)
+    if original_tokens <= target_tokens:
         return text
 
-    ratio = max(0.01, min(1.0, target_len / original_len))
-    tokens = WORD_TOKENIZER.findall(text)
-    compressed_parts: list[str] = []
-
-    for token in tokens:
-        if token.isspace():
-            compressed_parts.append(token)
+    ratio = max(0.01, min(1.0, target_tokens / original_tokens))
+    out: list[str] = []
+    kept = 0
+    for tok in NLP.make_doc(text):
+        if tok.is_space:
+            if out:
+                out.append(tok.text)
             continue
-        compressed_parts.append(_downsample_word(token, ratio))
+        if kept >= target_tokens:
+            break
+        out.append(_downsample_word(tok.text, ratio))
+        out.append(tok.whitespace_)
+        kept += 1
+    return _enforce_token_limit("".join(out).strip(), target_tokens)
 
-    result = "".join(compressed_parts)
 
-    while result and len(result.encode("utf-8")) > target_len:
-        result = result[:-1]
-
-    return result
+def _enforce_token_limit(text: str, token_limit: int) -> str:
+    if token_limit <= 0:
+        return ""
+    out: list[str] = []
+    kept = 0
+    for tok in NLP.make_doc(text):
+        if tok.is_space:
+            if out:
+                out.append(tok.text)
+            continue
+        if kept >= token_limit:
+            break
+        out.append(tok.text)
+        out.append(tok.whitespace_)
+        kept += 1
+    return "".join(out).strip()
 
 
 def _downsample_word(word: str, ratio: float) -> str:
-    """Keep characters proportionally to the requested ratio."""
     if len(word) <= 2:
         return word
 

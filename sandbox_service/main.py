@@ -46,6 +46,12 @@ app = FastAPI(
 
 
 # Sandbox executor
+@app.on_event("startup")
+async def startup():
+    """Initialize sandbox executor on startup."""
+    get_sandbox_executor()
+
+
 def get_sandbox_executor() -> SandboxExecutor:
     """Get or create sandbox executor instance."""
     if not hasattr(app.state, "sandbox_executor"):

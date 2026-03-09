@@ -14,6 +14,7 @@ from validator.evaluation.prompts import ANSWERS_GENERATION_PROMPT
 class ScoringResult(BaseModel):
     score: float
     model_answers: list[str]
+    scores: list[float]
     details: list[dict[str, Any]]
 
 
@@ -195,7 +196,7 @@ class Scoring:
 
         overall = self._round_score(sum(scores) / len(scores) if scores else 0.0)
         return ScoringResult(
-            score=overall, model_answers=model_answers, details=details
+            score=overall, model_answers=model_answers, scores=scores, details=details
         )
 
     def _round_score(self, value: float) -> float:

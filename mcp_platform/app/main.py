@@ -298,7 +298,11 @@ def create_app() -> FastAPI:
         sandbox_manager = getattr(app.state, "sandbox_manager", None)
         if sandbox_manager is not None:
             try:
-                await asyncio.to_thread(sandbox_manager.shutdown)
+                shutdown = getattr(sandbox_manager, "shutdown", None)
+                if callable(shutdown):
+                    await asyncio.to_thread(shutdown)
+                else:
+                    logger.warning("sandbox_manager_has_no_shutdown")
             except Exception:
                 logger.exception("sandbox_manager_shutdown_failed")
 

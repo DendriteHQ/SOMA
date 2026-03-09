@@ -32,6 +32,7 @@ from soma_shared.db.models.burn_request import BurnRequest
 from soma_shared.db.models.screener import Screener
 from soma_shared.db.models.screening_challenge import ScreeningChallenge
 from soma_shared.db.validator_log import log_validator_message
+from app.db.views import V_ACTIVE_COMPETITION, V_SCREENER_CHALLENGES_ACTIVE
 from app.core.config import settings
 from app.api.deps import get_script_storage
 
@@ -105,16 +106,7 @@ async def _log_error_response(
 
 
 async def _get_active_competition_id(db: AsyncSession) -> int | None:
-    return await db.scalar(
-        select(Competition.id)
-        .join(
-            CompetitionConfig,
-            CompetitionConfig.competition_fk == Competition.id,
-        )
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc())
-        .limit(1)
-    )
+    return await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
 
 
 async def _get_current_burn_state(db: AsyncSession) -> tuple[bool, float]:
@@ -178,11 +170,10 @@ async def _get_screener_challenges(
 ):
     screener_challenges = (
         select(
-            ScreeningChallenge.challenge_fk.label("challenge_fk"),
+            V_SCREENER_CHALLENGES_ACTIVE.c.challenge_id.label("challenge_fk"),
         )
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .where(Screener.competition_fk == competition_id)
-        .where(Screener.is_active.is_(True))
+        .select_from(V_SCREENER_CHALLENGES_ACTIVE)
+        .where(V_SCREENER_CHALLENGES_ACTIVE.c.competition_id == competition_id)
         .subquery()
     )
     screener_challenges_count = await db.scalar(
@@ -379,7 +370,11 @@ async def _get_screener_backlog_count(
     )
     scripts_in_competition = (
         select(MinerUpload.script_fk.label("script_fk"))
+        .select_from(MinerUpload)
+        .join(Script, Script.id == MinerUpload.script_fk)
+        .join(Miner, Miner.id == Script.miner_fk)
         .where(MinerUpload.competition_fk == competition_id)
+        .where(Miner.miner_banned_status.is_(False))
         .distinct()
         .subquery()
     )
@@ -429,6 +424,14 @@ async def _build_top_screener_scripts_subq(
             ChallengeBatch.id == BatchChallenge.challenge_batch_fk,
         )
         .join(
+            Script,
+            Script.id == ChallengeBatch.script_fk,
+        )
+        .join(
+            Miner,
+            Miner.id == Script.miner_fk,
+        )
+        .join(
             MinerUpload,
             MinerUpload.script_fk == ChallengeBatch.script_fk,
         )
@@ -437,6 +440,7 @@ async def _build_top_screener_scripts_subq(
             screener_challenges.c.challenge_fk == BatchChallenge.challenge_fk,
         )
         .where(MinerUpload.competition_fk == competition_id)
+        .where(Miner.miner_banned_status.is_(False))
         .group_by(ChallengeBatch.script_fk)
         .subquery()
     )
@@ -594,6 +598,7 @@ async def _select_miner_ss58(
         .join(Script, Script.miner_fk == Miner.id)
         .join(MinerUpload, MinerUpload.script_fk == Script.id)
         .where(MinerUpload.competition_fk == active_competition_id)
+        .where(Miner.miner_banned_status.is_(False))
         .outerjoin(
             accounted_pairs_per_script,
             accounted_pairs_per_script.c.script_fk == Script.id,

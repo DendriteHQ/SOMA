@@ -64,23 +64,11 @@ class Settings(BaseSettings):
 
     # Weight setting
     max_miners_for_weights: int = Field(default=1, alias="MAX_MINERS_FOR_WEIGHTS")
-
-    # Miner uploads (seconds)
-    miner_upload_allowed_frequency_secs: int = Field(
-        default=4 * 60 * 60,
-        alias="MINER_UPLOAD_ALLOWED_FREQUENCY",
-    )
-
+    
     # Evaluation: top fraction of screened scripts to evaluate (0-1 or percent)
     top_screener_scripts: float = Field(
         default=0.2,
         alias="TOP_SCREENER_SCRIPTS",
-    )
-
-    # Weight allocation for top screener miners
-    top_screener_fraction: float = Field(
-        default=0.2,
-        alias="TOP_SCREENER_FRACTION",
     )
 
     screener_weight_per_miner: float = Field(

@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +19,14 @@ from soma_shared.db.models.script import Script
 from app.services.blob.script_storage import ScriptStorage
 
 logger = logging.getLogger(__name__)
+
+
+class DuplicateMinerUploadError(RuntimeError):
+    pass
+
+
+class BannedMinerUploadError(RuntimeError):
+    pass
 
 
 async def _select_active_competition_id(session: AsyncSession) -> int | None:
@@ -74,47 +83,69 @@ async def store_hot_script(
         script,
         date_prefix=date_prefix,
     )
-    request_fk = None
-    if request_id:
-        result = await session.execute(
-            select(Request).where(Request.external_request_id == request_id)
-        )
-        request_row = result.scalars().first()
-        if request_row is not None:
-            request_fk = request_row.id
-    result = await session.execute(select(Miner).where(Miner.ss58 == miner_ss58))
-    miner = result.scalars().first()
-    if miner is None:
-        miner = Miner(ss58=miner_ss58)
-        session.add(miner)
-        await session.flush()
+    write_succeeded = False
+    script_row: Script | None = None
 
-    if competition_id is None:
-        competition_id = await _select_active_competition_id(session)
-    if competition_id is None:
-        raise LookupError("No active competition available for miner upload")
-
-    script_row = Script(
-        script_uuid=script_uuid,
-        miner_fk=miner.id,
-        request_fk=request_fk,
-    )
     try:
+        request_fk = None
+        if request_id:
+            result = await session.execute(
+                select(Request).where(Request.external_request_id == request_id)
+            )
+            request_row = result.scalars().first()
+            if request_row is not None:
+                request_fk = request_row.id
+
+        insert_stmt = (
+            pg_insert(Miner)
+            .values(ss58=miner_ss58)
+            .on_conflict_do_nothing(index_elements=[Miner.ss58])
+            .returning(Miner.id)
+        )
+        insert_result = await session.execute(insert_stmt)
+        miner_id = insert_result.scalar_one_or_none()
+        if miner_id is None:
+            result = await session.execute(
+                select(Miner.id).where(Miner.ss58 == miner_ss58)
+            )
+            miner_id = result.scalar_one_or_none()
+        if miner_id is None:
+            raise LookupError(f"Failed to resolve miner for ss58={miner_ss58}")
+
+        if competition_id is None:
+            competition_id = await _select_active_competition_id(session)
+        if competition_id is None:
+            raise LookupError("No active competition available for miner upload")
+
+        miner_row = await session.scalar(
+            select(Miner).where(Miner.id == miner_id).with_for_update()
+        )
+        if miner_row is None:
+            raise LookupError(f"Failed to resolve miner row for id={miner_id}")
+        if miner_row.miner_banned_status:
+            raise BannedMinerUploadError(
+                "Miner is banned and cannot upload scripts"
+            )
+
+        existing_upload = await session.scalar(
+            select(MinerUpload.id)
+            .join(Script, Script.id == MinerUpload.script_fk)
+            .where(Script.miner_fk == miner_id)
+            .where(MinerUpload.competition_fk == competition_id)
+            .limit(1)
+        )
+        if existing_upload is not None:
+            raise DuplicateMinerUploadError(
+                "Miner already uploaded a script for the current competition"
+            )
+
+        script_row = Script(
+            script_uuid=script_uuid,
+            miner_fk=miner_id,
+            request_fk=request_fk,
+        )
         session.add(script_row)
         await session.flush()
-
-        # Get active competition
-        if competition_id is None:
-            comp_result = await session.execute(
-                select(Competition.id)
-                .join(
-                    CompetitionConfig,
-                    CompetitionConfig.competition_fk == Competition.id,
-                )
-                .where(CompetitionConfig.is_active.is_(True))
-                .limit(1)
-            )
-            competition_id = comp_result.scalar()
 
         session.add(
             MinerUpload(
@@ -125,13 +156,28 @@ async def store_hot_script(
         )
         await session.commit()
         await session.refresh(script_row)
+        write_succeeded = True
+    except DuplicateMinerUploadError:
+        await session.rollback()
+        raise
+    except BannedMinerUploadError:
+        await session.rollback()
+        raise
     except SQLAlchemyError:
         await session.rollback()
-        try:
-            await storage.delete(key)
-        except Exception:
-            logger.exception("script_upload_cleanup_failed", extra={"key": key})
         logger.exception("script_write_failed", extra={"key": key})
         raise
+    except Exception:
+        await session.rollback()
+        logger.exception("script_write_failed", extra={"key": key})
+        raise
+    finally:
+        if not write_succeeded:
+            try:
+                await storage.delete(key)
+            except Exception:
+                logger.exception("script_upload_cleanup_failed", extra={"key": key})
 
+    if script_row is None:
+        raise LookupError("Failed to persist miner script")
     return script_row

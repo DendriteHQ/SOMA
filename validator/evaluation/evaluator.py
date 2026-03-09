@@ -75,8 +75,8 @@ class Evaluator(AbstractEvaluator):
                     # Create QuestionScore for each question
                     for q_idx, qa in enumerate(challenge.challenge_questions):
                         model_answer = scoring_result.model_answers[q_idx] if q_idx < len(scoring_result.model_answers) else ""
+                        q_score = scoring_result.scores[q_idx] if q_idx < len(scoring_result.scores) else 0.0
                         detail = scoring_result.details[q_idx] if q_idx < len(scoring_result.details) else {}
-                        q_score = detail.get("score", 0.0) if isinstance(detail, dict) else 0.0
                         
                         question_scores.append(
                             QuestionScore(

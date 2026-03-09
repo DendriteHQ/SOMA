@@ -28,7 +28,8 @@ class Settings(BaseModel):
     llm_timeout_seconds: float
     llm_max_tokens: int
     llm_temperature: float
-
+    http_timeout_seconds: float
+    
     @classmethod
     def from_env(cls) -> "Settings":
         wallet_name = os.getenv("WALLET_NAME", "")
@@ -45,7 +46,6 @@ class Settings(BaseModel):
         platform_signer_ss58 = cls._require_non_empty(
             "PLATFORM_SIGNER_SS58", os.getenv("PLATFORM_SIGNER_SS58", "")
         )
-
         try:
             if subtensor_endpoint:
                 subtensor = AsyncSubtensor(
@@ -70,7 +70,7 @@ class Settings(BaseModel):
             hotkey=hotkey,
             platform_url=platform_url,
             platform_signer_ss58=platform_signer_ss58,
-            validator_host=os.getenv("VALIDATOR_HOST", "0.0.0.0"),
+            validator_host=cls.resolve_public_ip(),
             validator_port=cls._get_int("VALIDATOR_PORT", 8000),
             netuid=netuid,
             wallet=bt.Wallet(name=wallet_name, hotkey=hotkey),
@@ -91,8 +91,31 @@ class Settings(BaseModel):
             llm_timeout_seconds=cls._get_float("LLM_TIMEOUT_SECONDS", 240),
             llm_max_tokens=cls._get_int("LLM_MAX_TOKENS", 1024),
             llm_temperature=cls._get_float("LLM_TEMPERATURE", 0),
+            http_timeout_seconds = cls._get_float("HTTP_TIMEOUT_SECONDS", 240.0)
         )
         return settings
+
+    @classmethod
+    def resolve_public_ip(cls) -> str:
+        if os.getenv("VALIDATOR_HOST") == "0.0.0.0" or os.getenv("VALIDATOR_HOST") == None:
+            import requests
+
+            try:
+                response = requests.get("https://api.ipify.org?format=text", timeout=5)
+                response.raise_for_status()
+                public_ip = response.text.strip()
+                bt.logging.info("resolved_public_ip", extra={"public_ip": public_ip})
+                return public_ip
+            except Exception as exc:
+                bt.logging.error(
+                    "resolve_public_ip_failed",
+                    extra={"error": str(exc)},
+                )
+                raise ValueError("Failed to resolve public IP address") from exc
+        else:
+            return os.getenv("VALIDATOR_HOST")
+        
+
 
     @classmethod
     def _get_int(cls, name: str, default: int) -> int:
