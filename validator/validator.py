@@ -422,8 +422,7 @@ class Validator(AbstractValidator):
                         # No tasks available (503 response) - apply backoff
                         consecutive_no_tasks += 1
                         current_poll_interval = min(
-                            base_poll_interval
-                            * (backoff_multiplier**consecutive_no_tasks),
+                            current_poll_interval * backoff_multiplier,
                             max_backoff_interval,
                         )
                         logging.info(
