@@ -29,6 +29,7 @@ from soma_shared.contracts.validator.v1.messages import (
 from soma_shared.db.models.batch_assignment import BatchAssignment
 from soma_shared.db.models.batch_challenge import BatchChallenge
 from soma_shared.db.models.batch_challenge_score import BatchChallengeScore
+from soma_shared.db.models.batch_compressed_text import BatchCompressedText
 from soma_shared.db.models.batch_question_answer import BatchQuestionAnswer
 from soma_shared.db.models.batch_question_score import BatchQuestionScore
 from soma_shared.db.models.challenge import Challenge
@@ -528,14 +529,23 @@ async def request_challenge(
     response_items: list[tuple[BatchChallenge, Challenge]] = []
     challenge_texts: list[str] = []
     compression_ratios: list[float | None] = []
+    storage_uuids: list[str] = []
 
     for batch_challenge in batch_challenges:
         challenge = challenge_by_id.get(batch_challenge.challenge_fk)
         if challenge is None:
             continue
+        storage_uuid = f"{script.script_uuid}/{uuid.uuid4()}"
+        db.add(
+            BatchCompressedText(
+                batch_challenge_fk=batch_challenge.id,
+                storage_uuid=storage_uuid,
+            )
+        )
         response_items.append((batch_challenge, challenge))
         challenge_texts.append(challenge.challenge_text or "")
         compression_ratios.append(float(batch_challenge.compression_ratio))
+        storage_uuids.append(storage_uuid)
 
     try:
         challenge_code = await fetch_miner_challenge_code(miner.ss58, script)
@@ -545,6 +555,7 @@ async def request_challenge(
             challenge_code=challenge_code,
             challenge_texts=challenge_texts,
             compression_ratios=compression_ratios,
+            storage_uuids=storage_uuids,
         )
         compressed_lengths = [len(text or "") for text in compressed_texts]
         bt.logging.info(

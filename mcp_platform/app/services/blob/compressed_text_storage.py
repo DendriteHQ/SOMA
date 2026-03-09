@@ -50,6 +50,31 @@ class CompressedTextStorage:
         key = self._get_key(batch_id)
         await self._storage.delete(key)
 
+    async def save_single(self, storage_uuid: str, compressed_text: str) -> None:
+        """Save a single compressed text under the given UUID key.
+
+        Args:
+            storage_uuid: UUID used as the S3 object key
+            compressed_text: The compressed text string
+        """
+        key = self._get_key(storage_uuid)
+        await self._storage.put_bytes(
+            key, compressed_text.encode("utf-8"), content_type="text/plain; charset=utf-8"
+        )
+
+    async def get_single(self, storage_uuid: str) -> str:
+        """Retrieve a single compressed text by its UUID key.
+
+        Args:
+            storage_uuid: UUID used as the S3 object key
+
+        Returns:
+            The compressed text string
+        """
+        key = self._get_key(storage_uuid)
+        data = await self._storage.get_bytes(key)
+        return data.decode("utf-8")
+
     def _get_key(self, batch_id: str) -> str:
         """Generate S3 key for batch.
         
