@@ -110,11 +110,17 @@ class Validator(AbstractValidator):
                         json=signed_payload.model_dump(),
                     )
                     response.raise_for_status()
-                    signed = verify_httpx_response(
-                        response,
-                        ValidatorRegisterResponse,
-                        expected_key=self.settings.platform_signer_ss58,
-                    )
+                    try:
+                        signed = verify_httpx_response(
+                            response,
+                            ValidatorRegisterResponse,
+                            expected_key=self.settings.platform_signer_ss58,
+                        )
+                    except ValueError as verify_exc:
+                        logging.warning(
+                            f"register_to_platform: signature verification failed: {verify_exc}"
+                        )
+                        raise
                     logging.info(
                         "Successfully registered validator",
                         extra={"payload": signed.payload.model_dump(mode="json")},
@@ -166,6 +172,11 @@ class Validator(AbstractValidator):
                         expected_key=self.settings.platform_signer_ss58,
                     )
                     logging.info("get_best_miners: Signature verified")
+                except ValueError as verify_exc:
+                    logging.warning(
+                        f"get_best_miners: signature verification failed: {verify_exc}"
+                    )
+                    raise
                 except Exception as verify_exc:
                     logging.error(
                         f"get_best_miners: verify_httpx_response failed: {verify_exc}",
@@ -278,6 +289,11 @@ class Validator(AbstractValidator):
                     logging.info(
                         "get_tasks_for_eval: Response verified successfully"
                     )
+                except ValueError as verify_exc:
+                    logging.warning(
+                        f"get_tasks_for_eval: signature verification failed: {verify_exc}"
+                    )
+                    raise
                 except Exception as verify_exc:
                     logging.error(
                         f"get_tasks_for_eval: verify_httpx_response failed: {verify_exc}",
@@ -338,11 +354,17 @@ class Validator(AbstractValidator):
                     json=signed_payload.model_dump(),
                 )
                 response.raise_for_status()
-                signed = verify_httpx_response(
-                    response,
-                    PostChallengeScoresResponse,
-                    expected_key=self.settings.platform_signer_ss58,
-                )
+                try:
+                    signed = verify_httpx_response(
+                        response,
+                        PostChallengeScoresResponse,
+                        expected_key=self.settings.platform_signer_ss58,
+                    )
+                except ValueError as verify_exc:
+                    logging.warning(
+                        f"report_results: signature verification failed: {verify_exc}"
+                    )
+                    raise
                 logging.info(
                     "Successfully reported results",
                     extra={"payload": signed.payload.model_dump(mode="json")},
