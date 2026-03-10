@@ -192,7 +192,7 @@ def _send_heartbeat_request(
                 )
                 return "failed"
             if env_raw.sig.signer_ss58 != validator_ss58:
-                logger.info(
+                logger.warning(
                     "heartbeat_signer_mismatch url=%s request_id=%s",
                     url,
                     request_id,
@@ -200,14 +200,31 @@ def _send_heartbeat_request(
                 return "failed"
             if not payload_obj.ok:
                 return "failed"
-            ok = verify_payload_model(
-                payload_obj,
-                nonce=env_raw.sig.nonce,
-                signature_b64=env_raw.sig.signature,
-                signer_ss58_address=env_raw.sig.signer_ss58,
-            )
-            if ok:
-                return "working"
+            try:
+                ok = verify_payload_model(
+                    payload_obj,
+                    nonce=env_raw.sig.nonce,
+                    signature_b64=env_raw.sig.signature,
+                    signer_ss58_address=env_raw.sig.signer_ss58,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "heartbeat_signature_verification_error url=%s request_id=%s signer_ss58=%s",
+                    url,
+                    request_id,
+                    env_raw.sig.signer_ss58,
+                    exc_info=exc,
+                )
+                return "failed"
+            if not ok:
+                logger.warning(
+                    "heartbeat_signature_verification_failed url=%s request_id=%s signer_ss58=%s",
+                    url,
+                    request_id,
+                    env_raw.sig.signer_ss58,
+                )
+                return "failed"
+            return "working"
     except (HTTPError, URLError, ValueError):
         logger.info(
             "heartbeat_request_failed url=%s request_id=%s",

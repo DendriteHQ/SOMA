@@ -95,11 +95,17 @@ async def main(
                 sys.exit(1)
 
             # Verify response
-            signed_response = verify_httpx_response(
-                response,
-                UploadSolutionResponse,
-                expected_key=os.getenv("PLATFORM_SIGNER_SS58"),
-            )
+            try:
+                signed_response = verify_httpx_response(
+                    response,
+                    UploadSolutionResponse,
+                    expected_key=os.getenv("PLATFORM_SIGNER_SS58"),
+                )
+            except ValueError as verify_exc:
+                logger.warning(
+                    f"Upload response signature verification failed: {verify_exc}"
+                )
+                raise
 
             logger.info(f"Upload successful: {signed_response.payload.ok}")
             logger.debug(
