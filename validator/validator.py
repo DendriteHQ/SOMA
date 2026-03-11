@@ -362,6 +362,32 @@ class Validator(AbstractValidator):
         return "service_unavailable"
 
     @staticmethod
+    def _compute_backoff_interval(
+        *,
+        streak: int,
+        base_poll_interval: float,
+        backoff_multiplier: float,
+        max_backoff_interval: float,
+        exponential_attempts: int = 3,
+    ) -> float:
+        safe_streak = max(0, streak)
+        safe_base = max(0.1, base_poll_interval)
+        safe_max = max(safe_base, max_backoff_interval)
+
+        if safe_streak == 0:
+            return safe_base
+
+        exp_attempts = max(1, exponential_attempts)
+        if safe_streak <= exp_attempts:
+            interval = safe_base * (backoff_multiplier ** safe_streak)
+            return min(interval, safe_max)
+
+        exp_end_interval = safe_base * (backoff_multiplier ** exp_attempts)
+        linear_steps = safe_streak - exp_attempts
+        interval = exp_end_interval + (linear_steps * safe_base)
+        return min(interval, safe_max)
+
+    @staticmethod
     def _next_sleep_interval(
         *,
         current_poll_interval: float,
@@ -449,12 +475,6 @@ class Validator(AbstractValidator):
                     exc_info=True,
                 )
 
-        def compute_backoff_interval(streak: int) -> float:
-            return min(
-                base_poll_interval * (backoff_multiplier ** max(0, streak)),
-                max_backoff_interval,
-            )
-
         try:
             logging.info("Validator run loop started")
             while True:
@@ -499,8 +519,11 @@ class Validator(AbstractValidator):
                         if cause == "compression_ratio_all_failed":
                             consecutive_ratio_failures += 1
                             consecutive_no_tasks = 0
-                            current_poll_interval = compute_backoff_interval(
-                                consecutive_ratio_failures
+                            current_poll_interval = self._compute_backoff_interval(
+                                streak=consecutive_ratio_failures,
+                                base_poll_interval=base_poll_interval,
+                                backoff_multiplier=backoff_multiplier,
+                                max_backoff_interval=max_backoff_interval,
                             )
                             logging.info(
                                 "All challenges failed compression ratio check "
@@ -511,8 +534,11 @@ class Validator(AbstractValidator):
                             # No tasks available (503 response) - apply standard backoff
                             consecutive_no_tasks += 1
                             consecutive_ratio_failures = 0
-                            current_poll_interval = compute_backoff_interval(
-                                consecutive_no_tasks
+                            current_poll_interval = self._compute_backoff_interval(
+                                streak=consecutive_no_tasks,
+                                base_poll_interval=base_poll_interval,
+                                backoff_multiplier=backoff_multiplier,
+                                max_backoff_interval=max_backoff_interval,
                             )
                             logging.info(
                                 f"No tasks available (attempt {consecutive_no_tasks}, cause={cause}), "

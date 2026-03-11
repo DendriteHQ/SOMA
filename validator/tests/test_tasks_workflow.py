@@ -81,6 +81,58 @@ def test_next_sleep_interval_policy():
     )
 
 
+def test_compute_backoff_interval_hybrid_policy():
+    base = 15.0
+    mult = 2.0
+    max_backoff = 300.0
+
+    assert (
+        Validator._compute_backoff_interval(
+            streak=0,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 15.0
+    )
+    assert (
+        Validator._compute_backoff_interval(
+            streak=1,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 30.0
+    )
+    assert (
+        Validator._compute_backoff_interval(
+            streak=3,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 120.0
+    )
+    assert (
+        Validator._compute_backoff_interval(
+            streak=4,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 135.0
+    )
+    assert (
+        Validator._compute_backoff_interval(
+            streak=20,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 300.0
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_tasks_for_eval_returns_typed_response():
     validator = _make_validator()
