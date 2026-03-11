@@ -120,7 +120,7 @@ class Settings(BaseSettings):
 
     # Validator stake requirements (in alpha tokens)
     min_validator_stake: float = Field(
-        default=10000.0,
+        default=20000.0,
         alias="MIN_VALIDATOR_STAKE",
     )
 
