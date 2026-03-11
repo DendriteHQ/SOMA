@@ -152,10 +152,10 @@ class Settings(BaseModel):
             logger.error("missing_required_env", extra={"env": "PLATFORM_URL"})
             raise ValueError("PLATFORM_URL is required and cannot be empty")
         parsed = urlparse(value)
-        if parsed.scheme not in {"http"}:
+        if parsed.scheme not in {"http", "https"}:
             logger.error(
                 "platform_url_invalid_scheme",
                 extra={"platform_url": value},
             )
-            raise ValueError("PLATFORM_URL must start with http://")
+            raise ValueError("PLATFORM_URL must start with http:// or https://")
         return value
