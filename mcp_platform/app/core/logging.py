@@ -29,6 +29,8 @@ _LOG_RECORD_ATTRS = {
     "processName",
     "process",
     "message",
+    "taskName",
+    "task",
     "log_domain",
     "log_component",
 }
@@ -186,6 +188,10 @@ class _LoggerPrefixFilter(logging.Filter):
         )
 
 
+class _ManagedRotatingFileHandler(RotatingFileHandler):
+    pass
+
+
 def _resolve_logger_context(module_name: str) -> tuple[str, str, str]:
     normalized = (module_name or "").strip()
     for route in _LOGGER_ROUTES:
@@ -282,8 +288,8 @@ def _create_file_handler(
     max_level: int | None,
     max_bytes: int,
     backup_count: int,
-) -> RotatingFileHandler:
-    handler = RotatingFileHandler(
+) -> _ManagedRotatingFileHandler:
+    handler = _ManagedRotatingFileHandler(
         log_path,
         maxBytes=max_bytes,
         backupCount=backup_count,
@@ -293,6 +299,12 @@ def _create_file_handler(
     handler.setFormatter(_build_json_formatter())
     handler.addFilter(_LoggerPrefixFilter(logger_prefix))
     handler.addFilter(_LevelRangeFilter(min_level=min_level, max_level=max_level))
+    handler._mcp_handler_key = (
+        str(log_path),
+        logger_prefix,
+        min_level,
+        max_level,
+    )
     return handler
 
 
@@ -348,6 +360,44 @@ def _build_file_handlers_for_prefix(
     ]
 
 
+def _attach_file_handlers_for_prefix(
+    logger: logging.Logger,
+    *,
+    log_dir: Path,
+    logger_prefix: str,
+    max_bytes: int,
+    backup_count: int,
+) -> None:
+    existing_handler_keys = {
+        getattr(handler, "_mcp_handler_key", None)
+        for handler in logger.handlers
+        if isinstance(handler, _ManagedRotatingFileHandler)
+    }
+    for handler in _build_file_handlers_for_prefix(
+        log_dir,
+        logger_prefix=logger_prefix,
+        max_bytes=max_bytes,
+        backup_count=backup_count,
+    ):
+        handler_key = getattr(handler, "_mcp_handler_key", None)
+        if handler_key in existing_handler_keys:
+            handler.close()
+            continue
+        logger.addHandler(handler)
+        existing_handler_keys.add(handler_key)
+
+
+def _match_file_logger_prefix(logger_name: str) -> str | None:
+    matched_prefixes = [
+        prefix
+        for prefix in _FILE_LOGGER_ROUTES
+        if logger_name == prefix or logger_name.startswith(prefix + ".")
+    ]
+    if not matched_prefixes:
+        return None
+    return max(matched_prefixes, key=len)
+
+
 def _attach_file_handlers(
     logger: logging.Logger,
     *,
@@ -358,14 +408,39 @@ def _attach_file_handlers(
     if log_dir is None:
         return
     for logger_prefix, relative_dir in _FILE_LOGGER_ROUTES.items():
-        target_dir = log_dir / relative_dir
-        for handler in _build_file_handlers_for_prefix(
-            target_dir,
+        _attach_file_handlers_for_prefix(
+            logger,
+            log_dir=log_dir / relative_dir,
             logger_prefix=logger_prefix,
             max_bytes=max_bytes,
             backup_count=backup_count,
-        ):
-            logger.addHandler(handler)
+        )
+
+
+def _attach_file_handlers_to_queue_loggers(
+    *,
+    log_dir: Path | None,
+    max_bytes: int,
+    backup_count: int,
+) -> None:
+    if log_dir is None:
+        return
+    for logger in logging.root.manager.loggerDict.values():
+        if not isinstance(logger, logging.Logger):
+            continue
+        if not any(isinstance(handler, QueueHandler) for handler in logger.handlers):
+            continue
+        matched_prefix = _match_file_logger_prefix(logger.name)
+        if matched_prefix is None:
+            continue
+        relative_dir = _FILE_LOGGER_ROUTES[matched_prefix]
+        _attach_file_handlers_for_prefix(
+            logger,
+            log_dir=log_dir / relative_dir,
+            logger_prefix=matched_prefix,
+            max_bytes=max_bytes,
+            backup_count=backup_count,
+        )
 
 
 def _configure_json_logging(
@@ -395,6 +470,53 @@ def _configure_json_logging(
         max_bytes=log_file_max_bytes,
         backup_count=log_file_backup_count,
     )
+    _apply_module_log_levels(module_levels)
+
+
+def _fallback_to_json_logging(
+    level: str,
+    module_levels: Mapping[str, str] | None,
+    include_extras: bool,
+    log_dir: Path | None,
+    log_file_max_bytes: int,
+    log_file_backup_count: int,
+) -> None:
+    _configure_json_logging(
+        level,
+        module_levels,
+        include_extras,
+        log_dir=log_dir,
+        log_file_max_bytes=log_file_max_bytes,
+        log_file_backup_count=log_file_backup_count,
+    )
+
+
+def _configure_bittensor_logging(
+    *,
+    include_extras: bool,
+    log_dir: Path | None,
+    log_file_max_bytes: int,
+    log_file_backup_count: int,
+    level: str,
+    module_levels: Mapping[str, str] | None,
+) -> None:
+    bt_app_logger = logging.getLogger("app")
+    bt_app_logger.setLevel(_to_python_log_level(level))
+    _apply_extras_filter(include_extras)
+    _apply_context_defaults_filter()
+    _apply_render_extras_filter(include_extras)
+    _attach_file_handlers(
+        bt_app_logger,
+        log_dir=log_dir,
+        max_bytes=log_file_max_bytes,
+        backup_count=log_file_backup_count,
+    )
+    _attach_file_handlers_to_queue_loggers(
+        log_dir=log_dir,
+        max_bytes=log_file_max_bytes,
+        backup_count=log_file_backup_count,
+    )
+    _disable_propagation_for_queue_handlers()
     _apply_module_log_levels(module_levels)
 
 
@@ -431,10 +553,15 @@ def _clear_non_bt_handlers(bt) -> None:
             continue
         if logger.name in primary:
             for handler in list(logger.handlers):
-                if not isinstance(handler, QueueHandler):
+                if not isinstance(
+                    handler,
+                    (QueueHandler, _ManagedRotatingFileHandler),
+                ):
                     logger.removeHandler(handler)
             continue
         for handler in list(logger.handlers):
+            if isinstance(handler, _ManagedRotatingFileHandler):
+                continue
             logger.removeHandler(handler)
 
 
@@ -529,13 +656,13 @@ def configure_logging(
     try:
         import bittensor as bt  # type: ignore
     except Exception:
-        _configure_json_logging(
+        _fallback_to_json_logging(
             level,
             module_levels,
             include_extras,
-            log_dir=resolved_log_dir,
-            log_file_max_bytes=log_file_max_bytes,
-            log_file_backup_count=log_file_backup_count,
+            resolved_log_dir,
+            log_file_max_bytes,
+            log_file_backup_count,
         )
         return
 
@@ -546,13 +673,13 @@ def configure_logging(
         try:
             bt.logging.register_primary_logger("app")
         except Exception:
-            _configure_json_logging(
+            _fallback_to_json_logging(
                 level,
                 module_levels,
                 include_extras,
-                log_dir=resolved_log_dir,
-                log_file_max_bytes=log_file_max_bytes,
-                log_file_backup_count=log_file_backup_count,
+                resolved_log_dir,
+                log_file_max_bytes,
+                log_file_backup_count,
             )
             return
         _BT_CONFIGURED = True
@@ -560,25 +687,20 @@ def configure_logging(
     _clear_non_bt_handlers(bt)
     try:
         bt.logging.enable_third_party_loggers()
-        app_logger = logging.getLogger("app")
-        app_logger.setLevel(_to_python_log_level(level))
-        _apply_extras_filter(include_extras)
-        _apply_context_defaults_filter()
-        _apply_render_extras_filter(include_extras)
-        _attach_file_handlers(
-            app_logger,
-            log_dir=resolved_log_dir,
-            max_bytes=log_file_max_bytes,
-            backup_count=log_file_backup_count,
-        )
-        _disable_propagation_for_queue_handlers()
-        _apply_module_log_levels(module_levels)
-    except Exception:
-        _configure_json_logging(
-            level,
-            module_levels,
-            include_extras,
+        _configure_bittensor_logging(
+            include_extras=include_extras,
             log_dir=resolved_log_dir,
             log_file_max_bytes=log_file_max_bytes,
             log_file_backup_count=log_file_backup_count,
+            level=level,
+            module_levels=module_levels,
+        )
+    except Exception:
+        _fallback_to_json_logging(
+            level,
+            module_levels,
+            include_extras,
+            resolved_log_dir,
+            log_file_max_bytes,
+            log_file_backup_count,
         )
