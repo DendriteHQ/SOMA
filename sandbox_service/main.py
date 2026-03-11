@@ -7,6 +7,7 @@ and stores the results in S3.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -15,7 +16,7 @@ from pathlib import Path
 # Add parent directory to path to find mcp_platform module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 from soma_shared.contracts.sandbox.v1.messages import (
     ExecuteBatchRequest,
@@ -50,6 +51,9 @@ app = FastAPI(
 async def startup():
     """Initialize sandbox executor on startup."""
     get_sandbox_executor()
+    max_concurrent = int(min(12, os.cpu_count() - 1)) 
+    app.state.sandbox_semaphore = asyncio.Semaphore(max_concurrent)
+    logger.info("Sandbox semaphore initialized with max_concurrent=%d", max_concurrent)
 
 
 def get_sandbox_executor() -> SandboxExecutor:
@@ -84,6 +88,20 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
     3. Saves compressed results to S3
     4. Returns success status
     """
+    semaphore: asyncio.Semaphore = app.state.sandbox_semaphore
+    try:
+        async with asyncio.timeout(0):
+            await semaphore.acquire()
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning(
+            "Sandbox service at capacity, rejecting batch: batch_id=%s",
+            request.batch_id,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Sandbox service is at capacity. Please try again later.",
+        )
+
     logger.info(
         "Received batch execution request: batch_id=%s, texts=%d",
         request.batch_id,
@@ -135,6 +153,8 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
             batch_id=request.batch_id,
             error=str(exc),
         )
+    finally:
+        semaphore.release()
 
 
 @app.get("/health")

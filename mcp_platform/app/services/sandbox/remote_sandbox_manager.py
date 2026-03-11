@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import timedelta
 from typing import List
@@ -25,7 +24,6 @@ class RemoteSandboxManager:
         timeout_per_task: float,
         container_timeout_offset: float,
         request_timeout_offset: float,
-        max_sandboxes: int = 10,
     ):
         """Initialize remote sandbox manager.
         
@@ -35,15 +33,12 @@ class RemoteSandboxManager:
             timeout_per_task: Timeout for executing one compression task (seconds)
             container_timeout_offset: Extra time for container overhead (seconds)
             request_timeout_offset: Extra time for HTTP request overhead (seconds, must be > container_offset)
-            max_sandboxes: Maximum concurrent sandbox operations (for semaphore)
         """
-        self.max_sandboxes = max_sandboxes
         self._timeout_per_task = timeout_per_task
         self._container_timeout_offset = container_timeout_offset
         self._request_timeout_offset = request_timeout_offset
         self._sandbox_service_url = sandbox_service_url.rstrip("/")
         self._compressed_text_storage = compressed_text_storage
-        self._semaphore = asyncio.Semaphore(max_sandboxes)
         
         # Validate that request timeout offset > container timeout offset
         if request_timeout_offset <= container_timeout_offset:
@@ -60,7 +55,6 @@ class RemoteSandboxManager:
         challenge_texts: list[str],
         compression_ratios: list[float | None],
         storage_uuids: list[str],
-        acquire_timeout: float = 10.0,
     ) -> list[str]:
         """Execute a batch of challenges on remote sandbox service.
         
@@ -70,27 +64,13 @@ class RemoteSandboxManager:
             challenge_texts: List of texts to compress
             compression_ratios: Target compression ratios
             storage_uuids: S3 storage UUIDs, one per challenge_text entry
-            acquire_timeout: Timeout for acquiring semaphore slot
             
         Returns:
             List of compressed texts
             
         Raises:
-            RuntimeError: If platform is at capacity or execution fails
+            RuntimeError: If platform is at capacity
         """
-        try:
-            async with asyncio.timeout(acquire_timeout):
-                await self._semaphore.acquire()
-        except asyncio.TimeoutError:
-            logger.warning(
-                "[RemoteSandbox] Platform at capacity - no sandbox slots available within %ss",
-                acquire_timeout
-            )
-            raise RuntimeError(
-                f"Platform is at capacity. Maximum {self.max_sandboxes} sandboxes are currently running. "
-                "Please try again later."
-            )
-        
         try:
             return await self._execute_remote_batch(
                 batch_id,
@@ -99,13 +79,13 @@ class RemoteSandboxManager:
                 compression_ratios,
                 storage_uuids,
             )
+        except RuntimeError:
+            raise
         except Exception as exc:
             logger.error(
                 "[RemoteSandbox] Batch execution failed: %s", exc, exc_info=True
             )
             return [""] * len(challenge_texts)
-        finally:
-            self._semaphore.release()
 
     async def _execute_remote_batch(
         self,
@@ -185,6 +165,15 @@ class RemoteSandboxManager:
                 )
                 return [""] * len(challenge_texts)
             except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429:
+                    logger.warning(
+                        "[RemoteSandbox] Sandbox service at capacity (429): batch_id=%s",
+                        batch_id,
+                    )
+                    raise RuntimeError(
+                        "Platform is at capacity. The sandbox service is currently handling the maximum "
+                        "number of concurrent requests. Please try again later."
+                    )
                 logger.error(
                     "[RemoteSandbox] Sandbox service returned error status %d: %s",
                     exc.response.status_code,
