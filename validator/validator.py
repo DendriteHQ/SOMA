@@ -361,6 +361,17 @@ class Validator(AbstractValidator):
             return "no_tasks"
         return "service_unavailable"
 
+    @staticmethod
+    def _next_sleep_interval(
+        *,
+        current_poll_interval: float,
+        base_poll_interval: float,
+        can_fetch: bool,
+    ) -> float:
+        if can_fetch:
+            return current_poll_interval
+        return min(current_poll_interval, base_poll_interval)
+
     async def report_results(self, task, results):
         try:
             payload = PostChallengeScores(
@@ -508,7 +519,12 @@ class Validator(AbstractValidator):
                                 f"backing off to {current_poll_interval:.1f}s poll interval"
                             )
 
-                await asyncio.sleep(current_poll_interval)
+                sleep_interval = self._next_sleep_interval(
+                    current_poll_interval=current_poll_interval,
+                    base_poll_interval=base_poll_interval,
+                    can_fetch=can_fetch,
+                )
+                await asyncio.sleep(sleep_interval)
         except asyncio.CancelledError as cancel_exc:
             logging.error(f"Validator run CANCELLED! Traceback:", exc_info=True)
             import traceback
