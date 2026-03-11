@@ -418,6 +418,7 @@ class Validator(AbstractValidator):
 
         current_poll_interval = base_poll_interval
         consecutive_no_tasks = 0
+        consecutive_ratio_failures = 0
 
         in_flight: set[asyncio.Task] = set()
         last_weight_set = 0.0
@@ -437,6 +438,12 @@ class Validator(AbstractValidator):
                     exc_info=True,
                 )
 
+        def compute_backoff_interval(streak: int) -> float:
+            return min(
+                base_poll_interval * (backoff_multiplier ** max(0, streak)),
+                max_backoff_interval,
+            )
+
         try:
             logging.info("Validator run loop started")
             while True:
@@ -453,10 +460,16 @@ class Validator(AbstractValidator):
 
                 in_flight = {task for task in in_flight if not task.done()}
                 has = self.has_eval_capacity()
-                logging.info(
-                    f"Has evaluation capacity: {has}, in_flight tasks: {len(in_flight)}"
+                max_in_flight = (
+                    1 if consecutive_ratio_failures > 0 else self.settings.max_concurrent_evaluations
                 )
-                if has:
+                can_fetch = has and len(in_flight) < max_in_flight
+                logging.info(
+                    f"Has evaluation capacity: {has}, in_flight tasks: {len(in_flight)}, "
+                    f"max_in_flight: {max_in_flight}, can_fetch: {can_fetch}, "
+                    f"ratio_fail_streak: {consecutive_ratio_failures}"
+                )
+                if can_fetch:
                     logging.info("Fetching tasks from platform...")
                     task = await self.get_tasks_for_eval()
                     logging.info(f"Got task: {task}")
@@ -464,22 +477,36 @@ class Validator(AbstractValidator):
                     if task and getattr(task, "challenges", None):
                         # Successfully got tasks - reset backoff
                         consecutive_no_tasks = 0
+                        consecutive_ratio_failures = 0
                         current_poll_interval = base_poll_interval
                         logging.info(
                             f"Fetched task: {task.batch_id}, reset poll interval to {current_poll_interval}s"
                         )
                         in_flight.add(asyncio.create_task(process_task(task)))
                     elif task is None:
-                        # No tasks available (503 response) - apply backoff
-                        consecutive_no_tasks += 1
-                        current_poll_interval = min(
-                            current_poll_interval * backoff_multiplier,
-                            max_backoff_interval,
-                        )
-                        logging.info(
-                            f"No tasks available (attempt {consecutive_no_tasks}), "
-                            f"backing off to {current_poll_interval:.1f}s poll interval"
-                        )
+                        cause = getattr(self, "_last_fetch_cause", "unknown")
+                        if cause == "compression_ratio_all_failed":
+                            consecutive_ratio_failures += 1
+                            consecutive_no_tasks = 0
+                            current_poll_interval = compute_backoff_interval(
+                                consecutive_ratio_failures
+                            )
+                            logging.info(
+                                "All challenges failed compression ratio check "
+                                f"(attempt {consecutive_ratio_failures}), backing off to "
+                                f"{current_poll_interval:.1f}s and limiting intake concurrency to 1"
+                            )
+                        else:
+                            # No tasks available (503 response) - apply standard backoff
+                            consecutive_no_tasks += 1
+                            consecutive_ratio_failures = 0
+                            current_poll_interval = compute_backoff_interval(
+                                consecutive_no_tasks
+                            )
+                            logging.info(
+                                f"No tasks available (attempt {consecutive_no_tasks}, cause={cause}), "
+                                f"backing off to {current_poll_interval:.1f}s poll interval"
+                            )
 
                 await asyncio.sleep(current_poll_interval)
         except asyncio.CancelledError as cancel_exc:
