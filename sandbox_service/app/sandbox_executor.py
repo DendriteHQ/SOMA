@@ -225,6 +225,7 @@ class SandboxExecutor:
                         detach=True,
                         environment={
                             "TASK_TIMEOUT": str(timeout_per_task),
+                            "TIKTOKEN_CACHE_DIR": "/tiktoken_cache"
                         },
                         volumes={
                             str(input_dir): {"bind": "/sandbox/input", "mode": "ro"},
@@ -236,6 +237,8 @@ class SandboxExecutor:
                     # Wait for completion
                     try:
                         result = container.wait(timeout=container_timeout)
+                        logs = container.logs().decode("utf-8")
+                        logger.info("Container logs:\n%s", logs)
                     except Exception as exc:
                         logger.error(
                             "Container wait failed (timeout=%ss): %s",
@@ -281,12 +284,20 @@ class SandboxExecutor:
                                     item = tuple(item)
                                 if isinstance(item, tuple) and len(item) >= 1:
                                     text_raw = item[0]
+                                    task_logs = item[1] if len(item) >= 2 else ""
                                     if isinstance(text_raw, list):
                                         text = text_raw[0] if text_raw else ""
                                     else:
                                         text = str(text_raw or "")
                                     responses.append(text)
-                                    logger.info("Output %d: %d bytes", idx, len(text))
+                                    if text:
+                                        logger.info("Output %d: %d bytes", idx, len(text))
+                                    else:
+                                        logger.warning(
+                                            "Output %d: empty result. Task logs: %s",
+                                            idx,
+                                            task_logs or "(no logs)",
+                                        )
                                 else:
                                     responses.append(str(item or ""))
                     except Exception as exc:

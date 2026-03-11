@@ -110,10 +110,10 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
     
     try:
         storage = get_storage()
-
+        logging.info("Script S3 key: %s", request.script_s3_key)
         # Fetch miner challenge code from S3
         challenge_code = await storage.get_script(request.script_s3_key)
-
+        logging.info("Fetched challenge code for batch_id=%s, length=%d", request.batch_id, len(challenge_code))
         # Get sandbox executor
         executor = get_sandbox_executor()
 
