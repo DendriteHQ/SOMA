@@ -17,8 +17,9 @@ from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.request import Request
 from soma_shared.db.models.script import Script
 from app.services.blob.script_storage import ScriptStorage
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class DuplicateMinerUploadError(RuntimeError):

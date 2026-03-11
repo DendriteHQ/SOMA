@@ -68,8 +68,9 @@ from app.api.routes.utils import (
     get_script_s3_key,
 )
 from app.db.views import V_MINER_SCREENER_STATS
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
 
 

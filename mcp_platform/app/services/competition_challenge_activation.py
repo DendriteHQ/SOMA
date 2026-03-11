@@ -8,8 +8,9 @@ from sqlalchemy import select, update
 from app.db.models.challenge import Challenge
 from app.db.models.competition_challenge import CompetitionChallenge
 from app.db.session import get_db_session
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_ACTIVATION_INTERVAL_SECS = 60
 DEFAULT_LATEST_CHALLENGE_LIMIT = 200

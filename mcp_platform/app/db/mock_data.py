@@ -37,8 +37,9 @@ from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_heartbeat import ValidatorHeartbeat
 from soma_shared.db.models.validator_registration import ValidatorRegistration
 from app.api.deps import get_script_storage
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def seed_debug_data(session: AsyncSession) -> None:

@@ -34,8 +34,9 @@ from soma_shared.db.models.screening_challenge import ScreeningChallenge
 from soma_shared.db.models.script import Script
 from soma_shared.db.models.question import Question
 from soma_shared.db.models.answer import Answer
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DEFAULT_CHALLENGE_CODE_PATH = (
     Path(__file__).resolve().parent / "challenges" / "default_challenge.py"

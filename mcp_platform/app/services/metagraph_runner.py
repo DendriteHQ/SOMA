@@ -5,8 +5,9 @@ import logging
 import threading
 
 from app.services.metagraph import MetagraphService
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class MetagraphServiceRunner:

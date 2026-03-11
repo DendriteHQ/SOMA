@@ -29,8 +29,9 @@ from app.services.script_store import (
 )
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
 from app.core.config import settings
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(tags=["miner"])
 

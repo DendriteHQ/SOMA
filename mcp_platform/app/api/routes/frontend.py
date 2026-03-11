@@ -57,9 +57,10 @@ from app.db.views import (
 )
 from app.core.config import settings
 from app.api.routes.utils import _get_current_burn_state
+from app.core.logging import get_logger
 import logging
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/private/frontend", tags=["frontend"])
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"

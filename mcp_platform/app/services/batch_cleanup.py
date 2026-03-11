@@ -16,8 +16,9 @@ from soma_shared.db.models.competition_config import CompetitionConfig
 from soma_shared.db.models.competition_challenge import CompetitionChallenge
 from soma_shared.db.session import get_db_session
 from app.core.config import settings
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def start_batch_cleanup_task(app) -> None:

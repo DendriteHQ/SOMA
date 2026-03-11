@@ -10,8 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from soma_shared.db.models.request import Request
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_heartbeat import ValidatorHeartbeat
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def log_validator_heartbeat(

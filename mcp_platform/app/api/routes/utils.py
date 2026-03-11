@@ -35,8 +35,9 @@ from soma_shared.db.validator_log import log_validator_message
 from app.db.views import V_ACTIVE_COMPETITION, V_SCREENER_CHALLENGES_ACTIVE
 from app.core.config import settings
 from app.api.deps import get_script_storage
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
 
 

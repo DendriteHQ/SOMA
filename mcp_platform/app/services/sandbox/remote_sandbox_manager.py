@@ -8,9 +8,10 @@ import uuid
 import httpx
 
 from app.services.blob.compressed_text_storage import CompressedTextStorage
+from app.core.logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class RemoteSandboxManager:

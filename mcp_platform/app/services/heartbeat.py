@@ -27,8 +27,9 @@ from soma_shared.utils.signer import (
     verify_payload_model,
     get_wallet_from_settings,
 )
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_HEARTBEAT_INTERVAL_SECS = 10
 DEFAULT_HEARTBEAT_TIMEOUT_SECS = 5

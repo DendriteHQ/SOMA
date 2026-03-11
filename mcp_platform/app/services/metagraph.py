@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.core.config import settings
-from app.core.logging import configure_logging
+from app.core.logging import configure_logging, get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _scalar(value: Any) -> int | float | None:
@@ -78,6 +78,9 @@ class MetagraphService:
             settings.log_level,
             settings.log_levels,
             include_extras=settings.log_include_extras,
+            log_dir=settings.log_dir,
+            log_file_max_bytes=settings.log_file_max_bytes,
+            log_file_backup_count=settings.log_file_backup_count,
         )
         subtensor_cls = getattr(bt, "subtensor", None) or getattr(bt, "Subtensor", None)
         if subtensor_cls is None:
