@@ -48,7 +48,10 @@ from app.services.challenge_factory import (
     create_challenge_batch,
     get_qa_pairs_for_challenge,
 )
-from app.services.sandbox.remote_sandbox_manager import RemoteSandboxManager
+from app.services.sandbox.remote_sandbox_manager import (
+    RemoteSandboxManager,
+    SandboxExecutionError,
+)
 from app.services.blob.s3 import S3BlobStorage
 from app.services.blob.compressed_text_storage import CompressedTextStorage
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
@@ -56,6 +59,7 @@ from soma_shared.utils.verifier import verify_validator_stake_dep
 from app.api.deps import verify_request_dep_tz
 from app.core.config import settings
 from app.api.routes.utils import (
+    _count_tokens,
     _get_request_row,
     _log_error_response,
     _select_miner_ss58,
@@ -584,6 +588,22 @@ async def request_challenge(
                 detail="Platform is at capacity processing other requests. Please try again in a moment.",
             )
         raise
+    except SandboxExecutionError as exc:
+        logger.error(
+            "request_challenge: sandbox execution failed "
+            f"miner_ss58={miner.ss58} request_id={request_id}: {exc}"
+        )
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Sandbox execution failed: {exc}",
+            exc=exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Sandbox execution failed: {exc}",
+        ) from exc
     except Exception as exc:
         logger.error(
             "request_challenge: error preparing sandbox batch "
@@ -624,6 +644,31 @@ async def request_challenge(
             ratio=ratio,
         ):
             original_text = challenge.challenge_text or ""
+            compressed_value = compressed_text or ""
+            original_tokens = _count_tokens(original_text)
+            compressed_tokens = _count_tokens(compressed_value)
+            if original_tokens > 0 and len(original_text) > 0:
+                base_chars_per_token = len(original_text) / original_tokens
+            else:
+                base_chars_per_token = None
+            if compressed_tokens > 0 and len(compressed_value) > 0:
+                compressed_chars_per_token = len(compressed_value) / compressed_tokens
+            else:
+                compressed_chars_per_token = None
+            if (
+                base_chars_per_token is None
+                or base_chars_per_token == 0
+                or compressed_chars_per_token is None
+            ):
+                chars_per_token_ratio = None
+            else:
+                chars_per_token_ratio = (
+                    compressed_chars_per_token / base_chars_per_token
+                )
+            if original_tokens > 0:
+                token_compression_ratio = compressed_tokens / original_tokens
+            else:
+                token_compression_ratio = None
             logger.warning(
                 "request_challenge: not compressed enough "
                 f"request_id={request_id} "
@@ -633,7 +678,11 @@ async def request_challenge(
                 f"miner_ss58={miner.ss58} "
                 f"ratio_target={ratio} "
                 f"original_chars={len(original_text)} "
-                f"compressed_chars={len(compressed_text or '')}"
+                f"compressed_chars={len(compressed_value)} "
+                f"original_tokens={original_tokens} "
+                f"compressed_tokens={compressed_tokens} "
+                f"chars_per_token_ratio={chars_per_token_ratio} "
+                f"token_compression_ratio={token_compression_ratio}"
             )
             for question_id in question_ids_by_challenge.get(challenge.id, []):
                 zero_score_answers.append(

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from soma_shared.db.models.batch_assignment import BatchAssignment
 from soma_shared.db.models.batch_challenge import BatchChallenge
+from soma_shared.db.models.batch_compressed_text import BatchCompressedText
 from soma_shared.db.models.challenge import Challenge
 from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.competition import Competition
@@ -110,13 +111,38 @@ async def _delete_expired_assignments(
 ) -> int:
     """Delete assignments that are not done and older than timeout."""
     cutoff_time = datetime.now(timezone.utc) - timedelta(hours=timeout_hours)
-
-    # Find expired assignments (assigned but not done, older than cutoff)
-    stmt = delete(BatchAssignment).where(
+    expired_filter = (
         BatchAssignment.assigned_at < cutoff_time,
         BatchAssignment.done_at.is_(None),
     )
 
+    expired_batch_ids = list(
+        (
+            await session.execute(
+                select(BatchAssignment.challenge_batch_fk).where(*expired_filter)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not expired_batch_ids:
+        return 0
+
+    # If these batches are reissued, old compressed-text rows conflict on
+    # uq_batch_compressed_texts_batch_challenge. Clear them together.
+    batch_challenge_ids_subquery = select(BatchChallenge.id).where(
+        BatchChallenge.challenge_batch_fk.in_(expired_batch_ids)
+    )
+    compressed_stmt = delete(BatchCompressedText).where(
+        BatchCompressedText.batch_challenge_fk.in_(batch_challenge_ids_subquery)
+    )
+    compressed_result = await session.execute(compressed_stmt)
+    compressed_deleted_count = compressed_result.rowcount or 0
+
+    stmt = delete(BatchAssignment).where(
+        BatchAssignment.challenge_batch_fk.in_(expired_batch_ids),
+        *expired_filter,
+    )
     result = await session.execute(stmt)
     deleted_count = result.rowcount or 0
 
@@ -125,6 +151,7 @@ async def _delete_expired_assignments(
             "expired_assignments_deleted",
             extra={
                 "count": deleted_count,
+                "compressed_text_count": compressed_deleted_count,
                 "cutoff_time": cutoff_time.isoformat(),
             },
         )

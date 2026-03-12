@@ -14,6 +14,10 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
+class SandboxExecutionError(Exception):
+    """Raised when sandbox execution fails for a batch."""
+
+
 class RemoteSandboxManager:
     """Remote sandbox manager that delegates execution to a separate sandbox service."""
 
@@ -71,6 +75,7 @@ class RemoteSandboxManager:
             
         Raises:
             RuntimeError: If platform is at capacity
+            SandboxExecutionError: If sandbox execution fails
         """
         try:
             return await self._execute_remote_batch(
@@ -154,25 +159,21 @@ class RemoteSandboxManager:
                         "[RemoteSandbox] Sandbox service returned error: %s",
                         error_msg,
                     )
-                    return [""] * len(challenge_texts), error_msg
-
-                sandbox_error = result.get("error")  # task-level failures (success=True because it's task level failure)
-                if sandbox_error:
-                    logger.warning(
-                        "[RemoteSandbox] Sandbox reported task failures: batch_id=%s\n%s",
-                        batch_id,
-                        sandbox_error,
-                    )
-
+                    raise SandboxExecutionError(error_msg)
+                
                 logger.info(
                     "[RemoteSandbox] Sandbox execution successful: batch_id=%s",
                     batch_id,
                 )
                 
             except httpx.TimeoutException as exc:
-                error_msg = f"HTTP request to sandbox service timed out: {exc}"
-                logger.error("[RemoteSandbox] %s", error_msg)
-                return [""] * len(challenge_texts), error_msg
+                logger.error(
+                    "[RemoteSandbox] Request to sandbox service timed out: %s",
+                    exc,
+                )
+                raise SandboxExecutionError(
+                    "Sandbox service request timed out"
+                ) from exc
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 429:
                     logger.warning(
@@ -183,13 +184,23 @@ class RemoteSandboxManager:
                         "Platform is at capacity. The sandbox service is currently handling the maximum "
                         "number of concurrent requests. Please try again later."
                     )
-                error_msg = f"Sandbox service returned HTTP {exc.response.status_code}: {exc.response.text}"
-                logger.error("[RemoteSandbox] %s", error_msg)
-                return [""] * len(challenge_texts), error_msg
+                logger.error(
+                    "[RemoteSandbox] Sandbox service returned error status %d: %s",
+                    exc.response.status_code,
+                    exc.response.text,
+                )
+                raise SandboxExecutionError(
+                    f"Sandbox service returned HTTP {exc.response.status_code}"
+                ) from exc
             except Exception as exc:
-                error_msg = f"Failed to communicate with sandbox service: {exc}"
-                logger.error("[RemoteSandbox] %s", error_msg, exc_info=True)
-                return [""] * len(challenge_texts), error_msg
+                logger.error(
+                    "[RemoteSandbox] Failed to communicate with sandbox service: %s",
+                    exc,
+                    exc_info=True,
+                )
+                raise SandboxExecutionError(
+                    "Failed to communicate with sandbox service"
+                ) from exc
         
         # Retrieve individual compressed texts from S3 using per-challenge UUIDs
         compressed_texts: list[str] = []
@@ -204,7 +215,9 @@ class RemoteSandboxManager:
                     exc,
                     exc_info=True,
                 )
-                compressed_texts.append("")
+                raise SandboxExecutionError(
+                    f"Failed to retrieve compressed text for uuid={storage_uuid}"
+                ) from exc
 
         logger.info(
             "[RemoteSandbox] Retrieved %d compressed texts from storage",

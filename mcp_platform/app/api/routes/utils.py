@@ -78,6 +78,9 @@ def _is_compressed_enough(
     compressed: str,
     ratio: float | None,
 ) -> bool:
+    if not compressed.strip():
+        return False
+
     if _is_chars_per_token_outlier(original=original, compressed=compressed):
         return False
 

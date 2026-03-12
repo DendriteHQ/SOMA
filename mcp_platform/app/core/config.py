@@ -93,11 +93,11 @@ class Settings(BaseSettings):
 
     # Batch cleanup
     batch_cleanup_interval_secs: int = Field(
-        default=300,
+        default=120,
         alias="BATCH_CLEANUP_INTERVAL_SECS",
     )
     batch_assignment_timeout_hours: float = Field(
-        default=0.5,
+        default=0.2,
         alias="BATCH_ASSIGNMENT_TIMEOUT_HOURS",
     )
 
