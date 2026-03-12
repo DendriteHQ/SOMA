@@ -493,9 +493,6 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def startup_event():
-        if os.getenv("VALIDATOR_DISABLE_RUN") == "1":
-            logging.info("Validator run disabled via VALIDATOR_DISABLE_RUN=1")
-            return
         validator = await asyncio.to_thread(Validator)
         app.state.validator = validator
         app.state.validator_task = asyncio.create_task(validator.run())
