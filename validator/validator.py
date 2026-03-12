@@ -34,6 +34,7 @@ import httpx
 from soma_shared.utils.signer import sign_payload_model, generate_nonce
 from validator.chain.weigt_setter import WeightSetter
 from validator.evaluation.evaluator import Evaluator
+from validator.evaluation.llm_scorer import LLMClient, LLMInsufficientFundsError
 from soma_shared.utils.verifier import verify_httpx_response
 import bittensor as bt
 
@@ -53,6 +54,7 @@ class Validator(AbstractValidator):
     def __init__(self):
         super().__init__()
         self.settings = self.init_settings()
+        self.verify_openrouter_startup()
         self._last_fetch_cause = "unknown"
         self.evaluator = Evaluator(settings=self.settings)
         self.weight_setter = WeightSetter(
@@ -64,6 +66,36 @@ class Validator(AbstractValidator):
         if not self.registered:
             raise RuntimeError("Validator registration to platform failed.")
         
+    def verify_openrouter_startup(self) -> None:
+        token = (self.settings.openrouter_api_token or "").strip()
+        if not token:
+            raise RuntimeError("OPENROUTER_API_TOKEN is required for validator scoring")
+
+        llm_client = LLMClient(
+            url=self.settings.openrouter_api_url,
+            api_token=token,
+            model=self.settings.openrouter_model,
+            timeout_seconds=min(self.settings.llm_timeout_seconds, 20.0),
+            max_tokens=min(self.settings.llm_max_tokens, 8),
+            temperature=0.0,
+        )
+
+        prompt = (
+            'Return exactly this JSON and nothing else: '
+            '{"results":[{"status":"UNANSWERABLE","answer":""}]}'
+        )
+
+        try:
+            asyncio.run(llm_client.ask(prompt))
+            logging.info("OpenRouter startup verification passed")
+        except LLMInsufficientFundsError as exc:
+            raise RuntimeError(
+                "OpenRouter startup verification failed: insufficient funds"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"OpenRouter startup verification failed: {exc}"
+            ) from exc
 
     def init_settings(self) -> Settings:
         return Settings.from_env()

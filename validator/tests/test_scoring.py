@@ -4,7 +4,39 @@ import pytest
 import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
-from validator.evaluation.llm_scorer import Scoring, LLMClient, ScoringResult
+from validator.evaluation.llm_scorer import (
+    Scoring,
+    LLMClient,
+    ScoringResult,
+    LLMInsufficientFundsError,
+    is_insufficient_funds_error,
+)
+
+
+class TestOpenRouterFunds:
+    def test_detects_insufficient_funds_error(self):
+        assert is_insufficient_funds_error(402, "Payment required")
+        assert is_insufficient_funds_error(429, "insufficient credits")
+        assert is_insufficient_funds_error(400, "not enough balance")
+
+    def test_does_not_misclassify_generic_errors(self):
+        assert not is_insufficient_funds_error(401, "invalid api key")
+        assert not is_insufficient_funds_error(429, "rate limit exceeded")
+
+    @pytest.mark.asyncio
+    async def test_request_with_retry_does_not_retry_insufficient_funds(self):
+        scoring = Scoring()
+        attempts = 0
+
+        async def _fail():
+            nonlocal attempts
+            attempts += 1
+            raise LLMInsufficientFundsError("insufficient funds")
+
+        with pytest.raises(LLMInsufficientFundsError):
+            await scoring._request_with_retry(_fail, retries=3, delay=0.0)
+
+        assert attempts == 1
 
 
 class TestLLMClient:

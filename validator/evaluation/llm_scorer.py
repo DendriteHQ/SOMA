@@ -22,6 +22,29 @@ class LLMOutputFormatError(ValueError):
     pass
 
 
+class LLMInsufficientFundsError(RuntimeError):
+    pass
+
+
+def is_insufficient_funds_error(status_code: int, error_body: str | None) -> bool:
+    body = (error_body or "").lower()
+    if status_code == 402:
+        return True
+    indicators = (
+        "insufficient credits",
+        "insufficient credit",
+        "insufficient balance",
+        "not enough credits",
+        "not enough balance",
+        "no credits remaining",
+        "no remaining credits",
+        "out of credits",
+        "top up",
+        "payment required",
+    )
+    return any(indicator in body for indicator in indicators)
+
+
 class LLMClient:
     def __init__(
         self,
@@ -86,6 +109,11 @@ class LLMClient:
                         f"LLM API Error: status={response.status}, "
                         f"body={error_body[:500]}"
                     )
+                    if is_insufficient_funds_error(response.status, error_body):
+                        raise LLMInsufficientFundsError(
+                            f"OpenRouter rejected request due to insufficient funds "
+                            f"(status={response.status})"
+                        )
                 response.raise_for_status()
 
                 payload = await response.json()
@@ -142,6 +170,11 @@ class Scoring:
         for attempt in range(1, attempts + 1):
             try:
                 return await func()
+            except LLMInsufficientFundsError:
+                logging.error(
+                    "LLM call failed due to insufficient OpenRouter funds; not retrying."
+                )
+                raise
             except Exception as exc:
                 last_exc = exc
                 remaining = attempts - attempt
