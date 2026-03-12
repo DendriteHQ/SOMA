@@ -20,6 +20,10 @@ from .container_config import CONTAINER_CONFIG
 logger = logging.getLogger(__name__)
 
 
+class SandboxExecutionError(RuntimeError):
+    """Raised when sandbox container exits with non-zero status or times out."""
+
+
 class SandboxExecutor:
     """Executes untrusted code in isolated Docker containers."""
 
@@ -125,7 +129,7 @@ class SandboxExecutor:
         compression_ratios: List[Optional[float]],
         timeout_per_task: float,
         container_timeout: float,
-    ) -> List[str]:
+    ) -> tuple[List[str], str | None]:
         """Execute a batch of compression tasks.
         
         Args:
@@ -136,7 +140,7 @@ class SandboxExecutor:
             container_timeout: Global timeout for entire execution
             
         Returns:
-            List of compressed texts
+            Tuple of (compressed_texts, error_message). error_message is None on full success.
         """
         import asyncio
         
@@ -156,7 +160,7 @@ class SandboxExecutor:
         compression_ratios: List[Optional[float]],
         timeout_per_task: float,
         container_timeout: float,
-    ) -> List[str]:
+    ) -> tuple[List[str], str | None]:
         """Synchronous batch execution.
         
         Args:
@@ -167,7 +171,7 @@ class SandboxExecutor:
             container_timeout: Global timeout for entire execution
             
         Returns:
-            List of compressed texts
+            Tuple of (compressed_texts, error_message). error_message is None on full success.
         """
         import asyncio
         try:
@@ -178,7 +182,7 @@ class SandboxExecutor:
                 exc,
                 exc_info=True,
             )
-            return [""] * len(challenge_texts)
+            return [""] * len(challenge_texts), str(exc)
         
         sandbox_id = f"sandbox-{uuid.uuid4().hex}"
         
@@ -216,6 +220,7 @@ class SandboxExecutor:
 
                 container = None
                 timed_out = False
+                container_error: str | None = None
                 try:
                     # Run container with timeout environment variable
                     container = client.containers.run(
@@ -237,8 +242,6 @@ class SandboxExecutor:
                     # Wait for completion
                     try:
                         result = container.wait(timeout=container_timeout)
-                        logs = container.logs().decode("utf-8")
-                        logger.info("Container logs:\n%s", logs)
                     except Exception as exc:
                         logger.error(
                             "Container wait failed (timeout=%ss): %s",
@@ -256,22 +259,25 @@ class SandboxExecutor:
                         status_code = (
                             result.get("StatusCode") if isinstance(result, dict) else result
                         )
-                        logger.info("Container finished with status=%s", status_code)
-
                         if status_code not in (0, None):
-                            logger.warning(
-                                "Container exited with non-zero status=%s", status_code
-                            )
+                            container_error = f"Container exited with status={status_code}."
+                            logger.error("Container exited with non-zero status=%s", status_code)
+                        else:
+                            logger.info("Container finished with status=%s", status_code)
+                    else:
+                        container_error = f"Container timed out after {container_timeout}s."
 
                 finally:
                     if container is not None:
                         container.remove(force=True)
 
-                if timed_out:
-                    return [""] * len(challenge_texts)
+                if container_error:
+                    raise SandboxExecutionError(container_error)
                 # Read output
                 output_path = output_dir / "output.json"
                 responses: List[str] = []
+
+                task_error: str | None = None
 
                 if output_path.exists():
                     try:
@@ -294,10 +300,12 @@ class SandboxExecutor:
                                         logger.info("Output %d: %d bytes", idx, len(text))
                                     else:
                                         logger.warning(
-                                            "Output %d: empty result. Task logs: %s",
+                                            "Output %d: empty result. Task logs:\n%s",
                                             idx,
                                             task_logs or "(no logs)",
                                         )
+                                        if task_logs and task_error is None:
+                                            task_error = task_logs
                                 else:
                                     responses.append(str(item or ""))
                     except Exception as exc:
@@ -316,7 +324,7 @@ class SandboxExecutor:
                 elif len(responses) > len(challenge_texts):
                     responses = responses[:len(challenge_texts)]
 
-                return responses
+                return responses, task_error
             finally:
                 self._cleanup_limited_fs(fs_img, output_dir)
 

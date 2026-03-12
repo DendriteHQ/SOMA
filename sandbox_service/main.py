@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import sys
+import traceback
 from pathlib import Path
 
 # Add parent directory to path to find mcp_platform module
@@ -118,7 +119,7 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
         executor = get_sandbox_executor()
 
         # Execute sandbox
-        compressed_texts = await executor.execute_batch(
+        compressed_texts, task_error = await executor.execute_batch(
             challenge_code=challenge_code,
             challenge_texts=request.challenge_texts,
             compression_ratios=request.compression_ratios,
@@ -135,23 +136,32 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
             request.batch_id,
             len(compressed_texts),
         )
+        if task_error:
+            logger.warning(
+                "Batch completed with task failures: batch_id=%s\n%s",
+                request.batch_id,
+                task_error,
+            )
 
         return ExecuteBatchResponse(
             success=True,
             batch_id=request.batch_id,
+            error=task_error,
         )
 
+
     except Exception as exc:
+        tb = traceback.format_exc()
         logger.error(
-            "Batch execution failed: batch_id=%s, error=%s",
+            "Batch execution failed: batch_id=%s, error=%s\n%s",
             request.batch_id,
             str(exc),
-            exc_info=True,
+            tb,
         )
         return ExecuteBatchResponse(
             success=False,
             batch_id=request.batch_id,
-            error=str(exc),
+            error=f"{type(exc).__name__}: {exc}\n\n{tb}",
         )
     finally:
         semaphore.release()

@@ -551,13 +551,18 @@ async def request_challenge(
     try:
         script_s3_key = get_script_s3_key(miner.ss58, script)
         sandbox_manager = _get_sandbox_manager(request)
-        compressed_texts = await sandbox_manager.run_batch(
+        compressed_texts, sandbox_error = await sandbox_manager.run_batch(
             batch_id=str(challenge_batch.id),
             script_s3_key=script_s3_key,
             challenge_texts=challenge_texts,
             compression_ratios=compression_ratios,
             storage_uuids=storage_uuids,
         )
+        if sandbox_error:
+            logger.error(
+                "request_challenge: sandbox returned error "
+                f"request_id={request_id} batch_id={challenge_batch.id}: {sandbox_error}"
+            )
         compressed_lengths = [len(text or "") for text in compressed_texts]
         logger.info(
             "request_challenge: compressed text lengths "
@@ -644,7 +649,11 @@ async def request_challenge(
                         question_fk=question_id,
                         validator_fk=validator.id,
                         score=0.0,
-                        details={"reason": "not_compressed_enough"},
+                        details=(
+                            {"reason": "sandbox_error", "error": sandbox_error}
+                            if sandbox_error
+                            else {"reason": "not_compressed_enough"}
+                        ),
                     )
                 )
             zero_score_rollups.append(

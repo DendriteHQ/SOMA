@@ -56,7 +56,7 @@ class RemoteSandboxManager:
         challenge_texts: list[str],
         compression_ratios: list[float | None],
         storage_uuids: list[str],
-    ) -> list[str]:
+    ) -> tuple[list[str], str | None]:
         """Execute a batch of challenges on remote sandbox service.
         
         Args:
@@ -67,7 +67,7 @@ class RemoteSandboxManager:
             storage_uuids: S3 storage UUIDs, one per challenge_text entry
             
         Returns:
-            List of compressed texts
+            Tuple of (compressed_texts, error_message). error_message is None on success.
             
         Raises:
             RuntimeError: If platform is at capacity
@@ -86,7 +86,7 @@ class RemoteSandboxManager:
             logger.error(
                 "[RemoteSandbox] Batch execution failed: %s", exc, exc_info=True
             )
-            return [""] * len(challenge_texts)
+            return [""] * len(challenge_texts), str(exc)
 
     async def _execute_remote_batch(
         self,
@@ -95,7 +95,7 @@ class RemoteSandboxManager:
         challenge_texts: list[str],
         compression_ratios: list[float | None],
         storage_uuids: list[str],
-    ) -> list[str]:
+    ) -> tuple[list[str], str | None]:
         """Execute batch on remote sandbox service and retrieve results from S3.
         
         Args:
@@ -106,7 +106,7 @@ class RemoteSandboxManager:
             storage_uuids: S3 storage UUIDs, one per challenge_text entry
             
         Returns:
-            List of compressed texts
+            Tuple of (compressed_texts, error_message). error_message is None on success.
         """
         num_tasks = len(challenge_texts)
         
@@ -134,7 +134,9 @@ class RemoteSandboxManager:
             container_timeout,
             request_timeout,
         )
-        
+
+        sandbox_error: str | None = None
+
         # Send request to sandbox service
         async with httpx.AsyncClient() as client:
             try:
@@ -147,24 +149,30 @@ class RemoteSandboxManager:
                 result = response.json()
                 
                 if not result.get("success"):
-                    error_msg = result.get("error", "Unknown error")
+                    error_msg = result.get("error", "Unknown sandbox error")
                     logger.error(
                         "[RemoteSandbox] Sandbox service returned error: %s",
                         error_msg,
                     )
-                    return [""] * len(challenge_texts)
-                
+                    return [""] * len(challenge_texts), error_msg
+
+                sandbox_error = result.get("error")  # task-level failures (success=True because it's task level failure)
+                if sandbox_error:
+                    logger.warning(
+                        "[RemoteSandbox] Sandbox reported task failures: batch_id=%s\n%s",
+                        batch_id,
+                        sandbox_error,
+                    )
+
                 logger.info(
                     "[RemoteSandbox] Sandbox execution successful: batch_id=%s",
                     batch_id,
                 )
                 
             except httpx.TimeoutException as exc:
-                logger.error(
-                    "[RemoteSandbox] Request to sandbox service timed out: %s",
-                    exc,
-                )
-                return [""] * len(challenge_texts)
+                error_msg = f"HTTP request to sandbox service timed out: {exc}"
+                logger.error("[RemoteSandbox] %s", error_msg)
+                return [""] * len(challenge_texts), error_msg
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 429:
                     logger.warning(
@@ -175,19 +183,13 @@ class RemoteSandboxManager:
                         "Platform is at capacity. The sandbox service is currently handling the maximum "
                         "number of concurrent requests. Please try again later."
                     )
-                logger.error(
-                    "[RemoteSandbox] Sandbox service returned error status %d: %s",
-                    exc.response.status_code,
-                    exc.response.text,
-                )
-                return [""] * len(challenge_texts)
+                error_msg = f"Sandbox service returned HTTP {exc.response.status_code}: {exc.response.text}"
+                logger.error("[RemoteSandbox] %s", error_msg)
+                return [""] * len(challenge_texts), error_msg
             except Exception as exc:
-                logger.error(
-                    "[RemoteSandbox] Failed to communicate with sandbox service: %s",
-                    exc,
-                    exc_info=True,
-                )
-                return [""] * len(challenge_texts)
+                error_msg = f"Failed to communicate with sandbox service: {exc}"
+                logger.error("[RemoteSandbox] %s", error_msg, exc_info=True)
+                return [""] * len(challenge_texts), error_msg
         
         # Retrieve individual compressed texts from S3 using per-challenge UUIDs
         compressed_texts: list[str] = []
@@ -208,7 +210,7 @@ class RemoteSandboxManager:
             "[RemoteSandbox] Retrieved %d compressed texts from storage",
             len(compressed_texts),
         )
-        return compressed_texts
+        return compressed_texts, sandbox_error
 
     def shutdown(self) -> None:
         """Compatibility lifecycle hook used by app shutdown."""
