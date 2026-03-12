@@ -60,7 +60,7 @@ class RemoteSandboxManager:
         challenge_texts: list[str],
         compression_ratios: list[float | None],
         storage_uuids: list[str],
-    ) -> list[str]:
+    ) -> tuple[list[str], str | None]:
         """Execute a batch of challenges on remote sandbox service.
         
         Args:
@@ -71,19 +71,27 @@ class RemoteSandboxManager:
             storage_uuids: S3 storage UUIDs, one per challenge_text entry
             
         Returns:
-            List of compressed texts
+            Tuple of (compressed_texts, error_message). error_message is None on success.
             
         Raises:
             RuntimeError: If platform is at capacity
             SandboxExecutionError: If sandbox execution fails
         """
-        return await self._execute_remote_batch(
-            batch_id,
-            script_s3_key,
-            challenge_texts,
-            compression_ratios,
-            storage_uuids,
-        )
+        try:
+            return await self._execute_remote_batch(
+                batch_id,
+                script_s3_key,
+                challenge_texts,
+                compression_ratios,
+                storage_uuids,
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "[RemoteSandbox] Batch execution failed: %s", exc, exc_info=True
+            )
+            return [""] * len(challenge_texts), str(exc)
 
     async def _execute_remote_batch(
         self,
@@ -92,7 +100,7 @@ class RemoteSandboxManager:
         challenge_texts: list[str],
         compression_ratios: list[float | None],
         storage_uuids: list[str],
-    ) -> list[str]:
+    ) -> tuple[list[str], str | None]:
         """Execute batch on remote sandbox service and retrieve results from S3.
         
         Args:
@@ -103,7 +111,7 @@ class RemoteSandboxManager:
             storage_uuids: S3 storage UUIDs, one per challenge_text entry
             
         Returns:
-            List of compressed texts
+            Tuple of (compressed_texts, error_message). error_message is None on success.
         """
         num_tasks = len(challenge_texts)
         
@@ -131,7 +139,9 @@ class RemoteSandboxManager:
             container_timeout,
             request_timeout,
         )
-        
+
+        sandbox_error: str | None = None
+
         # Send request to sandbox service
         async with httpx.AsyncClient() as client:
             try:
@@ -144,7 +154,7 @@ class RemoteSandboxManager:
                 result = response.json()
                 
                 if not result.get("success"):
-                    error_msg = result.get("error", "Unknown error")
+                    error_msg = result.get("error", "Unknown sandbox error")
                     logger.error(
                         "[RemoteSandbox] Sandbox service returned error: %s",
                         error_msg,
@@ -213,7 +223,7 @@ class RemoteSandboxManager:
             "[RemoteSandbox] Retrieved %d compressed texts from storage",
             len(compressed_texts),
         )
-        return compressed_texts
+        return compressed_texts, sandbox_error
 
     def shutdown(self) -> None:
         """Compatibility lifecycle hook used by app shutdown."""

@@ -38,30 +38,22 @@ class Settings(BaseModel):
         hotkey = os.getenv("WALLET_HOTKEY", "")
         netuid = cls._get_int("NETUID", 114)
         subtensor_network = os.getenv("BT_NETWORK", "finney")
-        subtensor_endpoint = os.getenv("BT_CHAIN_ENDPOINT")
 
         wallet_name = cls._require_non_empty("WALLET_NAME", wallet_name)
         hotkey = cls._require_non_empty("WALLET_HOTKEY", hotkey)
         platform_url = cls._validate_platform_url(
-            os.getenv("PLATFORM_URL", "http://platform:8000")
+            os.getenv("PLATFORM_URL", "https://platform.thesoma.ai")
         )
         platform_signer_ss58 = cls._require_non_empty(
             "PLATFORM_SIGNER_SS58", os.getenv("PLATFORM_SIGNER_SS58", "")
         )
         try:
-            if subtensor_endpoint:
-                subtensor = AsyncSubtensor(
-                    network=subtensor_network,
-                    chain_endpoint=subtensor_endpoint,
-                )
-            else:
-                subtensor = AsyncSubtensor(network=subtensor_network)
+            subtensor = AsyncSubtensor(network=subtensor_network)
         except Exception as exc:
             logger.error(
                 "subtensor_init_failed",
                 extra={
                     "network": subtensor_network,
-                    "chain_endpoint": subtensor_endpoint,
                     "error": str(exc),
                 },
             )
@@ -89,7 +81,7 @@ class Settings(BaseModel):
                 "OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions"
             ),
             openrouter_api_token=os.getenv("OPENROUTER_API_TOKEN", ""),
-            openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            openrouter_model=os.getenv("OPENROUTER_MODEL", "moonshotai/kimi-k2-0905"),
             llm_timeout_seconds=cls._get_float("LLM_TIMEOUT_SECONDS", 240),
             llm_max_tokens=cls._get_int("LLM_MAX_TOKENS", 1024),
             llm_temperature=cls._get_float("LLM_TEMPERATURE", 0),
