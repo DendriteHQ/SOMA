@@ -6,7 +6,7 @@ import os
 import logging
 
 from .abstract_evaluator import AbstractEvaluator
-from .llm_scorer import Scoring
+from .llm_scorer import Scoring, LLMInsufficientFundsError
 from soma_shared.contracts.validator.v1.messages import GetChallengesResponse, QuestionScore
 
 
@@ -89,6 +89,12 @@ class Evaluator(AbstractEvaluator):
                         )
                 except Exception as exc:
                     logging.error(f"Scoring failed for task index={index}: {exc}", exc_info=True)
+                    if isinstance(exc, LLMInsufficientFundsError):
+                        logging.critical(
+                            "OpenRouter insufficient funds detected during scoring; exiting validator process."
+                        )
+                        logging.shutdown()
+                        os._exit(1)
                     # Add QuestionScore with 0.0 for each question on error
                     for qa in challenge.challenge_questions:
                         question_scores.append(
