@@ -35,15 +35,88 @@ def _make_validator():
         wallet=object(),
     )
     validator.evaluator = Mock()
+    validator.client = Mock()
+    validator.client.post = AsyncMock()
     return validator
 
 
 def _mock_client(response):
-    client = MagicMock()
-    client.post.return_value = response
-    client.__enter__.return_value = client
-    client.__exit__.return_value = False
+    client = Mock()
+    client.post = AsyncMock(return_value=response)
     return client
+
+
+def test_classify_503_cause_variants():
+    assert (
+        Validator._classify_503_cause(
+            "All challenges failed compression ratio check - no tasks available"
+        )
+        == "compression_ratio_all_failed"
+    )
+    assert (
+        Validator._classify_503_cause(
+            "No tasks available - all miners are scored or no free challenges exist"
+        )
+        == "no_tasks"
+    )
+    assert Validator._classify_503_cause("Platform is at capacity") == "service_unavailable"
+
+
+def test_loop_tick_interval_bounds():
+    assert Validator._loop_tick_interval(15.0) == 1.0
+    assert Validator._loop_tick_interval(0.2) == 0.5
+
+
+def test_compute_backoff_interval_hybrid_policy():
+    base = 15.0
+    mult = 2.0
+    max_backoff = 300.0
+
+    assert (
+        Validator._compute_backoff_interval(
+            streak=0,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 15.0
+    )
+    assert (
+        Validator._compute_backoff_interval(
+            streak=1,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 30.0
+    )
+    assert (
+        Validator._compute_backoff_interval(
+            streak=3,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 120.0
+    )
+    assert (
+        Validator._compute_backoff_interval(
+            streak=4,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 135.0
+    )
+    assert (
+        Validator._compute_backoff_interval(
+            streak=20,
+            base_poll_interval=base,
+            backoff_multiplier=mult,
+            max_backoff_interval=max_backoff,
+        )
+        == 300.0
+    )
 
 
 @pytest.mark.asyncio
@@ -135,10 +208,9 @@ async def test_report_results_posts_to_platform():
         patch("validator.validator.generate_nonce", return_value="n"),
         patch("validator.validator.sign_payload_model", return_value=signed.sig),
         patch("validator.validator.verify_httpx_response", return_value=signed),
-        patch("validator.validator.httpx.AsyncClient") as httpx_client,
     ):
         mock_client = _mock_client(response)
-        httpx_client.return_value.__aenter__.return_value = mock_client
+        validator.client = mock_client
         await validator.report_results(
             task,
             {"question_scores": question_scores, "batch_id": "batch-2"},
@@ -232,10 +304,9 @@ async def test_end_to_end_scores_and_reports():
         patch("validator.validator.generate_nonce", return_value="n"),
         patch("validator.validator.sign_payload_model", return_value=post_signed.sig),
         patch("validator.validator.verify_httpx_response", return_value=post_signed),
-        patch("validator.validator.httpx.AsyncClient") as httpx_client,
     ):
         mock_client = _mock_client(response)
-        httpx_client.return_value.__aenter__.return_value = mock_client
+        validator.client = mock_client
 
         # Now task will be response_payload, not None
         task = await validator.get_tasks_for_eval()

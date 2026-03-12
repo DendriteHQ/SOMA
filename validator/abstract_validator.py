@@ -69,7 +69,7 @@ class AbstractValidator(ABC):
         return NotImplementedError
 
     @abstractmethod
-    def get_tasks_for_eval(self) -> GetChallengesResponse:
+    def get_tasks_for_eval(self) -> GetChallengesResponse | None:
         """
         Fetch tasks to be evaluated from the platform.
         Calls an PLATFORM_URL/api/v1/validator/request_challenge endpoint.

@@ -53,6 +53,7 @@ class Validator(AbstractValidator):
     def __init__(self):
         super().__init__()
         self.settings = self.init_settings()
+        self._last_fetch_cause = "unknown"
         self.evaluator = Evaluator(settings=self.settings)
         self.weight_setter = WeightSetter(
             netuid=self.settings.netuid, subtensor=self.settings.subtensor
@@ -235,7 +236,7 @@ class Validator(AbstractValidator):
             logging.error(f"Exception during setting weights: {e}", exc_info=True)
             raise  # Re-raise to see if this is causing the crash
 
-    async def get_tasks_for_eval(self) -> GetChallengesResponse:
+    async def get_tasks_for_eval(self) -> GetChallengesResponse | None:
         try:
             payload = GetChallengesRequest()
             nonce = generate_nonce()
@@ -262,18 +263,34 @@ class Validator(AbstractValidator):
                 if response.status_code == 503:
                     try:
                         error_detail = response.json().get("detail", "")
-                        if "No tasks available" in error_detail:
+                        cause = self._classify_503_cause(error_detail)
+                        self._last_fetch_cause = cause
+                        if cause == "compression_ratio_all_failed":
+                            logging.info(
+                                "Platform reports all challenges failed compression ratio check. "
+                                "Validator will retry later with compression backoff."
+                            )
+                            logging.info(
+                                "get_tasks_for_eval: Returning None (503 compression ratio all failed)"
+                            )
+                            return None
+                        if cause == "no_tasks":
                             logging.info(
                                 "Platform reports no tasks available - all miners are scored. "
                                 "Validator will retry later with backoff."
                             )
                             logging.info("get_tasks_for_eval: Returning None (503)")
                             return None
+                        logging.info(
+                            f"get_tasks_for_eval: Returning None (503 other cause: {cause})"
+                        )
+                        return None
                     except Exception as e503:
                         logging.error(
                             f"get_tasks_for_eval: Error parsing 503 response: {e503}",
                             exc_info=True,
                         )
+                        self._last_fetch_cause = "service_unavailable"
                         pass
 
                 response.raise_for_status()
@@ -315,6 +332,7 @@ class Validator(AbstractValidator):
                     "Fetched challenges",
                     extra={"payload": signed.payload.model_dump(mode="json")},
                 )
+                self._last_fetch_cause = "ok"
                 logging.info("get_tasks_for_eval: Returning payload")
                 return signed.payload
             except httpx.HTTPError as e:
@@ -325,12 +343,53 @@ class Validator(AbstractValidator):
                     f"Response text: {getattr(e.response, 'text', 'N/A')}",
                     exc_info=True,
                 )
+                self._last_fetch_cause = "http_error"
                 logging.info("get_tasks_for_eval: Returning None (HTTP error)")
                 return None
         except Exception as e:
             logging.error(f"Exception during get_tasks_for_eval: {e}", exc_info=True)
+            self._last_fetch_cause = "exception"
             logging.info("get_tasks_for_eval: Returning None (exception)")
             return None
+
+    @staticmethod
+    def _classify_503_cause(error_detail: str) -> str:
+        detail = (error_detail or "").lower()
+        if "compression ratio check" in detail:
+            return "compression_ratio_all_failed"
+        if "no tasks available" in detail:
+            return "no_tasks"
+        return "service_unavailable"
+
+    @staticmethod
+    def _compute_backoff_interval(
+        *,
+        streak: int,
+        base_poll_interval: float,
+        backoff_multiplier: float,
+        max_backoff_interval: float,
+        exponential_attempts: int = 3,
+    ) -> float:
+        safe_streak = max(0, streak)
+        safe_base = max(0.1, base_poll_interval)
+        safe_max = max(safe_base, max_backoff_interval)
+
+        if safe_streak == 0:
+            return safe_base
+
+        exp_attempts = max(1, exponential_attempts)
+        if safe_streak <= exp_attempts:
+            interval = safe_base * (backoff_multiplier ** safe_streak)
+            return min(interval, safe_max)
+
+        exp_end_interval = safe_base * (backoff_multiplier ** exp_attempts)
+        linear_steps = safe_streak - exp_attempts
+        interval = exp_end_interval + (linear_steps * safe_base)
+        return min(interval, safe_max)
+
+    @staticmethod
+    def _loop_tick_interval(base_poll_interval: float) -> float:
+        return max(0.5, min(base_poll_interval, 1.0))
 
     async def report_results(self, task, results):
         try:
@@ -389,6 +448,8 @@ class Validator(AbstractValidator):
 
         current_poll_interval = base_poll_interval
         consecutive_no_tasks = 0
+        consecutive_ratio_failures = 0
+        fetch_cooldown_until = 0.0
 
         in_flight: set[asyncio.Task] = set()
         last_weight_set = 0.0
@@ -424,10 +485,19 @@ class Validator(AbstractValidator):
 
                 in_flight = {task for task in in_flight if not task.done()}
                 has = self.has_eval_capacity()
-                logging.info(
-                    f"Has evaluation capacity: {has}, in_flight tasks: {len(in_flight)}"
+                max_in_flight = (
+                    1 if consecutive_ratio_failures > 0 else self.settings.max_concurrent_evaluations
                 )
-                if has:
+                fetch_due = now >= fetch_cooldown_until
+                can_fetch = has and len(in_flight) < max_in_flight and fetch_due
+                cooldown_remaining = max(0.0, fetch_cooldown_until - now)
+                logging.info(
+                    f"Has evaluation capacity: {has}, in_flight tasks: {len(in_flight)}, "
+                    f"max_in_flight: {max_in_flight}, can_fetch: {can_fetch}, "
+                    f"ratio_fail_streak: {consecutive_ratio_failures}, "
+                    f"fetch_due: {fetch_due}, cooldown_remaining: {cooldown_remaining:.1f}s"
+                )
+                if can_fetch:
                     logging.info("Fetching tasks from platform...")
                     task = await self.get_tasks_for_eval()
                     logging.info(f"Got task: {task}")
@@ -435,24 +505,48 @@ class Validator(AbstractValidator):
                     if task and getattr(task, "challenges", None):
                         # Successfully got tasks - reset backoff
                         consecutive_no_tasks = 0
+                        consecutive_ratio_failures = 0
                         current_poll_interval = base_poll_interval
+                        fetch_cooldown_until = now
                         logging.info(
                             f"Fetched task: {task.batch_id}, reset poll interval to {current_poll_interval}s"
                         )
                         in_flight.add(asyncio.create_task(process_task(task)))
                     elif task is None:
-                        # No tasks available (503 response) - apply backoff
-                        consecutive_no_tasks += 1
-                        current_poll_interval = min(
-                            current_poll_interval * backoff_multiplier,
-                            max_backoff_interval,
-                        )
-                        logging.info(
-                            f"No tasks available (attempt {consecutive_no_tasks}), "
-                            f"backing off to {current_poll_interval:.1f}s poll interval"
-                        )
+                        cause = getattr(self, "_last_fetch_cause", "unknown")
+                        if cause == "compression_ratio_all_failed":
+                            consecutive_ratio_failures += 1
+                            consecutive_no_tasks = 0
+                            current_poll_interval = self._compute_backoff_interval(
+                                streak=consecutive_ratio_failures,
+                                base_poll_interval=base_poll_interval,
+                                backoff_multiplier=backoff_multiplier,
+                                max_backoff_interval=max_backoff_interval,
+                            )
+                            logging.info(
+                                "All challenges failed compression ratio check "
+                                f"(attempt {consecutive_ratio_failures}), backing off to "
+                                f"{current_poll_interval:.1f}s and limiting intake concurrency to 1"
+                            )
+                            fetch_cooldown_until = time.monotonic() + current_poll_interval
+                        else:
+                            # No tasks available (503 response) - apply standard backoff
+                            consecutive_no_tasks += 1
+                            consecutive_ratio_failures = 0
+                            current_poll_interval = self._compute_backoff_interval(
+                                streak=consecutive_no_tasks,
+                                base_poll_interval=base_poll_interval,
+                                backoff_multiplier=backoff_multiplier,
+                                max_backoff_interval=max_backoff_interval,
+                            )
+                            logging.info(
+                                f"No tasks available (attempt {consecutive_no_tasks}, cause={cause}), "
+                                f"backing off to {current_poll_interval:.1f}s poll interval"
+                            )
+                            fetch_cooldown_until = time.monotonic() + current_poll_interval
 
-                await asyncio.sleep(current_poll_interval)
+                sleep_interval = self._loop_tick_interval(base_poll_interval)
+                await asyncio.sleep(sleep_interval)
         except asyncio.CancelledError as cancel_exc:
             logging.error(f"Validator run CANCELLED! Traceback:", exc_info=True)
             import traceback
