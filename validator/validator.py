@@ -70,23 +70,48 @@ class Validator(AbstractValidator):
         token = (self.settings.openrouter_api_token or "").strip()
         if not token:
             raise RuntimeError("OPENROUTER_API_TOKEN is required for validator scoring")
+        masked_token = (
+            f"{token[:8]}...{token[-6:]}" if len(token) > 14 else "***masked***"
+        )
+        logging.info(
+            "OpenRouter startup verification using API token fragment: %s",
+            masked_token,
+        )
 
         llm_client = LLMClient(
             url=self.settings.openrouter_api_url,
             api_token=token,
             model=self.settings.openrouter_model,
             timeout_seconds=min(self.settings.llm_timeout_seconds, 20.0),
-            max_tokens=min(self.settings.llm_max_tokens, 8),
+            max_tokens=min(self.settings.llm_max_tokens, 120),
             temperature=0.0,
         )
 
         prompt = (
-            'Return exactly this JSON and nothing else: '
-            '{"results":[{"status":"UNANSWERABLE","answer":""}]}'
+            "Write a short 3-sentence story about a validator node keeping the network healthy."
         )
 
         try:
-            asyncio.run(llm_client.ask(prompt))
+            probe_response = asyncio.run(llm_client.ask(prompt))
+            status_code = (
+                probe_response.get("status_code")
+                if isinstance(probe_response, dict)
+                else None
+            )
+            response_text = (
+                probe_response.get("text", "")
+                if isinstance(probe_response, dict)
+                else str(probe_response)
+            )
+            logging.info(
+                "OpenRouter startup verification response: status=%s text=%s",
+                status_code,
+                response_text[:500],
+            )
+            if not response_text.strip():
+                raise RuntimeError(
+                    "OpenRouter startup verification failed: empty response text"
+                )
             logging.info("OpenRouter startup verification passed")
         except LLMInsufficientFundsError as exc:
             raise RuntimeError(

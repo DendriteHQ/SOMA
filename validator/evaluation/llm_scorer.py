@@ -101,8 +101,10 @@ class LLMClient:
             raise RuntimeError("aiohttp is required for LLM HTTP calls") from exc
 
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        status_code = 0
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=headers, json=body) as response:
+                status_code = response.status
                 if response.status != 200:
                     error_body = await response.text()
                     logging.error(
@@ -128,7 +130,7 @@ class LLMClient:
                     text = message.get("content") or ""
                 elif isinstance(choice0, dict) and isinstance(choice0.get("text"), str):
                     text = choice0.get("text") or ""
-        return {"text": str(text)}
+        return {"text": str(text), "status_code": status_code}
 
 
 class Scoring:
