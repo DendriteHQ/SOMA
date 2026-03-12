@@ -18,6 +18,10 @@ class ScoringResult(BaseModel):
     details: list[dict[str, Any]]
 
 
+class LLMOutputFormatError(ValueError):
+    pass
+
+
 class LLMClient:
     def __init__(
         self,
@@ -174,9 +178,13 @@ class Scoring:
             raise ValueError("questions and expected_answers must be same length")
         prompt = self.build_prompt(text, questions)
 
-        raw = await self._request_with_retry(lambda: self._llm.ask(prompt))
-        model_answers = self._extract_answers(raw)
-        model_answers = self._normalize_len(model_answers, len(expected_answers))
+        try:
+            model_answers = await self._request_with_retry(
+                lambda: self._ask_and_extract_answers(prompt, len(expected_answers))
+            )
+        except LLMOutputFormatError as exc:
+            logging.error("LLM returned invalid output format after retries: %s", exc)
+            model_answers = [""] * len(expected_answers)
 
         details: list[dict[str, Any]] = []
         scores: list[float] = []
@@ -199,52 +207,42 @@ class Scoring:
             score=overall, model_answers=model_answers, scores=scores, details=details
         )
 
+    async def _ask_and_extract_answers(
+        self,
+        prompt: str,
+        expected_len: int,
+    ) -> list[str]:
+        raw = await self._llm.ask(prompt)
+        model_answers = self._extract_answers(raw)
+        return self._normalize_len(model_answers, expected_len)
+
     def _round_score(self, value: float) -> float:
         return round(value, 2)
 
     def _extract_answers(self, raw: Any) -> list[str]:
-        if isinstance(raw, list):
-            return [str(x) for x in raw]
         if isinstance(raw, dict):
             if "results" in raw and isinstance(raw["results"], list):
-                answers = self._extract_answers_from_results(raw["results"])
-                if answers:
-                    return answers
-            for key in ("responses", "answers", "output", "result"):
-                if key in raw and isinstance(raw[key], list):
-                    return [str(x) for x in raw[key]]
+                return self._extract_answers_from_results(raw["results"])
             for key in ("text", "response", "answer", "content"):
                 if key in raw and isinstance(raw[key], str):
                     return self._parse_text_answers(raw[key])
         if isinstance(raw, str):
             return self._parse_text_answers(raw)
-        return []
+        raise LLMOutputFormatError("Unsupported LLM output type")
 
     def _parse_text_answers(self, text: str) -> list[str]:
         text = text.strip()
         if not text:
-            return []
+            raise LLMOutputFormatError("Empty LLM response")
         text = self._strip_code_fences(text)
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return [str(x) for x in parsed]
             if isinstance(parsed, dict):
                 if "results" in parsed and isinstance(parsed["results"], list):
-                    answers = self._extract_answers_from_results(parsed["results"])
-                    if answers:
-                        return answers
-                for key in ("responses", "answers"):
-                    if key in parsed and isinstance(parsed[key], list):
-                        return [str(x) for x in parsed[key]]
-        except Exception:
-            pass
-
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        cleaned: list[str] = []
-        for line in lines:
-            cleaned.append(re.sub(r"^[-*\\d\\.\\)\\:]+\\s*", "", line))
-        return cleaned
+                    return self._extract_answers_from_results(parsed["results"])
+            raise LLMOutputFormatError("LLM response does not contain a results array")
+        except json.JSONDecodeError as exc:
+            raise LLMOutputFormatError("LLM response is not valid JSON") from exc
 
     def _extract_answers_from_results(self, results: list[Any]) -> list[str]:
         answers: list[str] = []
