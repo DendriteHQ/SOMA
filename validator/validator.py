@@ -38,6 +38,8 @@ from validator.evaluation.llm_scorer import LLMClient, LLMInsufficientFundsError
 from soma_shared.utils.verifier import verify_httpx_response
 import bittensor as bt
 
+WEIGHT_BLOCK_INTERVAL = 110
+
 def configure_logging() -> None:
     root = logging.getLogger()
     if root.handlers:
@@ -497,8 +499,6 @@ class Validator(AbstractValidator):
         # Initialize async resources in the correct event loop
         await self.async_init()
         
-        # TODO change this for a blocks from chain instead of mocked time intervals
-        weight_interval_seconds = 360 * 12
         base_poll_interval = self.settings.task_poll_interval_seconds
         max_backoff_interval = self.settings.max_backoff_interval_seconds
         backoff_multiplier = self.settings.backoff_multiplier
@@ -509,7 +509,7 @@ class Validator(AbstractValidator):
         fetch_cooldown_until = 0.0
 
         in_flight: set[asyncio.Task] = set()
-        last_weight_set = 0.0
+        last_weight_set_block: int | None = None
         weight_task: asyncio.Task | None = None
 
         async def process_task(task: GetChallengesResponse) -> None:
@@ -530,15 +530,23 @@ class Validator(AbstractValidator):
             logging.info("Validator run loop started")
             while True:
                 now = time.monotonic()
-                # TODO Change to blocks operation
-                if (
-                    weight_interval_seconds > 0
-                    and (now - last_weight_set) >= weight_interval_seconds
-                ):
-                    if weight_task is None or weight_task.done():
-                        logging.info("Creating weight setting task")
-                        weight_task = asyncio.create_task(self.set_weights())
-                        last_weight_set = now
+
+                try:
+                    current_block = await self.settings.subtensor.get_current_block()
+                    if last_weight_set_block is None:
+                        last_weight_set_block = current_block
+                        logging.info(f"Initialized last_weight_set_block={current_block}")
+                    blocks_since_last = current_block - last_weight_set_block
+                    if blocks_since_last >= WEIGHT_BLOCK_INTERVAL:
+                        if weight_task is None or weight_task.done():
+                            logging.info(
+                                f"Block {current_block}: {blocks_since_last} blocks since last weight set "
+                                f"(interval={WEIGHT_BLOCK_INTERVAL}), setting weights"
+                            )
+                            weight_task = asyncio.create_task(self.set_weights())
+                            last_weight_set_block = current_block
+                except Exception as block_exc:
+                    logging.warning(f"Failed to fetch current block: {block_exc}", exc_info=True)
 
                 in_flight = {task for task in in_flight if not task.done()}
                 has = self.has_eval_capacity()
