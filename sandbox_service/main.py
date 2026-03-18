@@ -17,6 +17,7 @@ from pathlib import Path
 # Add parent directory to path to find mcp_platform module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 from soma_shared.contracts.sandbox.v1.messages import (
@@ -24,8 +25,6 @@ from soma_shared.contracts.sandbox.v1.messages import (
     ExecuteBatchResponse,
 )
 from app.sandbox_executor import SandboxExecutor
-from mcp_platform.app.services.blob.compressed_text_storage import CompressedTextStorage
-from mcp_platform.app.services.blob.s3 import S3BlobStorage
 
 
 # Load environment variables from .env file
@@ -70,23 +69,14 @@ def get_sandbox_executor() -> SandboxExecutor:
     return app.state.sandbox_executor
 
 
-# Initialize storage
-def get_storage() -> CompressedTextStorage:
-    """Get or create blob storage instance (used for both scripts and compressed texts)."""
-    if not hasattr(app.state, "storage"):
-        s3_storage = S3BlobStorage()
-        app.state.storage = CompressedTextStorage(s3_storage)
-    return app.state.storage
-
-
 @app.post("/execute_batch", response_model=ExecuteBatchResponse)
 async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
     """Execute a batch of compression tasks in sandbox.
-    
+
     This endpoint:
-    1. Fetches the miner's challenge script from S3 using the provided key
-    2. Runs them in isolated Docker containers
-    3. Saves compressed results to S3
+    1. Fetches the miner's challenge script via a presigned S3 URL (read-only, scoped access)
+    2. Runs it in an isolated Docker container
+    3. Uploads compressed results via per-task presigned S3 URLs (write-only, scoped access)
     4. Returns success status
     """
     semaphore: asyncio.Semaphore = app.state.sandbox_semaphore
@@ -108,13 +98,22 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
         request.batch_id,
         len(request.challenge_texts),
     )
-    
+
     try:
-        storage = get_storage()
-        logging.info("Script S3 key: %s", request.script_s3_key)
-        # Fetch miner challenge code from S3
-        challenge_code = await storage.get_script(request.script_s3_key)
-        logging.info("Fetched challenge code for batch_id=%s, length=%d", request.batch_id, len(challenge_code))
+        # Fetch miner challenge code via presigned GET URL — no S3 credentials needed.
+        async with httpx.AsyncClient() as http_client:
+            script_response = await http_client.get(
+                request.script_presigned_url,
+                follow_redirects=True,
+            )
+            script_response.raise_for_status()
+        challenge_code = script_response.text
+        logging.info(
+            "Fetched challenge code for batch_id=%s via presigned URL, length=%d",
+            request.batch_id,
+            len(challenge_code),
+        )
+
         # Get sandbox executor
         executor = get_sandbox_executor()
 
@@ -127,9 +126,16 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
             container_timeout=request.container_timeout,
         )
 
-        # Save each compressed text individually to S3 using the per-challenge UUID
-        for storage_uuid, compressed_text in zip(request.storage_uuids, compressed_texts):
-            await storage.save_single(storage_uuid, compressed_text)
+        # Upload each compressed result via its presigned PUT URL — scoped write access only.
+        async with httpx.AsyncClient() as http_client:
+            for presigned_url, compressed_text in zip(
+                request.storage_presigned_urls, compressed_texts
+            ):
+                put_resp = await http_client.put(
+                    presigned_url,
+                    content=compressed_text.encode("utf-8"),
+                )
+                put_resp.raise_for_status()
 
         logger.info(
             "Batch execution completed: batch_id=%s, results=%d",

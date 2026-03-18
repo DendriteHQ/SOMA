@@ -78,6 +78,17 @@ logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
 
 
+def _get_s3_storage(request: Request) -> S3BlobStorage:
+    """Get or create the shared S3 storage instance."""
+    s3_storage = getattr(request.app.state, "s3_storage", None)
+    if s3_storage is None:
+        if not settings.s3_bucket:
+            raise RuntimeError("S3_BUCKET must be set in configuration")
+        s3_storage = S3BlobStorage()
+        request.app.state.s3_storage = s3_storage
+    return s3_storage
+
+
 def _get_sandbox_manager(request: Request) -> RemoteSandboxManager:
     """Get or create remote sandbox manager instance."""
     sandbox_manager = getattr(request.app.state, "sandbox_manager", None)
@@ -86,14 +97,9 @@ def _get_sandbox_manager(request: Request) -> RemoteSandboxManager:
             raise RuntimeError(
                 "SANDBOX_SERVICE_URL must be set in configuration"
             )
-        if not settings.s3_bucket:
-            raise RuntimeError(
-                "S3_BUCKET must be set in configuration"
-            )
-        
-        s3_storage = S3BlobStorage()
+        s3_storage = _get_s3_storage(request)
         compressed_text_storage = CompressedTextStorage(s3_storage)
-        
+
         sandbox_manager = RemoteSandboxManager(
             sandbox_service_url=settings.sandbox_service_url,
             compressed_text_storage=compressed_text_storage,
@@ -566,12 +572,30 @@ async def request_challenge(
     try:
         script_s3_key = get_script_s3_key(miner.ss58, script)
         sandbox_manager = _get_sandbox_manager(request)
+        s3_storage = _get_s3_storage(request)
+
+        # Compute expiry long enough to cover sandbox execution + network overhead.
+        _presigned_expires_in = int(
+            settings.sandbox_timeout_per_task_seconds * len(challenge_texts)
+            + settings.sandbox_container_timeout_offset
+            + settings.sandbox_request_timeout_offset
+        ) + 60  # 60 s buffer
+
+        script_presigned_url: str = await s3_storage.generate_presigned_url(
+            script_s3_key, "get_object", expires_in=_presigned_expires_in
+        )
+        storage_keys = [f"compressed-texts/{su}.json" for su in storage_uuids]
+        storage_presigned_urls: list[str] = await s3_storage.generate_presigned_url(
+            storage_keys, "put_object", expires_in=_presigned_expires_in
+        )
+
         compressed_texts, sandbox_error = await sandbox_manager.run_batch(
             batch_id=str(challenge_batch.id),
-            script_s3_key=script_s3_key,
+            script_presigned_url=script_presigned_url,
             challenge_texts=challenge_texts,
             compression_ratios=compression_ratios,
             storage_uuids=storage_uuids,
+            storage_presigned_urls=storage_presigned_urls,
         )
         if sandbox_error:
             logger.error(
