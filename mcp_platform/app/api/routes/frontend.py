@@ -437,7 +437,9 @@ async def frontend_summary(
     active_validators_count = await db.scalar(
         select(func.count())
         .select_from(ValidatorRegistration)
+        .join(Validator, ValidatorRegistration.validator_fk == Validator.id)
         .where(ValidatorRegistration.is_active.is_(True))
+        .where(Validator.is_archive.is_(False))
     )
 
     burn_active, burn_ratio = await _get_current_burn_state(db)
@@ -1978,7 +1980,8 @@ async def list_validators(
         ValidatorListItem(
             id=validator.id,
             name=validator.ss58,
-            status=validator.current_status,
+            status="archive" if validator.is_archive else validator.current_status,
+            is_archive=bool(validator.is_archive),
             register_date=validator.created_at,
         )
         for validator in result.scalars().all()

@@ -754,14 +754,21 @@ async def _get_validator(
 ) -> Validator:
     """
     Get existing validator by ss58 address.
-    Raises HTTPException if validator not found.
+    Raises HTTPException if validator is not found or archived.
     """
-    result = await db.execute(select(Validator).where(Validator.ss58 == ss58))
+    result = await db.execute(
+        select(Validator)
+        .where(Validator.ss58 == ss58)
+        .where(Validator.is_archive.is_(False))
+    )
     validator = result.scalars().first()
     if validator is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Validator with ss58={ss58} not found. Please register first.",
+            detail=(
+                f"Validator with ss58={ss58} not found or archived. "
+                "Please register first."
+            ),
         )
 
     # Update last_seen_at

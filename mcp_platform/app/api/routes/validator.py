@@ -259,6 +259,17 @@ async def register(
         select(Validator).where(Validator.ss58 == payload.validator_hotkey)
     )
     validator = result.scalars().first()
+    if validator is not None and validator.is_archive:
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_403_FORBIDDEN,
+            "Validator is archived",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Validator is archived",
+        )
 
     if validator is None:
         validator = Validator(
@@ -268,6 +279,7 @@ async def register(
             created_at=now,
             last_seen_at=now,
             current_status="registered",
+            is_archive=False,
         )
         db.add(validator)
         await db.flush()

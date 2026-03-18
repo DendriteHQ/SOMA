@@ -125,6 +125,7 @@ def create_app() -> FastAPI:
                     select(ValidatorRegistration, Validator)
                     .join(Validator, ValidatorRegistration.validator_fk == Validator.id)
                     .where(ValidatorRegistration.is_active.is_(True))
+                    .where(Validator.is_archive.is_(False))
                 )
                 rows = result.all()
                 for registration, validator in rows:
