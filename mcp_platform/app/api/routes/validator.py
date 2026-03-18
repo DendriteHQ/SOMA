@@ -1195,7 +1195,7 @@ async def score_challenges(
             score_rows=score_rows,
             rollup_rows=rollup_rows,
         )
-        validator.current_status = "active"
+        validator.current_status = "working"
         await db.execute(
             update(BatchAssignment)
             .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
