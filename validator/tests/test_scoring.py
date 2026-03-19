@@ -118,12 +118,23 @@ class TestScoring:
         scoring = Scoring()
         questions = ["What is the capital?", "What is the population?"]
         text = "The capital is Paris with population 2 million."
+        answer_formats = ["[word]", "[number] [word]"]
 
-        prompt = scoring.build_prompt(text, questions)
+        prompt = scoring.build_prompt(text, questions, answer_formats)
 
         assert "1. What is the capital?" in prompt
         assert "2. What is the population?" in prompt
         assert text in prompt
+
+    def test_get_answer_format_hint_handles_unicode_letters(self):
+        scoring = Scoring()
+
+        assert scoring.get_answer_format_hint("Président") == "[word]"
+
+    def test_get_answer_format_hint_handles_unicode_mixed_content(self):
+        scoring = Scoring()
+
+        assert scoring.get_answer_format_hint("Président 2") == "[word] [digit]"
 
     def test_normalize_text(self):
         scoring = Scoring()

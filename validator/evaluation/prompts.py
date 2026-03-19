@@ -34,6 +34,8 @@ STRICT GUIDELINES:
 - Partial information is NOT sufficient — treat it as NOT_ANSWERABLE_FROM_DOCUMENT.
 - If a question has multiple required components, ALL must be supported by the document.
 - If you cannot point to a specific sentence in DOCUMENT that directly supports your answer, you MUST choose NOT_ANSWERABLE_FROM_DOCUMENT.
+- If a question includes an answer format hint such as [word], [number], [digit], or [letter], treat it only as a description of the expected shape of the answer.
+- Never copy bracketed format hints literally into the answer unless the document itself literally contains those bracketed characters.
 
 
 For each question:
