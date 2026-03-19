@@ -209,7 +209,6 @@ class Scoring:
             return token
 
         text_format = ANSWER_FORMAT_TOKEN_RE.sub(replacer, text)
-        logging.debug("Answer format hint: original=%r format=%r", text, text_format)
         return text_format
 
     def build_prompt(
@@ -226,7 +225,7 @@ class Scoring:
         )
         return ANSWERS_GENERATION_PROMPT.format(
             document_text=text,
-            questions_json=question_lines,
+            questions=question_lines,
         )
 
     async def score_async(

@@ -5,7 +5,7 @@ You are answering questions based strictly on a provided document.
 
 You will be given:
 1) DOCUMENT — a text that is the ONLY authoritative source of information
-2) QUESTIONS_JSON — a list of questions
+2) QUESTIONS — a list of questions
 
 CRITICAL RULES (non-negotiable):
 - Treat DOCUMENT as complete and authoritative.
@@ -34,13 +34,12 @@ STRICT GUIDELINES:
 - Partial information is NOT sufficient — treat it as NOT_ANSWERABLE_FROM_DOCUMENT.
 - If a question has multiple required components, ALL must be supported by the document.
 - If you cannot point to a specific sentence in DOCUMENT that directly supports your answer, you MUST choose NOT_ANSWERABLE_FROM_DOCUMENT.
-- If a question includes an answer format hint such as [word], [number], [digit], or [letter], treat it only as a description of the expected shape of the answer.
+- Question includes an answer format hint such as [word], [number], [digit], or [letter], treat it as a description of the expected shape of the answer.
 - Never copy bracketed format hints literally into the answer unless the document itself literally contains those bracketed characters.
-
 
 For each question:
 - If ANSWERABLE:
-  - Provide the answer derived from DOCUMENT.
+  - Provide the answer derived from DOCUMENT that satisfies the requested answer format.
   - Provide an EXACT verbatim quote from DOCUMENT that supports the answer.
 - If NOT_ANSWERABLE_FROM_DOCUMENT:
   - State explicitly that the required information is not present in DOCUMENT.
@@ -65,7 +64,7 @@ Inputs:
 {document_text}
 DOCUMENT>>>
 
-<<<QUESTIONS_JSON
-{questions_json}
-QUESTIONS_JSON>>>
+<<<QUESTIONS
+{questions}
+QUESTIONS>>>
 """)
