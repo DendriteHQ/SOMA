@@ -31,6 +31,7 @@ class Settings(BaseModel):
     llm_max_tokens: int
     llm_temperature: float
     llm_provider_error_cooldown_seconds: float
+    llm_scoring_error_cooldown_seconds: float
     http_timeout_seconds: float
     weight_block_interval:int
      
@@ -89,6 +90,9 @@ class Settings(BaseModel):
             llm_temperature=cls._get_float("LLM_TEMPERATURE", 0),
             llm_provider_error_cooldown_seconds=cls._get_float(
                 "LLM_PROVIDER_ERROR_COOLDOWN_SECONDS", 600.0
+            ),
+            llm_scoring_error_cooldown_seconds=cls._get_float(
+                "LLM_SCORING_ERROR_COOLDOWN_SECONDS", 600.0
             ),
             http_timeout_seconds = cls._get_float("HTTP_TIMEOUT_SECONDS", 240.0),
             weight_block_interval = 110

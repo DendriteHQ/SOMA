@@ -451,6 +451,15 @@ class Validator(AbstractValidator):
     def _loop_tick_interval(base_poll_interval: float) -> float:
         return max(0.5, min(base_poll_interval, 1.0))
 
+    def _resolve_scoring_error_cooldown_seconds(self, error_code: str) -> float:
+        if error_code == "provider_insufficient_funds":
+            return max(30.0, self.settings.llm_provider_error_cooldown_seconds)
+        if error_code.startswith("provider_"):
+            return max(30.0, self.settings.llm_scoring_error_cooldown_seconds)
+        if error_code == "validator_scoring_failed":
+            return max(30.0, self.settings.llm_scoring_error_cooldown_seconds)
+        return 0.0
+
     async def report_results(self, task, results):
         try:
             payload = PostChallengeScores(
@@ -582,15 +591,16 @@ class Validator(AbstractValidator):
                     error_details=exc.details,
                     retryable=exc.retryable,
                 )
-                if exc.error_code == "provider_insufficient_funds":
-                    cooldown = max(30.0, self.settings.llm_provider_error_cooldown_seconds)
+                cooldown = self._resolve_scoring_error_cooldown_seconds(exc.error_code)
+                if cooldown > 0:
                     self._provider_degraded_until = max(
                         self._provider_degraded_until,
                         time.monotonic() + cooldown,
                     )
                     logging.warning(
-                        "Provider degraded mode activated for %.1fs due to insufficient funds",
+                        "Fetch cooldown activated for %.1fs due to scoring error code=%s",
                         cooldown,
+                        exc.error_code,
                     )
             except Exception as exc:
                 logging.error(

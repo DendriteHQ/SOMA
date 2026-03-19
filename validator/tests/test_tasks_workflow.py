@@ -34,6 +34,8 @@ def _make_validator():
         platform_url="http://platform:8000",
         platform_signer_ss58="expected-signer",
         wallet=object(),
+        llm_provider_error_cooldown_seconds=600.0,
+        llm_scoring_error_cooldown_seconds=600.0,
     )
     validator.evaluator = Mock()
     validator.client = Mock()
@@ -117,6 +119,30 @@ def test_compute_backoff_interval_hybrid_policy():
             max_backoff_interval=max_backoff,
         )
         == 300.0
+    )
+
+
+def test_resolve_scoring_error_cooldown_seconds():
+    validator = _make_validator()
+
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("provider_insufficient_funds")
+        == 600.0
+    )
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("provider_auth_failed")
+        == 600.0
+    )
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("validator_scoring_failed")
+        == 600.0
+    )
+    assert validator._resolve_scoring_error_cooldown_seconds("unknown_error") == 0.0
+
+    validator.settings.llm_scoring_error_cooldown_seconds = 10.0
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("validator_scoring_failed")
+        == 30.0
     )
 
 
