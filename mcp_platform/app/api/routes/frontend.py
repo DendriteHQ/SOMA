@@ -53,6 +53,7 @@ from soma_shared.db.session import get_db_session
 from app.db.views import (
     V_ACTIVE_COMPETITION,
     V_MINER_COMPETITION_RANK,
+    V_MINER_SCREENER_QUALIFIED,
     V_MINER_SCREENER_STATS,
     V_SCREENER_CHALLENGES_ACTIVE,
 )
@@ -68,6 +69,43 @@ router = APIRouter(prefix="/api/private/frontend", tags=["frontend"])
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
 
 _cache = Cache(Cache.MEMORY)
+
+
+def _build_top_screener_miners_subq(latest_active_competition_id: int):
+    top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
+    if top_fraction <= 0:
+        return None
+
+    ranked_subq = (
+        select(
+            V_MINER_SCREENER_QUALIFIED.c.miner_id.label("miner_fk"),
+            V_MINER_SCREENER_QUALIFIED.c.rank.label("rank"),
+            V_MINER_SCREENER_QUALIFIED.c.total_eligible.label("total_eligible"),
+        )
+        .select_from(V_MINER_SCREENER_QUALIFIED)
+        .where(
+            V_MINER_SCREENER_QUALIFIED.c.competition_id
+            == latest_active_competition_id
+        )
+        .subquery()
+    )
+
+    top_rank_threshold = func.greatest(
+        1,
+        func.cast(
+            func.ceil(
+                func.cast(ranked_subq.c.total_eligible, literal(1.0).type)
+                * top_fraction
+            ),
+            literal(1).type,
+        ),
+    )
+
+    return (
+        select(ranked_subq.c.miner_fk.label("miner_fk"))
+        .where(ranked_subq.c.rank <= top_rank_threshold)
+        .subquery()
+    )
 
 
 def _build_miner_data_subqueries(latest_active_competition_id: int):
@@ -160,73 +198,9 @@ def _build_miner_data_subqueries(latest_active_competition_id: int):
     )
 
     # Top screener miners
-    top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
-    is_top_screener_subq = None
-
-    if top_fraction > 0:
-        eligible_subq = (
-            select(
-                V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
-                V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
-                V_MINER_SCREENER_STATS.c.screener_scored.label("scored_count"),
-            )
-            .select_from(V_MINER_SCREENER_STATS)
-            .join(
-                Miner,
-                Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
-            )
-            .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
-            .where(Miner.miner_banned_status.is_(False))
-            .subquery()
-        )
-
-        filtered_subq = (
-            select(
-                eligible_subq.c.miner_fk.label("miner_fk"),
-                eligible_subq.c.avg_score.label("avg_score"),
-            )
-            .select_from(eligible_subq)
-            .join(
-                screener_assigned_subq,
-                screener_assigned_subq.c.miner_fk == eligible_subq.c.miner_fk,
-            )
-            .where(
-                eligible_subq.c.scored_count
-                >= screener_assigned_subq.c.screener_assigned
-            )
-            .subquery()
-        )
-
-        ranked_subq = select(
-            filtered_subq.c.miner_fk.label("miner_fk"),
-            func.row_number()
-            .over(
-                order_by=[
-                    filtered_subq.c.avg_score.desc().nullslast(),
-                    filtered_subq.c.miner_fk.asc(),
-                ]
-            )
-            .label("rank"),
-            func.count(filtered_subq.c.miner_fk).over().label("total_eligible"),
-        ).subquery()
-
-        is_top_screener_subq = (
-            select(ranked_subq.c.miner_fk.label("miner_fk"))
-            .where(
-                ranked_subq.c.rank
-                <= func.greatest(
-                    1,
-                    func.cast(
-                        func.ceil(
-                            func.cast(ranked_subq.c.total_eligible, literal(1.0).type)
-                            * top_fraction
-                        ),
-                        literal(1).type,
-                    ),
-                )
-            )
-            .subquery()
-        )
+    is_top_screener_subq = _build_top_screener_miners_subq(
+        latest_active_competition_id
+    )
 
     return {
         "screener_assigned": screener_assigned_subq,
@@ -751,76 +725,9 @@ async def list_miners(
         )
 
         # Top screener miners
-        top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
-        if top_fraction > 0:
-            # Get eligible miners who completed all their assigned screener challenges
-            eligible_subq = (
-                select(
-                    V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
-                    V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
-                    V_MINER_SCREENER_STATS.c.screener_scored.label("scored_count"),
-                )
-                .select_from(V_MINER_SCREENER_STATS)
-                .join(
-                    Miner,
-                    Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
-                )
-                .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
-                .where(Miner.miner_banned_status.is_(False))
-                .subquery()
-            )
-
-            # Filter to those who completed all assigned and rank them
-            filtered_subq = (
-                select(
-                    eligible_subq.c.miner_fk.label("miner_fk"),
-                    eligible_subq.c.avg_score.label("avg_score"),
-                )
-                .select_from(eligible_subq)
-                .join(
-                    screener_assigned_subq,
-                    screener_assigned_subq.c.miner_fk == eligible_subq.c.miner_fk,
-                )
-                .where(
-                    eligible_subq.c.scored_count
-                    >= screener_assigned_subq.c.screener_assigned
-                )
-                .subquery()
-            )
-
-            # Rank and get top N
-            ranked_subq = select(
-                filtered_subq.c.miner_fk.label("miner_fk"),
-                func.row_number()
-                .over(
-                    order_by=[
-                        filtered_subq.c.avg_score.desc().nullslast(),
-                        filtered_subq.c.miner_fk.asc(),
-                    ]
-                )
-                .label("rank"),
-                func.count(filtered_subq.c.miner_fk).over().label("total_eligible"),
-            ).subquery()
-
-            is_top_screener_subq = (
-                select(ranked_subq.c.miner_fk.label("miner_fk"))
-                .where(
-                    ranked_subq.c.rank
-                    <= func.greatest(
-                        1,
-                        func.cast(
-                            func.ceil(
-                                func.cast(
-                                    ranked_subq.c.total_eligible, literal(1.0).type
-                                )
-                                * top_fraction
-                            ),
-                            literal(1).type,
-                        ),
-                    )
-                )
-                .subquery()
-            )
+        is_top_screener_subq = _build_top_screener_miners_subq(
+            latest_active_competition_id
+        )
 
     # Build main query with all subqueries
     base_select = select(

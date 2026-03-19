@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from functools import lru_cache
-import math
 import bittensor as bt
 import tiktoken
 
@@ -32,7 +31,11 @@ from soma_shared.db.models.burn_request import BurnRequest
 from soma_shared.db.models.screener import Screener
 from soma_shared.db.models.screening_challenge import ScreeningChallenge
 from soma_shared.db.validator_log import log_validator_message
-from app.db.views import V_ACTIVE_COMPETITION, V_SCREENER_CHALLENGES_ACTIVE
+from app.db.views import (
+    V_ACTIVE_COMPETITION,
+    V_MINER_SCREENER_QUALIFIED,
+    V_SCREENER_CHALLENGES_ACTIVE,
+)
 from app.core.config import settings
 from app.api.deps import get_script_storage
 from app.core.logging import get_logger
@@ -432,80 +435,37 @@ async def _get_screener_backlog_count(
 async def _build_top_screener_scripts_subq(
     db: AsyncSession,
     competition_id: int,
-    screener_challenges,
-    screener_challenges_count: int,
-    ratio_count: int,
     top_fraction: float,
 ):
-    screener_scores = (
+    ranked_qualified = (
         select(
-            ChallengeBatch.script_fk.label("script_fk"),
-            func.count(func.distinct(BatchChallenge.id)).label("scored_count"),
-            (
-                func.sum(
-                    BatchChallengeScore.score
-                    / func.sqrt(BatchChallenge.compression_ratio)
-                )
-                / func.sum(literal(1.0) / func.sqrt(BatchChallenge.compression_ratio))
-            ).label("avg_score"),
+            V_MINER_SCREENER_QUALIFIED.c.script_id.label("script_fk"),
+            V_MINER_SCREENER_QUALIFIED.c.rank.label("rank"),
+            V_MINER_SCREENER_QUALIFIED.c.total_eligible.label("total_eligible"),
         )
-        .select_from(BatchChallengeScore)
-        .join(
-            BatchChallenge,
-            BatchChallenge.id == BatchChallengeScore.batch_challenge_fk,
-        )
-        .join(
-            ChallengeBatch,
-            ChallengeBatch.id == BatchChallenge.challenge_batch_fk,
-        )
-        .join(
-            Script,
-            Script.id == ChallengeBatch.script_fk,
-        )
-        .join(
-            Miner,
-            Miner.id == Script.miner_fk,
-        )
-        .join(
-            MinerUpload,
-            MinerUpload.script_fk == ChallengeBatch.script_fk,
-        )
-        .join(
-            screener_challenges,
-            screener_challenges.c.challenge_fk == BatchChallenge.challenge_fk,
-        )
-        .where(MinerUpload.competition_fk == competition_id)
-        .where(Miner.miner_banned_status.is_(False))
-        .group_by(ChallengeBatch.script_fk)
+        .where(V_MINER_SCREENER_QUALIFIED.c.competition_id == competition_id)
         .subquery()
     )
 
-    eligible_screener = (
-        select(
-            screener_scores.c.script_fk.label("script_fk"),
-            screener_scores.c.avg_score.label("avg_score"),
-        )
-        .where(
-            screener_scores.c.scored_count >= screener_challenges_count * ratio_count
-        )
-        .subquery()
-    )
-    eligible_count = await db.scalar(
-        select(func.count()).select_from(eligible_screener)
-    )
+    eligible_count = await db.scalar(select(func.count()).select_from(ranked_qualified))
     eligible_count = int(eligible_count or 0)
     if eligible_count <= 0:
         return None
-    top_limit = int(math.ceil(eligible_count * top_fraction))
-    if top_limit <= 0:
-        return None
+
+    top_rank_threshold = func.greatest(
+        1,
+        func.cast(
+            func.ceil(
+                func.cast(ranked_qualified.c.total_eligible, literal(1.0).type)
+                * top_fraction
+            ),
+            literal(1).type,
+        ),
+    )
+
     return (
-        select(eligible_screener.c.script_fk)
-        .order_by(
-            eligible_screener.c.avg_score.desc().nullslast(),
-            eligible_screener.c.script_fk.asc(),
-        )
-        .limit(top_limit)
+        select(ranked_qualified.c.script_fk)
+        .where(ranked_qualified.c.rank <= top_rank_threshold)
         .subquery()
     )
 
@@ -596,9 +556,6 @@ async def _select_miner_ss58(
             top_scripts_subq = await _build_top_screener_scripts_subq(
                 db,
                 active_competition_id,
-                screener_challenges,
-                screener_challenges_count,
-                ratio_count,
                 top_fraction,
             )
             if top_scripts_subq is None:
@@ -706,8 +663,8 @@ def get_script_s3_key(miner_ss58: str, script: Script) -> str:
     """
     from app.core.config import settings
 
-    if settings.debug:
-        return f"debug/miner_solutions/{miner_ss58}/{script.script_uuid}.py"
+    #if settings.debug:
+    #    return f"debug/miner_solutions/{miner_ss58}/{script.script_uuid}.py"
 
     date_prefix = (
         script.created_at.strftime("%Y-%m-%d") if script.created_at else None

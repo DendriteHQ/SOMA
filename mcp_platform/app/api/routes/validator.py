@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+import json
 import math
+import time
 import uuid
 import bittensor as bt
 
@@ -67,16 +69,82 @@ from app.api.routes.utils import (
     _get_validator,
     _get_active_competition_id,
     _get_screener_challenges,
-    _get_ratio_count,
     _get_current_burn_state,
     _is_compressed_enough,
     get_script_s3_key,
 )
-from app.db.views import V_MINER_SCREENER_STATS
+from app.db.views import V_MINER_SCREENER_QUALIFIED
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
+
+_OPENROUTER_ERROR_MARKERS = (
+    "openrouter",
+    "openrouter.ai",
+    "/api/v1/chat/completions",
+)
+
+
+def _get_validator_fetch_block_cache(request: Request) -> dict[str, float]:
+    cache = getattr(request.app.state, "validator_fetch_block_until", None)
+    if cache is None:
+        # TODO: Move this process-local cache to a shared store (Redis) for multi-instance deployments.
+        cache = {}
+        request.app.state.validator_fetch_block_until = cache
+    return cache
+
+
+def _get_validator_fetch_block_remaining_secs(
+    request: Request,
+    validator_ss58: str,
+) -> float:
+    cache = _get_validator_fetch_block_cache(request)
+    blocked_until = cache.get(validator_ss58)
+    if blocked_until is None:
+        return 0.0
+    remaining = blocked_until - time.monotonic()
+    if remaining <= 0:
+        cache.pop(validator_ss58, None)
+        return 0.0
+    return remaining
+
+
+def _set_validator_fetch_block(
+    request: Request,
+    validator_ss58: str,
+    *,
+    cooldown_seconds: float | None = None,
+) -> float:
+    cooldown = max(
+        30.0,
+        cooldown_seconds or settings.validator_openrouter_error_cooldown_seconds,
+    )
+    now = time.monotonic()
+    blocked_until = now + cooldown
+    cache = _get_validator_fetch_block_cache(request)
+    previous_blocked_until = cache.get(validator_ss58)
+    if previous_blocked_until is not None:
+        blocked_until = max(blocked_until, previous_blocked_until)
+    cache[validator_ss58] = blocked_until
+    return blocked_until - now
+
+
+def _is_openrouter_error_submission(payload: PostChallengeScores) -> bool:
+    error_code = (payload.error_code or "").strip().lower()
+    if error_code.startswith("provider_"):
+        return True
+
+    parts: list[str] = []
+    if payload.error_message:
+        parts.append(str(payload.error_message))
+    if payload.error_details is not None:
+        try:
+            parts.append(json.dumps(payload.error_details))
+        except TypeError:
+            parts.append(str(payload.error_details))
+    haystack = " ".join(parts).lower()
+    return any(marker in haystack for marker in _OPENROUTER_ERROR_MARKERS)
 
 
 def _get_s3_storage(request: Request) -> S3BlobStorage:
@@ -437,6 +505,28 @@ async def request_challenge(
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Validator must have status 'working' to request challenges",
+                )
+            block_remaining_secs = _get_validator_fetch_block_remaining_secs(
+                request,
+                validator.ss58,
+            )
+            if block_remaining_secs > 0:
+                retry_after_secs = max(1, int(math.ceil(block_remaining_secs)))
+                logger.warning(
+                    "request_challenge_blocked_due_to_openrouter_error",
+                    extra={
+                        "request_id": request_id,
+                        "validator_ss58": validator.ss58,
+                        "retry_after_secs": retry_after_secs,
+                    },
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=(
+                        "Validator is temporarily blocked from fetching new assignments "
+                        "after recent OpenRouter scoring errors"
+                    ),
+                    headers={"Retry-After": str(retry_after_secs)},
                 )
             for attempt in range(max_attempts):
                 miner, script = await _select_miner_ss58(request, db)
@@ -1064,6 +1154,22 @@ async def score_challenges(
                 detail="miner_* error_code is not allowed for submission_type=error",
             )
 
+        if _is_openrouter_error_submission(payload):
+            block_window_secs = _set_validator_fetch_block(
+                request,
+                validator.ss58,
+            )
+            logger.warning(
+                "score_challenges_openrouter_error_validator_blocked",
+                extra={
+                    "request_id": request_id,
+                    "validator_ss58": validator.ss58,
+                    "error_code": error_code,
+                    "retryable": payload.retryable,
+                    "block_window_secs": block_window_secs,
+                },
+            )
+
         if assignment is None:
             other_open_assignment = await db.scalar(
                 select(BatchAssignment.id)
@@ -1616,58 +1722,39 @@ async def get_best_miners(
                                 },
                             )
 
-                            ratio_count = await _get_ratio_count(
-                                db, active_competition_id
-                            )
-                            screener_scores_result = await db.execute(
+                            qualified_miners_result = await db.execute(
                                 select(
                                     Miner.ss58,
-                                    V_MINER_SCREENER_STATS.c.screener_scored.label(
-                                        "scored_count"
-                                    ),
-                                    V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
-                                    V_MINER_SCREENER_STATS.c.first_upload_at.label(
-                                        "earliest_upload"
-                                    ),
+                                    V_MINER_SCREENER_QUALIFIED.c.rank.label("rank"),
                                 )
-                                .select_from(V_MINER_SCREENER_STATS)
+                                .select_from(V_MINER_SCREENER_QUALIFIED)
                                 .join(
                                     Miner,
-                                    Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
+                                    Miner.id == V_MINER_SCREENER_QUALIFIED.c.miner_id,
                                 )
                                 .where(
-                                    V_MINER_SCREENER_STATS.c.competition_id
+                                    V_MINER_SCREENER_QUALIFIED.c.competition_id
                                     == active_competition_id
                                 )
-                                .where(
-                                    V_MINER_SCREENER_STATS.c.screener_scored
-                                    >= screener_challenges_count * ratio_count
-                                )
-                                .where(Miner.miner_banned_status.is_(False))
+                                .order_by(V_MINER_SCREENER_QUALIFIED.c.rank.asc())
+                                .limit(buffer_size)
                             )
 
-                            screener_scores = [
-                                (row.ss58, float(row.avg_score), row.earliest_upload)
-                                for row in screener_scores_result
+                            qualified_miners = [
+                                (str(row.ss58), int(row.rank))
+                                for row in qualified_miners_result
                             ]
                             logger.info(
                                 "get_best_miners_screener_scores",
                                 extra={
                                     "request_id": request_id,
-                                    "ratio_count": ratio_count,
-                                    "screener_scores_count": len(screener_scores),
+                                    "qualified_miners_count": len(qualified_miners),
                                 },
                             )
 
-                            if screener_scores:
-                                # Sort by score descending, then by upload time ascending (earlier = better)
-                                screener_scores.sort(key=lambda x: (-x[1], x[2]))
-
-                                # Take top N miners up to buffer_size
-                                top_miners = screener_scores[:buffer_size]
-
+                            if qualified_miners:
                                 # Map to UIDs
-                                for ss58, score, upload_time in top_miners:
+                                for ss58, _rank in qualified_miners:
                                     uid = hotkey_to_uid.get(str(ss58))
                                     if uid is not None:
                                         top_screener_miners.append(uid)
