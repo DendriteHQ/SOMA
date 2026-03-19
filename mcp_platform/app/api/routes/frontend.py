@@ -1792,7 +1792,6 @@ async def get_miner_screener_contests(
             BatchChallenge.id.label("batch_challenge_id"),
             Challenge.id.label("challenge_id"),
             Challenge.challenge_name,
-            Challenge.challenge_text,
             Competition.competition_name,
             Competition.id.label("competition_id"),
             BatchChallenge.compression_ratio,
@@ -1829,7 +1828,7 @@ async def get_miner_screener_contests(
             BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
         )
         .where(ChallengeBatch.miner_fk == miner.id)
-        .where(BatchChallenge.challenge_fk.in_(select(screening_challenges_subq)))
+        .where(BatchChallenge.challenge_fk.in_(screening_challenges_subq))
         .where(MinerUpload.competition_fk == latest_active_competition_id)
         .where(Competition.id == latest_active_competition_id)
         .where(CompetitionChallenge.is_active.is_(True))
@@ -1841,22 +1840,15 @@ async def get_miner_screener_contests(
     if not batch_challenges_data:
         return ScreenerChallengesResponse(avg_score=None, challenges=[], total=0)
 
-    avg_score_result = await db.scalar(
-        select(V_MINER_SCREENER_STATS.c.avg_score)
-        .select_from(V_MINER_SCREENER_STATS)
-        .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
-        .where(V_MINER_SCREENER_STATS.c.miner_id == miner.id)
-        .limit(1)
-    )
-    avg_score = float(avg_score_result) if avg_score_result is not None else None
-
-    # Calculate miner's rank among all miners on screener challenges
+    # Calculate miner's avg_score and rank in a single query
     miner_rank = None
     total_miners_count = 0
+    avg_score = None
 
     ranked_subq = (
         select(
             V_MINER_SCREENER_STATS.c.miner_id.label("miner_id"),
+            V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
             func.row_number()
             .over(
                 order_by=(
@@ -1875,16 +1867,16 @@ async def get_miner_screener_contests(
 
     rank_row = (
         await db.execute(
-            select(ranked_subq.c.rank, ranked_subq.c.total_miners)
+            select(ranked_subq.c.avg_score, ranked_subq.c.rank, ranked_subq.c.total_miners)
             .where(ranked_subq.c.miner_id == miner.id)
             .limit(1)
         )
     ).first()
 
     if rank_row is not None:
+        avg_score = float(rank_row.avg_score) if rank_row.avg_score is not None else None
         miner_rank = int(rank_row.rank) if rank_row.rank is not None else None
         total_miners_count = int(rank_row.total_miners or 0)
-    eval_started = await _is_eval_started(db, latest_active_competition_id)
 
     # Get detailed questions for each challenge
     challenges = []
@@ -1892,7 +1884,6 @@ async def get_miner_screener_contests(
         batch_challenge_id,
         challenge_id,
         challenge_name,
-        challenge_text,
         competition_name,
         competition_id,
         compression_ratio,
@@ -1900,71 +1891,18 @@ async def get_miner_screener_contests(
         overall_score,
     ) in batch_challenges_data:
         # Get all questions for this challenge with answers and scores
-        questions_result = await db.execute(
-            select(
-                Question,
-                BatchQuestionAnswer.produced_answer,
-                Answer.answer.label("ground_truth"),
-                func.avg(BatchQuestionScore.score).label("avg_score"),
-                func.json_agg(BatchQuestionScore.details).label("score_details"),
-            )
-            .select_from(Question)
-            .outerjoin(
-                BatchQuestionAnswer,
-                (BatchQuestionAnswer.question_fk == Question.id)
-                & (BatchQuestionAnswer.batch_challenge_fk == batch_challenge_id),
-            )
-            .outerjoin(
-                Answer,
-                Answer.question_fk == Question.id,
-            )
-            .outerjoin(
-                BatchQuestionScore,
-                (BatchQuestionScore.question_fk == Question.id)
-                & (BatchQuestionScore.batch_challenge_fk == batch_challenge_id),
-            )
-            .where(Question.challenge_fk == challenge_id)
-            .group_by(
-                Question.id,
-                BatchQuestionAnswer.produced_answer,
-                Answer.answer,
-            )
-            .order_by(Question.id)
-        )
-
-        questions_data = questions_result.all()
-
-        questions = [
-            QuestionDetail(
-                question_id=question.id,
-                question_text=(
-                    TEXT_HIDDEN_PLACEHOLDER if not eval_started else question.question
-                ),
-                miner_answer=TEXT_HIDDEN_PLACEHOLDER if not eval_started else produced_answer,
-                ground_truth_answer=(
-                    TEXT_HIDDEN_PLACEHOLDER if not eval_started else ground_truth
-                ),
-                score=float(avg_score_q) if avg_score_q is not None else None,
-                score_details=(
-                    score_details[0]
-                    if score_details and score_details[0] is not None
-                    else None
-                ),
-            )
-            for question, produced_answer, ground_truth, avg_score_q, score_details in questions_data
-        ]
 
         challenge_detail = ChallengeDetail(
             batch_challenge_id=batch_challenge_id,
             challenge_id=challenge_id,
             challenge_name=challenge_name,
-            challenge_text=TEXT_HIDDEN_PLACEHOLDER if not eval_started else challenge_text,
+            challenge_text="",
             competition_name=competition_name,
             competition_id=competition_id,
             compression_ratio=compression_ratio,
             created_at=created_at,
             overall_score=float(overall_score) if overall_score is not None else None,
-            questions=questions,
+            questions=[],
         )
         challenges.append(challenge_detail)
 
