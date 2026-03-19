@@ -5,6 +5,7 @@ from math import ceil
 
 import ipaddress
 
+from aiocache import Cache
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, select, literal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,11 +60,14 @@ from app.core.config import settings
 from app.api.routes.utils import _get_current_burn_state
 from app.core.logging import get_logger
 import logging
+from aiocache import cached, Cache
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/private/frontend", tags=["frontend"])
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
+
+_cache = Cache(Cache.MEMORY)
 
 
 def _build_miner_data_subqueries(latest_active_competition_id: int):
@@ -238,13 +242,23 @@ def _latest_active_competition_id_subquery():
 
 
 async def _get_latest_active_competition_id(db: AsyncSession) -> int | None:
-    return await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
+    cached = await _cache.get("latest_active_competition_id")
+    if cached is not None:
+        return cached
+    result = await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
+    if result is not None:
+        await _cache.set("latest_active_competition_id", result, ttl=60)
+    return result
 
 
 async def _is_eval_started(
     db: AsyncSession,
     competition_id: int,
 ) -> bool:
+    cache_key = f"eval_started_{competition_id}"
+    cached = await _cache.get(cache_key)
+    if cached is not None:
+        return cached["value"]
     eval_starts_at = await db.scalar(
         select(CompetitionTimeframe.eval_starts_at)
         .select_from(V_ACTIVE_COMPETITION)
@@ -258,10 +272,13 @@ async def _is_eval_started(
         .limit(1)
     )
     if eval_starts_at is None:
-        return False
-    if eval_starts_at.tzinfo is None:
-        eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) >= eval_starts_at
+        result = False
+    else:
+        if eval_starts_at.tzinfo is None:
+            eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
+        result = datetime.now(timezone.utc) >= eval_starts_at
+    await _cache.set(cache_key, {"value": result}, ttl=30)
+    return result
 
 
 def _extract_client_ip(request: Request) -> str | None:
@@ -404,6 +421,9 @@ async def frontend_summary(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> FrontendSummaryResponse:
+    _cached = await _cache.get("summary")
+    if _cached is not None:
+        return _cached
     latest_active_competition_id = await _get_latest_active_competition_id(db)
 
     miners_count = 0
@@ -461,6 +481,7 @@ async def frontend_summary(
         burn_ratio=burn_ratio,
     )
 
+    await _cache.set("summary", response, ttl=30)
     logger.info(
         f"[Frontend] Summary: miners={response.miners}, validators={response.validators}, "
         f"active_validators={response.active_validators}, competitions={response.competitions}, "
@@ -478,6 +499,9 @@ async def get_current_competition_timeframe(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> CurrentCompetitionTimeframeResponse:
+    _cached = await _cache.get("competition_timeframe")
+    if _cached is not None:
+        return _cached
     timeframe_row = (
         await db.execute(
             select(
@@ -523,6 +547,7 @@ async def get_current_competition_timeframe(
         evaluation_end=evaluation_end,
     )
 
+    await _cache.set("competition_timeframe", response, ttl=120)
     logger.info(
         "[Frontend] Current timeframe: competition_id=%s, upload_start=%s, "
         "upload_end=%s, evaluation_start=%s, evaluation_end=%s",
@@ -551,6 +576,9 @@ async def list_miners(
     limit: int = Query(default=20, ge=1, le=400),
 ) -> MinersListResponse:
     """List only miners that uploaded a script in the latest active competition."""
+    _cached = await _cache.get(f"miners_{page}_{limit}")
+    if _cached is not None:
+        return _cached
 
     latest_active_competition_subq = _latest_active_competition_id_subquery()
 
@@ -982,6 +1010,7 @@ async def list_miners(
         ),
     )
 
+    await _cache.set(f"miners_{page}_{limit}", response, ttl=15)
     logger.info(
         f"[Frontend] Miners list: page={page}, limit={limit}, total={total_value}, "
         f"returned={len(miners)} miners"
@@ -996,6 +1025,9 @@ async def get_miner(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> MinerDetailResponse:
+    _cached = await _cache.get(f"miner_{hotkey}")
+    if _cached is not None:
+        return _cached
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
         raise HTTPException(
@@ -1334,6 +1366,7 @@ async def get_miner(
         source_code=SourceCodeSummary(available=False, code=None),
     )
 
+    await _cache.set(f"miner_{hotkey}", response, ttl=15)
     logger.info(
         f"[Frontend] Miner detail: hotkey={hotkey}, uid={miner.id}, "
         f"status={response.miner.status}, contests={response.miner.contests}, "
@@ -1356,6 +1389,9 @@ async def get_miner_contest_challenge_detail(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> ChallengeDetailResponse:
+    _cached = await _cache.get(f"miner_challenge_{hotkey}_{batch_challenge_id}")
+    if _cached is not None:
+        return _cached
     # Verify miner exists
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
@@ -1506,6 +1542,7 @@ async def get_miner_contest_challenge_detail(
         )
     )
 
+    await _cache.set(f"miner_challenge_{hotkey}_{batch_challenge_id}", response, ttl=15)
     logger.info(
         f"[Frontend] Challenge detail: batch_challenge_id={batch_challenge_id}, "
         f"hotkey={hotkey}, challenge_id={challenge.id}, "
@@ -1523,6 +1560,9 @@ async def get_miner_contests_challenges(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> MinerChallengesResponse:
+    _cached = await _cache.get(f"miner_challenges_{hotkey}")
+    if _cached is not None:
+        return _cached
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
         raise HTTPException(
@@ -1620,6 +1660,7 @@ async def get_miner_contests_challenges(
         total=len(challenges),
     )
 
+    await _cache.set(f"miner_challenges_{hotkey}", response, ttl=15)
     logger.info(
         f"[Frontend] Miner challenges: hotkey={hotkey}, total={response.total}, "
         f"scored={sum(1 for c in challenges if c.score is not None)}, "
@@ -1635,6 +1676,9 @@ async def get_miner_contests(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> MinerContestsResponse:
+    _cached = await _cache.get(f"miner_contests_{hotkey}")
+    if _cached is not None:
+        return _cached
     logger.info(f"Received request for miner competitions: hotkey={hotkey}")
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
@@ -1747,6 +1791,7 @@ async def get_miner_contests(
         total=len(competitions),
     )
 
+    await _cache.set(f"miner_contests_{hotkey}", response, ttl=15)
     logger.info(
         f"[Frontend] Miner competitions: hotkey={hotkey}, total={response.total}, "
         f"returned={len(competitions)} competitions, miner_rank={miner_rank}/{total_miners_count}, "
@@ -1765,6 +1810,9 @@ async def get_miner_screener_contests(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> ScreenerChallengesResponse:
+    _cached = await _cache.get(f"miner_screener_{hotkey}")
+    if _cached is not None:
+        return _cached
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
         raise HTTPException(
@@ -1914,6 +1962,7 @@ async def get_miner_screener_contests(
         total=len(challenges),
     )
 
+    await _cache.set(f"miner_screener_{hotkey}", response, ttl=15)
     logger.info(
         f"[Frontend] Miner screener challenges: hotkey={hotkey}, "
         f"competition_id={latest_active_competition_id}, total={response.total}, "
@@ -1928,6 +1977,9 @@ async def list_validators(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> ValidatorsListResponse:
+    _cached = await _cache.get("validators")
+    if _cached is not None:
+        return _cached
     result = await db.execute(
         select(Validator)
         .where(Validator.is_archive.is_(False))
@@ -1946,6 +1998,7 @@ async def list_validators(
 
     response = ValidatorsListResponse(validators=validators)
 
+    await _cache.set("validators", response, ttl=120)
     logger.info(
         f"[Frontend] Validators list: total={len(validators)}, "
         f"statuses={[v.status for v in validators]}"
