@@ -26,6 +26,9 @@ class LLMInsufficientFundsError(RuntimeError):
     pass
 
 
+ANSWER_FORMAT_TOKEN_RE = re.compile(r"[^\W\d_]+|\d+", re.UNICODE)
+
+
 def is_insufficient_funds_error(status_code: int, error_body: str | None) -> bool:
     body = (error_body or "").lower()
     if status_code == 402:
@@ -196,8 +199,31 @@ class Scoring:
         assert last_exc is not None
         raise last_exc
 
-    def build_prompt(self, text: str, questions: list[str]) -> str:
-        question_lines = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+    def get_answer_format_hint(self, text: str) -> str:
+        def replacer(match: re.Match[str]) -> str:
+            token = match.group(0)
+            if token.isdigit():
+                return "[digit]" if len(token) == 1 else "[number]"
+            if token.isalpha():
+                return "[letter]" if len(token) == 1 else "[word]"
+            return token
+
+        text_format = ANSWER_FORMAT_TOKEN_RE.sub(replacer, text)
+        logging.debug("Answer format hint: original=%r format=%r", text, text_format)
+        return text_format
+
+    def build_prompt(
+        self,
+        text: str,
+        questions: list[str],
+        answer_formats: list[str],
+    ) -> str:
+        question_lines = "\n".join(
+            f"{i+1}. {q}, (answer in format: {answer_format})"
+            for i, (q, answer_format) in enumerate(
+                zip(questions, answer_formats)
+            )
+        )
         return ANSWERS_GENERATION_PROMPT.format(
             document_text=text,
             questions_json=question_lines,
@@ -211,7 +237,8 @@ class Scoring:
     ) -> ScoringResult:
         if len(questions) != len(expected_answers):
             raise ValueError("questions and expected_answers must be same length")
-        prompt = self.build_prompt(text, questions)
+        answer_formats = [self.get_answer_format_hint(answer) for answer in expected_answers]
+        prompt = self.build_prompt(text, questions, answer_formats)
 
         try:
             model_answers = await self._request_with_retry(
