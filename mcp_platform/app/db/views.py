@@ -29,8 +29,8 @@ V_MINER_SCREENER_STATS = sa.table(
     sa.column("first_upload_at"),
 )
 
-V_MINER_SCREENER_QUALIFIED = sa.table(
-    "v_miner_screener_qualified",
+V_MINER_SCREENER_ELIGIBLE_RANKED = sa.table(
+    "v_miner_screener_eligible_ranked",
     sa.column("competition_id"),
     sa.column("miner_id"),
     sa.column("script_id"),

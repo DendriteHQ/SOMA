@@ -77,6 +77,16 @@ class Settings(BaseSettings):
         default=0.2,
         alias="TOP_SCREENER_SCRIPTS",
     )
+    # Additional miners to include beyond top fraction when they are near best score.
+    screener_extra_miners_limit: int = Field(
+        default=10,
+        alias="SCREENER_EXTRA_MINERS_LIMIT",
+    )
+    # Score window in percentage points from best screener score (e.g. 0.03 = 3pp).
+    screener_extra_score_points: float = Field(
+        default=0.03,
+        alias="SCREENER_EXTRA_SCORE_POINTS",
+    )
 
     screener_weight_per_miner: float = Field(
         default=0.00002,
@@ -99,6 +109,10 @@ class Settings(BaseSettings):
     batch_assignment_timeout_hours: float = Field(
         default=0.2,
         alias="BATCH_ASSIGNMENT_TIMEOUT_HOURS",
+    )
+    validator_openrouter_error_cooldown_seconds: float = Field(
+        default=600.0,
+        alias="VALIDATOR_OPENROUTER_ERROR_COOLDOWN_SECONDS",
     )
 
     # Sandbox timeout configuration
@@ -211,6 +225,39 @@ class Settings(BaseSettings):
             numeric = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError("TOP_SCREENER_SCRIPTS must be a number") from exc
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator("screener_extra_miners_limit", mode="before")
+    @classmethod
+    def _parse_screener_extra_miners_limit(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 10
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SCREENER_EXTRA_MINERS_LIMIT must be an integer") from exc
+        if numeric < 0:
+            numeric = 0
+        return numeric
+
+    @field_validator("screener_extra_score_points", mode="before")
+    @classmethod
+    def _parse_screener_extra_score_points(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.03
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SCREENER_EXTRA_SCORE_POINTS must be a number") from exc
+        # Accept either ratio [0..1] or percent points [0..100].
         if numeric > 1:
             if numeric > 100:
                 numeric = 100.0

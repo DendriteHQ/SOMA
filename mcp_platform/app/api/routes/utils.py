@@ -33,7 +33,7 @@ from soma_shared.db.models.screening_challenge import ScreeningChallenge
 from soma_shared.db.validator_log import log_validator_message
 from app.db.views import (
     V_ACTIVE_COMPETITION,
-    V_MINER_SCREENER_QUALIFIED,
+    V_MINER_SCREENER_ELIGIBLE_RANKED,
     V_SCREENER_CHALLENGES_ACTIVE,
 )
 from app.core.config import settings
@@ -432,42 +432,108 @@ async def _get_screener_backlog_count(
     return int(backlog_count or 0)
 
 
-async def _build_top_screener_scripts_subq(
-    db: AsyncSession,
-    competition_id: int,
-    top_fraction: float,
-):
-    ranked_qualified = (
+def _get_top_screener_fraction() -> float:
+    return float(getattr(settings, "top_screener_scripts", 0.0))
+
+
+def _get_screener_extra_miners_limit() -> int:
+    raw = int(getattr(settings, "screener_extra_miners_limit", 0) or 0)
+    return max(0, raw)
+
+
+def _get_screener_extra_score_points() -> float:
+    raw = float(getattr(settings, "screener_extra_score_points", 0.0) or 0.0)
+    return max(0.0, raw)
+
+
+def _build_ranked_screener_pool_subq(competition_id: int):
+    return (
         select(
-            V_MINER_SCREENER_QUALIFIED.c.script_id.label("script_fk"),
-            V_MINER_SCREENER_QUALIFIED.c.rank.label("rank"),
-            V_MINER_SCREENER_QUALIFIED.c.total_eligible.label("total_eligible"),
+            V_MINER_SCREENER_ELIGIBLE_RANKED.c.miner_id.label("miner_id"),
+            V_MINER_SCREENER_ELIGIBLE_RANKED.c.script_id.label("script_id"),
+            V_MINER_SCREENER_ELIGIBLE_RANKED.c.avg_score.label("avg_score"),
+            V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank.label("rank"),
+            V_MINER_SCREENER_ELIGIBLE_RANKED.c.total_eligible.label("total_eligible"),
         )
-        .where(V_MINER_SCREENER_QUALIFIED.c.competition_id == competition_id)
+        .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
         .subquery()
     )
 
-    eligible_count = await db.scalar(select(func.count()).select_from(ranked_qualified))
-    eligible_count = int(eligible_count or 0)
-    if eligible_count <= 0:
+
+def _build_top_screener_ranked_subq(
+    competition_id: int,
+    *,
+    top_fraction: float | None = None,
+):
+    fraction = _get_top_screener_fraction() if top_fraction is None else float(top_fraction)
+    if fraction <= 0:
         return None
 
+    ranked_pool = _build_ranked_screener_pool_subq(competition_id)
     top_rank_threshold = func.greatest(
         1,
         func.cast(
             func.ceil(
-                func.cast(ranked_qualified.c.total_eligible, literal(1.0).type)
-                * top_fraction
+                func.cast(ranked_pool.c.total_eligible, literal(1.0).type) * fraction
             ),
             literal(1).type,
         ),
     )
+    base_top = select(
+        ranked_pool.c.miner_id.label("miner_id"),
+        ranked_pool.c.script_id.label("script_id"),
+        ranked_pool.c.rank.label("rank"),
+        ranked_pool.c.total_eligible.label("total_eligible"),
+    ).where(ranked_pool.c.rank <= top_rank_threshold)
 
-    return (
-        select(ranked_qualified.c.script_fk)
-        .where(ranked_qualified.c.rank <= top_rank_threshold)
-        .subquery()
+    extra_limit = _get_screener_extra_miners_limit()
+    extra_score_points = _get_screener_extra_score_points()
+    if extra_limit <= 0 or extra_score_points <= 0:
+        return base_top.subquery()
+
+    best_score_subq = select(func.max(ranked_pool.c.avg_score)).scalar_subquery()
+    extra_candidates = (
+        select(
+            ranked_pool.c.miner_id.label("miner_id"),
+            ranked_pool.c.script_id.label("script_id"),
+            ranked_pool.c.rank.label("rank"),
+            ranked_pool.c.total_eligible.label("total_eligible"),
+        )
+        .where(ranked_pool.c.rank > top_rank_threshold)
+        .where(ranked_pool.c.avg_score.isnot(None))
+        .where(ranked_pool.c.avg_score >= (best_score_subq - literal(extra_score_points)))
+        .order_by(ranked_pool.c.rank.asc())
+        .limit(extra_limit)
     )
+    return base_top.union_all(extra_candidates).subquery()
+
+
+def _build_top_screener_scripts_subq(
+    competition_id: int,
+    *,
+    top_fraction: float | None = None,
+):
+    ranked_top = _build_top_screener_ranked_subq(
+        competition_id,
+        top_fraction=top_fraction,
+    )
+    if ranked_top is None:
+        return None
+    return select(ranked_top.c.script_id.label("script_fk")).subquery()
+
+
+def _build_top_screener_miners_subq(
+    competition_id: int,
+    *,
+    top_fraction: float | None = None,
+):
+    ranked_top = _build_top_screener_ranked_subq(
+        competition_id,
+        top_fraction=top_fraction,
+    )
+    if ranked_top is None:
+        return None
+    return select(ranked_top.c.miner_id.label("miner_fk")).subquery()
 
 
 async def _get_expected_competition_pairs(
@@ -553,12 +619,19 @@ async def _select_miner_ss58(
                     "_select_miner_ss58: No screener challenges found for evaluation"
                 )
                 return None, None
-            top_scripts_subq = await _build_top_screener_scripts_subq(
-                db,
+            top_scripts_subq = _build_top_screener_scripts_subq(
                 active_competition_id,
-                top_fraction,
+                top_fraction=top_fraction,
             )
             if top_scripts_subq is None:
+                logger.info(
+                    "_select_miner_ss58: No eligible screener scripts found"
+                )
+                return None, None
+            top_scripts_count = await db.scalar(
+                select(func.count()).select_from(top_scripts_subq)
+            )
+            if int(top_scripts_count or 0) <= 0:
                 logger.info(
                     "_select_miner_ss58: No eligible screener scripts found"
                 )

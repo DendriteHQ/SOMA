@@ -36,11 +36,9 @@ from soma_shared.db.models.batch_compressed_text import BatchCompressedText
 from soma_shared.db.models.batch_question_answer import BatchQuestionAnswer
 from soma_shared.db.models.batch_question_score import BatchQuestionScore
 from soma_shared.db.models.challenge import Challenge
-from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.question import Question
-from soma_shared.db.models.script import Script
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
 from soma_shared.db.models.top_miner import TopMiner
@@ -62,18 +60,17 @@ from soma_shared.utils.verifier import verify_validator_stake_dep
 from app.api.deps import verify_request_dep_tz
 from app.core.config import settings
 from app.api.routes.utils import (
+    _build_top_screener_ranked_subq,
     _count_tokens,
     _get_request_row,
     _log_error_response,
     _select_miner_ss58,
     _get_validator,
     _get_active_competition_id,
-    _get_screener_challenges,
     _get_current_burn_state,
     _is_compressed_enough,
     get_script_s3_key,
 )
-from app.db.views import V_MINER_SCREENER_QUALIFIED
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -1674,99 +1671,64 @@ async def get_best_miners(
                 miners = [MinerWeight(uid=0, weight=1.0)]
                 response_payload = GetBestMinersUidResponse(miners=miners)
             else:
-                # Get top miners from screener scores (buffer based on total uploads)
+                # Get top miners from screener ranking.
                 top_screener_miners = []
                 try:
                     active_competition_id = current_competition_id
-                    screener_challenges, screener_challenges_count = (
-                        await _get_screener_challenges(db, active_competition_id)
+                    top_screener_scripts = float(
+                        getattr(settings, "top_screener_scripts", 0.2)
+                    )
+                    ranked_top_subq = _build_top_screener_ranked_subq(
+                        active_competition_id,
+                        top_fraction=top_screener_scripts,
                     )
                     logger.info(
                         "get_best_miners_screener_context",
                         extra={
                             "request_id": request_id,
                             "active_competition_id": active_competition_id,
-                            "screener_challenges_count": screener_challenges_count,
+                            "top_screener_scripts": top_screener_scripts,
                         },
                     )
 
-                    if screener_challenges_count > 0:
-                        # Count total unique uploads in competition
-                        total_uploads = await db.scalar(
+                    if ranked_top_subq is not None:
+                        qualified_miners_result = await db.execute(
                             select(
-                                func.count(func.distinct(MinerUpload.script_fk))
+                                Miner.ss58,
+                                ranked_top_subq.c.rank.label("rank"),
                             )
-                            .select_from(MinerUpload)
-                            .join(Script, Script.id == MinerUpload.script_fk)
-                            .join(Miner, Miner.id == Script.miner_fk)
-                            .where(MinerUpload.competition_fk == active_competition_id)
+                            .select_from(ranked_top_subq)
+                            .join(Miner, Miner.id == ranked_top_subq.c.miner_id)
                             .where(Miner.miner_banned_status.is_(False))
+                            .order_by(ranked_top_subq.c.rank.asc())
                         )
-                        total_uploads = int(total_uploads or 0)
 
-                        if total_uploads > 0:
-                            # Calculate buffer size as % of total uploads
-                            top_screener_scripts = float(
-                                getattr(settings, "top_screener_scripts", 0.2)
-                            )
-                            buffer_size = max(
-                                1, int(math.ceil(total_uploads * top_screener_scripts))
-                            )
+                        qualified_miners = [
+                            (str(row.ss58), int(row.rank))
+                            for row in qualified_miners_result
+                        ]
+                        logger.info(
+                            "get_best_miners_screener_scores",
+                            extra={
+                                "request_id": request_id,
+                                "qualified_miners_count": len(qualified_miners),
+                            },
+                        )
+
+                        if qualified_miners:
+                            # Map to UIDs
+                            for ss58, _rank in qualified_miners:
+                                uid = hotkey_to_uid.get(str(ss58))
+                                if uid is not None:
+                                    top_screener_miners.append(uid)
                             logger.info(
-                                "get_best_miners_screener_buffer",
+                                "get_best_miners_screener_selected",
                                 extra={
                                     "request_id": request_id,
-                                    "total_uploads": total_uploads,
-                                    "top_screener_scripts": top_screener_scripts,
-                                    "buffer_size": buffer_size,
+                                    "top_screener_miners": top_screener_miners,
+                                    "selected_count": len(top_screener_miners),
                                 },
                             )
-
-                            qualified_miners_result = await db.execute(
-                                select(
-                                    Miner.ss58,
-                                    V_MINER_SCREENER_QUALIFIED.c.rank.label("rank"),
-                                )
-                                .select_from(V_MINER_SCREENER_QUALIFIED)
-                                .join(
-                                    Miner,
-                                    Miner.id == V_MINER_SCREENER_QUALIFIED.c.miner_id,
-                                )
-                                .where(
-                                    V_MINER_SCREENER_QUALIFIED.c.competition_id
-                                    == active_competition_id
-                                )
-                                .order_by(V_MINER_SCREENER_QUALIFIED.c.rank.asc())
-                                .limit(buffer_size)
-                            )
-
-                            qualified_miners = [
-                                (str(row.ss58), int(row.rank))
-                                for row in qualified_miners_result
-                            ]
-                            logger.info(
-                                "get_best_miners_screener_scores",
-                                extra={
-                                    "request_id": request_id,
-                                    "qualified_miners_count": len(qualified_miners),
-                                },
-                            )
-
-                            if qualified_miners:
-                                # Map to UIDs
-                                for ss58, _rank in qualified_miners:
-                                    uid = hotkey_to_uid.get(str(ss58))
-                                    if uid is not None:
-                                        top_screener_miners.append(uid)
-                                logger.info(
-                                    "get_best_miners_screener_selected",
-                                    extra={
-                                        "request_id": request_id,
-                                        "top_screener_miners": top_screener_miners,
-                                        "buffer_size": buffer_size,
-                                        "selected_count": len(top_screener_miners),
-                                    },
-                                )
                 except Exception as exc:
                     logger.warning(
                         "get_best_miners_screener_calculation_failed",

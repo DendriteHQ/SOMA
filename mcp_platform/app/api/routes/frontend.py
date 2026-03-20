@@ -53,12 +53,14 @@ from soma_shared.db.session import get_db_session
 from app.db.views import (
     V_ACTIVE_COMPETITION,
     V_MINER_COMPETITION_RANK,
-    V_MINER_SCREENER_QUALIFIED,
     V_MINER_SCREENER_STATS,
     V_SCREENER_CHALLENGES_ACTIVE,
 )
 from app.core.config import settings
-from app.api.routes.utils import _get_current_burn_state
+from app.api.routes.utils import (
+    _build_top_screener_miners_subq,
+    _get_current_burn_state,
+)
 from app.core.logging import get_logger
 import logging
 from aiocache import cached, Cache
@@ -69,43 +71,6 @@ router = APIRouter(prefix="/api/private/frontend", tags=["frontend"])
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
 
 _cache = Cache(Cache.MEMORY)
-
-
-def _build_top_screener_miners_subq(latest_active_competition_id: int):
-    top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
-    if top_fraction <= 0:
-        return None
-
-    ranked_subq = (
-        select(
-            V_MINER_SCREENER_QUALIFIED.c.miner_id.label("miner_fk"),
-            V_MINER_SCREENER_QUALIFIED.c.rank.label("rank"),
-            V_MINER_SCREENER_QUALIFIED.c.total_eligible.label("total_eligible"),
-        )
-        .select_from(V_MINER_SCREENER_QUALIFIED)
-        .where(
-            V_MINER_SCREENER_QUALIFIED.c.competition_id
-            == latest_active_competition_id
-        )
-        .subquery()
-    )
-
-    top_rank_threshold = func.greatest(
-        1,
-        func.cast(
-            func.ceil(
-                func.cast(ranked_subq.c.total_eligible, literal(1.0).type)
-                * top_fraction
-            ),
-            literal(1).type,
-        ),
-    )
-
-    return (
-        select(ranked_subq.c.miner_fk.label("miner_fk"))
-        .where(ranked_subq.c.rank <= top_rank_threshold)
-        .subquery()
-    )
 
 
 def _build_miner_data_subqueries(latest_active_competition_id: int):
