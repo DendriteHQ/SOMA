@@ -34,6 +34,7 @@ async def log_validator_heartbeat(
             request_row = result.scalars().first()
             if request_row is not None:
                 request_fk = request_row.id
+                apply_db_metrics_snapshot_to_request(request_row, metrics_snapshot)
             else:
                 # Create Request record for heartbeat
                 request_row = Request(
@@ -47,8 +48,6 @@ async def log_validator_heartbeat(
                 session.add(request_row)
                 await session.flush()
                 request_fk = request_row.id
-            else:
-                apply_db_metrics_snapshot_to_request(request_row, metrics_snapshot)
         now = datetime.now(timezone.utc)
         result = await session.execute(
             select(Validator).where(Validator.ss58 == validator_ss58)
