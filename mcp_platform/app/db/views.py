@@ -30,7 +30,6 @@ V_BATCH_CHALLENGE_QUESTIONS = sa.table(
     sa.column("competition_name"),
     sa.column("compression_ratio"),
     sa.column("created_at"),
-    sa.column("is_screener"),
     sa.column("overall_score"),
     sa.column("scored_at"),
     sa.column("question_id"),
