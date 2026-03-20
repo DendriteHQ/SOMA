@@ -8,6 +8,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soma_shared.db.models.request import Request
+from soma_shared.db.request_metrics import apply_db_metrics_snapshot_to_request
+from soma_shared.db.session import get_current_db_request_metrics_snapshot
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_heartbeat import ValidatorHeartbeat
 from app.core.logging import get_logger
@@ -22,6 +24,7 @@ async def log_validator_heartbeat(
     validator_ss58: str,
     status: str,
 ) -> None:
+    metrics_snapshot = get_current_db_request_metrics_snapshot()
     try:
         request_fk = None
         if request_id:
@@ -40,9 +43,12 @@ async def log_validator_heartbeat(
                     payload={},
                     status_code=200 if status == "working" else None,
                 )
+                apply_db_metrics_snapshot_to_request(request_row, metrics_snapshot)
                 session.add(request_row)
                 await session.flush()
                 request_fk = request_row.id
+            else:
+                apply_db_metrics_snapshot_to_request(request_row, metrics_snapshot)
         now = datetime.now(timezone.utc)
         result = await session.execute(
             select(Validator).where(Validator.ss58 == validator_ss58)
