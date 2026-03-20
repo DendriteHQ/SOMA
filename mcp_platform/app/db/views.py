@@ -2,31 +2,66 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 
+# ---------------------------------------------------------------------------
+# Regular (live) views — used by backend for real-time data.
+# ---------------------------------------------------------------------------
 
 V_ACTIVE_COMPETITION = sa.table(
     "v_active_competition",
     sa.column("competition_id"),
     sa.column("competition_name"),
     sa.column("competition_created_at"),
-    sa.column("competition_config_id"),
-    sa.column("competition_config_created_at"),
+    sa.column("compression_ratios"),
+    sa.column("upload_starts_at"),
+    sa.column("upload_ends_at"),
+    sa.column("eval_starts_at"),
+    sa.column("eval_ends_at"),
 )
 
-V_SCREENER_CHALLENGES_ACTIVE = sa.table(
-    "v_screener_challenges_active",
+
+V_COMPETITION_CHALLENGES = sa.table(
+    "v_competition_challenges",
     sa.column("competition_id"),
-    sa.column("screener_id"),
     sa.column("challenge_id"),
+    sa.column("is_active"),
+    sa.column("is_screener"),
 )
 
 V_MINER_SCREENER_STATS = sa.table(
     "v_miner_screener_stats",
     sa.column("competition_id"),
-    sa.column("miner_id"),
-    sa.column("screener_assigned"),
-    sa.column("screener_scored"),
-    sa.column("avg_score"),
+    sa.column("ss58"),
+    sa.column("is_banned"),
+    sa.column("total_screener_score"),
     sa.column("first_upload_at"),
+    sa.column("screener_rank"),
+    sa.column("total_screener_miners"),
+)
+
+V_MINER_COMPETITION_STATS = sa.table(
+    "v_miner_competition_stats",
+    sa.column("competition_id"),
+    sa.column("ss58"),
+    sa.column("is_banned"),
+    sa.column("total_score"),
+    sa.column("first_upload_at"),
+    sa.column("rank"),
+)
+
+V_MINER_STATUS = sa.table(
+    "v_miner_status",
+    sa.column("competition_id"),
+    sa.column("ss58"),
+    sa.column("is_banned"),
+    sa.column("has_script"),
+    sa.column("competition_challenges"),
+    sa.column("screener_challenges"),
+    sa.column("scored_screened_challenges"),
+    sa.column("pending_assignments_screener"),
+    sa.column("scored_competition_challenges"),
+    sa.column("pending_assignments_competition"),
+    sa.column("screener_rank"),
+    sa.column("total_eligible_screener"),
 )
 
 V_MINER_SCREENER_ELIGIBLE_RANKED = sa.table(
@@ -42,12 +77,52 @@ V_MINER_SCREENER_ELIGIBLE_RANKED = sa.table(
     sa.column("total_eligible"),
 )
 
-V_MINER_COMPETITION_RANK = sa.table(
-    "v_miner_competition_rank",
+# ---------------------------------------------------------------------------
+# Materialized views — frontend reads from these (refreshed every ~30-120s).
+# Columns are identical to their v_* counterparts.
+# ---------------------------------------------------------------------------
+
+MV_COMPETITION_CHALLENGES = sa.table(
+    "mv_competition_challenges",
     sa.column("competition_id"),
-    sa.column("miner_id"),
+    sa.column("challenge_id"),
+    sa.column("is_active"),
+    sa.column("is_screener"),
+)
+
+MV_MINER_SCREENER_STATS = sa.table(
+    "mv_miner_screener_stats",
+    sa.column("competition_id"),
+    sa.column("ss58"),
+    sa.column("is_banned"),
+    sa.column("total_screener_score"),
+    sa.column("first_upload_at"),
+    sa.column("screener_rank"),
+    sa.column("total_screener_miners"),
+)
+
+MV_MINER_COMPETITION_STATS = sa.table(
+    "mv_miner_competition_stats",
+    sa.column("competition_id"),
+    sa.column("ss58"),
+    sa.column("is_banned"),
     sa.column("total_score"),
-    sa.column("first_upload"),
+    sa.column("first_upload_at"),
     sa.column("rank"),
-    sa.column("total_miners"),
+)
+
+MV_MINER_STATUS = sa.table(
+    "mv_miner_status",
+    sa.column("competition_id"),
+    sa.column("ss58"),
+    sa.column("is_banned"),
+    sa.column("has_script"),
+    sa.column("competition_challenges"),
+    sa.column("screener_challenges"),
+    sa.column("scored_screened_challenges"),
+    sa.column("pending_assignments_screener"),
+    sa.column("scored_competition_challenges"),
+    sa.column("pending_assignments_competition"),
+    sa.column("screener_rank"),
+    sa.column("total_eligible_screener"),
 )
