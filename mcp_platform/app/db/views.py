@@ -19,6 +19,28 @@ V_ACTIVE_COMPETITION = sa.table(
 )
 
 
+V_BATCH_CHALLENGE_QUESTIONS = sa.table(
+    "v_batch_challenge_questions",
+    sa.column("batch_challenge_id"),
+    sa.column("miner_ss58"),
+    sa.column("challenge_id"),
+    sa.column("challenge_name"),
+    sa.column("challenge_text"),
+    sa.column("competition_id"),
+    sa.column("competition_name"),
+    sa.column("compression_ratio"),
+    sa.column("created_at"),
+    sa.column("is_screener"),
+    sa.column("overall_score"),
+    sa.column("scored_at"),
+    sa.column("question_id"),
+    sa.column("question_text"),
+    sa.column("produced_answer"),
+    sa.column("ground_truth"),
+    sa.column("avg_score"),
+    sa.column("score_details"),
+)
+
 V_COMPETITION_CHALLENGES = sa.table(
     "v_competition_challenges",
     sa.column("competition_id"),
@@ -62,6 +84,7 @@ V_MINER_STATUS = sa.table(
     sa.column("pending_assignments_competition"),
     sa.column("screener_rank"),
     sa.column("total_eligible_screener"),
+    sa.column("last_submit_at"),
 )
 
 V_MINER_SCREENER_ELIGIBLE_RANKED = sa.table(
@@ -125,4 +148,5 @@ MV_MINER_STATUS = sa.table(
     sa.column("pending_assignments_competition"),
     sa.column("screener_rank"),
     sa.column("total_eligible_screener"),
+    sa.column("last_submit_at"),
 )
