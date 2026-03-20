@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, status, Request
 from sqlalchemy import func, select, literal, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
+import ipaddress
 from soma_shared.contracts.validator.v1.messages import Challenge
 from soma_shared.db.models.batch_assignment import BatchAssignment
 from soma_shared.db.models.batch_challenge import BatchChallenge
@@ -75,6 +76,137 @@ def _is_chars_per_token_outlier(
     chars_per_token_ratio = compressed_chars_per_token / original_chars_per_token
     return chars_per_token_ratio > threshold
 
+def _extract_client_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        # X-Forwarded-For can contain multiple IPs; take the first hop.
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return None
+
+
+def _is_trusted_proxy(request: Request) -> bool:
+    client_host = request.client.host if request.client else None
+    if not client_host:
+        return False
+    try:
+        ip = ipaddress.ip_address(client_host)
+    except ValueError:
+        return False
+    for cidr in settings.trusted_proxy_cidrs:
+        try:
+            if ip in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _is_private_client_ip(client_ip: str | None) -> bool:
+    if not client_ip:
+        return False
+    try:
+        ip = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    for cidr in settings.private_network_cidrs:
+        try:
+            if ip in ipaddress.ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+async def _require_private_network(request: Request) -> None:
+    if not _is_trusted_proxy(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Private network access only",
+        )
+    client_ip = _extract_client_ip(request)
+    if not _is_private_client_ip(client_ip):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Private network access only",
+        )
+
+def _miner_status(
+    competition_challenges: int | None,
+    screener_challenges: int | None,
+    pending_assignments_competition: int | None,
+    pending_assignments_screener: int | None,
+    scored_screened_challenges: int | None,
+    scored_competition_challanges: int | None,
+    is_in_top_screener: bool = False,
+    has_script: bool = False,
+    miner_banned_status: bool = False,
+) -> str:
+    """Determine miner status based on challenges and scores.
+
+    Args:
+        total_challenges: Total number of active challenges in the competition
+        miner_challenges: Number of challenges assigned to the miner
+        scored_challenges: Number of challenges that have been scored
+        has_script: Whether miner has uploaded a script for active competition
+
+    Returns:
+        - 'scored': All competition challenges have been scored for this miner
+        - 'evaluating': Some challenges scored, some pending
+        - 'in queue': Miner uploaded script but waiting for challenges or scoring
+        - 'idle': No script uploaded
+    """
+    if miner_banned_status:
+        return "banned"
+
+    if not has_script:
+        return "idle"
+
+    if competition_challenges is not None and scored_competition_challanges is not None:
+        if scored_competition_challanges >= competition_challenges:
+            return "scored"
+        elif (
+            scored_competition_challanges > 0
+            and scored_competition_challanges < competition_challenges
+        ):
+            return "evaluating"
+
+    if pending_assignments_screener is not None and pending_assignments_screener > 0:
+        return "screening"
+    # Only check screener status if miner actually has screener challenges assigned
+    if (
+        screener_challenges is not None
+        and screener_challenges > 0
+        and scored_screened_challenges is not None
+    ):
+        if scored_screened_challenges < screener_challenges:
+            return "screening"
+        elif (
+            scored_screened_challenges >= screener_challenges
+            and is_in_top_screener
+            and (
+                pending_assignments_competition is None
+                or pending_assignments_competition == 0
+            )
+            and (
+                scored_competition_challanges is None
+                or scored_competition_challanges == 0
+            )
+        ):
+            return "qualified"
+        elif (
+            scored_screened_challenges >= screener_challenges and not is_in_top_screener
+        ):
+            return "not qualified"
+
+    if (
+        pending_assignments_competition is not None
+        and pending_assignments_competition > 0
+    ):
+        return "evaluating"
+
+    return "in queue"
 
 def _is_compressed_enough(
     original: str,
