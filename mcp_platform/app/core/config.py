@@ -115,6 +115,18 @@ class Settings(BaseSettings):
         alias="VALIDATOR_OPENROUTER_ERROR_COOLDOWN_SECONDS",
     )
 
+    # Materialized view refresh
+    # Fast views: mv_miner_status, mv_miner_screener_stats, mv_miner_competition_stats
+    mv_refresh_fast_interval_secs: int = Field(
+        default=10,
+        alias="MV_REFRESH_FAST_INTERVAL_SECS",
+    )
+    # Slow views: mv_competition_challenges
+    mv_refresh_interval_secs: int = Field(
+        default=60,
+        alias="MV_REFRESH_INTERVAL_SECS",
+    )
+
     # Sandbox timeout configuration
     sandbox_timeout_per_task_seconds: float = Field(
         default=10.0,
