@@ -30,6 +30,7 @@ from app.db.views import V_ACTIVE_COMPETITION, V_COMPETITION_CHALLENGES, V_MINER
 from app.core.config import settings
 from app.api.deps import get_script_storage
 from app.core.logging import get_logger
+import math
 
 logger = get_logger(__name__)
 TOKENIZER_CHEATING_CHARS_PER_TOKEN_THRESHOLD = 1.3
