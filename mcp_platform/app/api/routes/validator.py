@@ -60,7 +60,6 @@ from soma_shared.utils.verifier import verify_validator_stake_dep
 from app.api.deps import verify_request_dep_tz
 from app.core.config import settings
 from app.api.routes.utils import (
-    _build_top_screener_ranked_subq,
     _count_tokens,
     _get_request_row,
     _log_error_response,
@@ -70,7 +69,9 @@ from app.api.routes.utils import (
     _get_current_burn_state,
     _is_compressed_enough,
     get_script_s3_key,
+    _get_ratio_count
 )
+from app.db.views import V_MINER_SCREENER_ELIGIBLE_RANKED
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -1678,10 +1679,6 @@ async def get_best_miners(
                     top_screener_scripts = float(
                         getattr(settings, "top_screener_scripts", 0.2)
                     )
-                    ranked_top_subq = _build_top_screener_ranked_subq(
-                        active_competition_id,
-                        top_fraction=top_screener_scripts,
-                    )
                     logger.info(
                         "get_best_miners_screener_context",
                         extra={
@@ -1691,40 +1688,56 @@ async def get_best_miners(
                         },
                     )
 
-                    if ranked_top_subq is not None:
-                        qualified_miners_result = await db.execute(
-                            select(
-                                Miner.ss58,
-                                ranked_top_subq.c.rank.label("rank"),
+                    if top_screener_scripts > 0:
+                        eligible_row = (
+                            await db.execute(
+                                select(V_MINER_SCREENER_ELIGIBLE_RANKED.c.total_eligible)
+                                .where(
+                                    V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id
+                                    == active_competition_id
+                                )
+                                .limit(1)
                             )
-                            .select_from(ranked_top_subq)
-                            .join(Miner, Miner.id == ranked_top_subq.c.miner_id)
-                            .where(Miner.miner_banned_status.is_(False))
-                            .order_by(ranked_top_subq.c.rank.asc())
+                        ).first()
+                        total_eligible = (
+                            int(eligible_row.total_eligible)
+                            if eligible_row and eligible_row.total_eligible
+                            else 0
+                        )
+                        top_limit = (
+                            int(math.ceil(total_eligible * top_screener_scripts))
+                            if total_eligible > 0
+                            else 0
                         )
 
-                        qualified_miners = [
-                            (str(row.ss58), int(row.rank))
-                            for row in qualified_miners_result
-                        ]
-                        logger.info(
-                            "get_best_miners_screener_scores",
-                            extra={
-                                "request_id": request_id,
-                                "qualified_miners_count": len(qualified_miners),
-                            },
-                        )
-
-                        if qualified_miners:
-                            # Map to UIDs
-                            for ss58, _rank in qualified_miners:
-                                uid = hotkey_to_uid.get(str(ss58))
+                        if top_limit > 0:
+                            qualified_miners_result = await db.execute(
+                                select(Miner.ss58)
+                                .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
+                                .join(
+                                    Miner,
+                                    Miner.id == V_MINER_SCREENER_ELIGIBLE_RANKED.c.miner_id,
+                                )
+                                .where(
+                                    V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id
+                                    == active_competition_id
+                                )
+                                .where(
+                                    V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank <= top_limit
+                                )
+                                .where(Miner.miner_banned_status.is_(False))
+                                .order_by(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank.asc())
+                            )
+                            for row in qualified_miners_result:
+                                uid = hotkey_to_uid.get(str(row.ss58))
                                 if uid is not None:
                                     top_screener_miners.append(uid)
                             logger.info(
                                 "get_best_miners_screener_selected",
                                 extra={
                                     "request_id": request_id,
+                                    "total_eligible": total_eligible,
+                                    "top_limit": top_limit,
                                     "top_screener_miners": top_screener_miners,
                                     "selected_count": len(top_screener_miners),
                                 },
