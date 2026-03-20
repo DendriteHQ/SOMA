@@ -24,9 +24,9 @@ async def log_validator_heartbeat(
     validator_ss58: str,
     status: str,
 ) -> None:
-    metrics_snapshot = get_current_db_request_metrics_snapshot()
     try:
         request_fk = None
+        request_row: Request | None = None
         if request_id:
             result = await session.execute(
                 select(Request).where(Request.external_request_id == request_id)
@@ -34,7 +34,6 @@ async def log_validator_heartbeat(
             request_row = result.scalars().first()
             if request_row is not None:
                 request_fk = request_row.id
-                apply_db_metrics_snapshot_to_request(request_row, metrics_snapshot)
             else:
                 # Create Request record for heartbeat
                 request_row = Request(
@@ -44,7 +43,6 @@ async def log_validator_heartbeat(
                     payload={},
                     status_code=200 if status == "working" else None,
                 )
-                apply_db_metrics_snapshot_to_request(request_row, metrics_snapshot)
                 session.add(request_row)
                 await session.flush()
                 request_fk = request_row.id
@@ -71,6 +69,10 @@ async def log_validator_heartbeat(
             status=status,
         )
         session.add(entry)
+        await session.flush()
+        if request_row is not None:
+            metrics_snapshot = get_current_db_request_metrics_snapshot()
+            apply_db_metrics_snapshot_to_request(request_row, metrics_snapshot)
         await session.commit()
     except SQLAlchemyError:
         await session.rollback()
