@@ -672,10 +672,9 @@ async def get_miner_competition(
     comp_row = (
         await db.execute(
             select(
-                V_ACTIVE_COMPETITION.c.competition_name,
-                V_ACTIVE_COMPETITION.c.eval_starts_at,
-            )
-            .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+                Competition.name.label("competition_name"),
+                Competition.eval_starts_at,
+            ).where(Competition.id == comp_id)
         )
     ).first()
 
