@@ -69,7 +69,6 @@ from app.api.routes.utils import (
     _get_current_burn_state,
     _is_compressed_enough,
     get_script_s3_key,
-    _get_ratio_count
 )
 from app.db.views import V_MINER_SCREENER_ELIGIBLE_RANKED
 from app.core.logging import get_logger
