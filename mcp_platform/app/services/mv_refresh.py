@@ -64,10 +64,9 @@ async def _run_refresh_loop() -> None:
                 if now - last_refresh[mv.name] >= interval:
                     try:
                         async for conn in _get_raw_connection():
-                            await conn.execute(
-                                __import__("sqlalchemy").text(
-                                    f"REFRESH MATERIALIZED VIEW CONCURRENTLY {mv.name}"
-                                )
+                            await conn.exec_driver_sql(
+                                f"REFRESH MATERIALIZED VIEW CONCURRENTLY {mv.name}",
+                                execution_options={"isolation_level": "AUTOCOMMIT"},
                             )
                         last_refresh[mv.name] = time.monotonic()
                         logger.debug("mv_refreshed", extra={"view": mv.name})
