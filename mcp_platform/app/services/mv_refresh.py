@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from soma_shared.db.session import get_db_session
 from soma_shared.db.views.definitions import MV_DEFINITIONS
-from soma_shared.db.views.sync import refresh_materialized_views
 from app.core.config import settings
 from app.core.logging import get_logger
 
