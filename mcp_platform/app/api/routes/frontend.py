@@ -5,6 +5,7 @@ from math import ceil
 
 import ipaddress
 
+from aiocache import Cache
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, select, literal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,14 +57,20 @@ from app.db.views import (
     V_SCREENER_CHALLENGES_ACTIVE,
 )
 from app.core.config import settings
-from app.api.routes.utils import _get_current_burn_state
+from app.api.routes.utils import (
+    _build_top_screener_miners_subq,
+    _get_current_burn_state,
+)
 from app.core.logging import get_logger
 import logging
+from aiocache import cached, Cache
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/private/frontend", tags=["frontend"])
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
+
+_cache = Cache(Cache.MEMORY)
 
 
 def _build_miner_data_subqueries(latest_active_competition_id: int):
@@ -156,73 +163,9 @@ def _build_miner_data_subqueries(latest_active_competition_id: int):
     )
 
     # Top screener miners
-    top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
-    is_top_screener_subq = None
-
-    if top_fraction > 0:
-        eligible_subq = (
-            select(
-                V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
-                V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
-                V_MINER_SCREENER_STATS.c.screener_scored.label("scored_count"),
-            )
-            .select_from(V_MINER_SCREENER_STATS)
-            .join(
-                Miner,
-                Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
-            )
-            .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
-            .where(Miner.miner_banned_status.is_(False))
-            .subquery()
-        )
-
-        filtered_subq = (
-            select(
-                eligible_subq.c.miner_fk.label("miner_fk"),
-                eligible_subq.c.avg_score.label("avg_score"),
-            )
-            .select_from(eligible_subq)
-            .join(
-                screener_assigned_subq,
-                screener_assigned_subq.c.miner_fk == eligible_subq.c.miner_fk,
-            )
-            .where(
-                eligible_subq.c.scored_count
-                >= screener_assigned_subq.c.screener_assigned
-            )
-            .subquery()
-        )
-
-        ranked_subq = select(
-            filtered_subq.c.miner_fk.label("miner_fk"),
-            func.row_number()
-            .over(
-                order_by=[
-                    filtered_subq.c.avg_score.desc().nullslast(),
-                    filtered_subq.c.miner_fk.asc(),
-                ]
-            )
-            .label("rank"),
-            func.count(filtered_subq.c.miner_fk).over().label("total_eligible"),
-        ).subquery()
-
-        is_top_screener_subq = (
-            select(ranked_subq.c.miner_fk.label("miner_fk"))
-            .where(
-                ranked_subq.c.rank
-                <= func.greatest(
-                    1,
-                    func.cast(
-                        func.ceil(
-                            func.cast(ranked_subq.c.total_eligible, literal(1.0).type)
-                            * top_fraction
-                        ),
-                        literal(1).type,
-                    ),
-                )
-            )
-            .subquery()
-        )
+    is_top_screener_subq = _build_top_screener_miners_subq(
+        latest_active_competition_id
+    )
 
     return {
         "screener_assigned": screener_assigned_subq,
@@ -238,13 +181,23 @@ def _latest_active_competition_id_subquery():
 
 
 async def _get_latest_active_competition_id(db: AsyncSession) -> int | None:
-    return await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
+    cached = await _cache.get("latest_active_competition_id")
+    if cached is not None:
+        return cached
+    result = await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
+    if result is not None:
+        await _cache.set("latest_active_competition_id", result, ttl=60)
+    return result
 
 
-async def _should_mask_challenge_text(
+async def _is_eval_started(
     db: AsyncSession,
     competition_id: int,
 ) -> bool:
+    cache_key = f"eval_started_{competition_id}"
+    cached = await _cache.get(cache_key)
+    if cached is not None:
+        return cached["value"]
     eval_starts_at = await db.scalar(
         select(CompetitionTimeframe.eval_starts_at)
         .select_from(V_ACTIVE_COMPETITION)
@@ -258,10 +211,13 @@ async def _should_mask_challenge_text(
         .limit(1)
     )
     if eval_starts_at is None:
-        return True
-    if eval_starts_at.tzinfo is None:
-        eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) < eval_starts_at
+        result = False
+    else:
+        if eval_starts_at.tzinfo is None:
+            eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
+        result = datetime.now(timezone.utc) >= eval_starts_at
+    await _cache.set(cache_key, {"value": result}, ttl=30)
+    return result
 
 
 def _extract_client_ip(request: Request) -> str | None:
@@ -404,6 +360,9 @@ async def frontend_summary(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> FrontendSummaryResponse:
+    _cached = await _cache.get("summary")
+    if _cached is not None:
+        return _cached
     latest_active_competition_id = await _get_latest_active_competition_id(db)
 
     miners_count = 0
@@ -433,11 +392,17 @@ async def frontend_summary(
             .where(CompetitionChallenge.is_active.is_(True))
         )
 
-    validators_count = await db.scalar(select(func.count()).select_from(Validator))
+    validators_count = await db.scalar(
+        select(func.count())
+        .select_from(Validator)
+        .where(Validator.is_archive.is_(False))
+    )
     active_validators_count = await db.scalar(
         select(func.count())
         .select_from(ValidatorRegistration)
+        .join(Validator, ValidatorRegistration.validator_fk == Validator.id)
         .where(ValidatorRegistration.is_active.is_(True))
+        .where(Validator.is_archive.is_(False))
     )
 
     burn_active, burn_ratio = await _get_current_burn_state(db)
@@ -455,6 +420,7 @@ async def frontend_summary(
         burn_ratio=burn_ratio,
     )
 
+    await _cache.set("summary", response, ttl=30)
     logger.info(
         f"[Frontend] Summary: miners={response.miners}, validators={response.validators}, "
         f"active_validators={response.active_validators}, competitions={response.competitions}, "
@@ -472,6 +438,9 @@ async def get_current_competition_timeframe(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> CurrentCompetitionTimeframeResponse:
+    _cached = await _cache.get("competition_timeframe")
+    if _cached is not None:
+        return _cached
     timeframe_row = (
         await db.execute(
             select(
@@ -517,6 +486,7 @@ async def get_current_competition_timeframe(
         evaluation_end=evaluation_end,
     )
 
+    await _cache.set("competition_timeframe", response, ttl=120)
     logger.info(
         "[Frontend] Current timeframe: competition_id=%s, upload_start=%s, "
         "upload_end=%s, evaluation_start=%s, evaluation_end=%s",
@@ -545,6 +515,9 @@ async def list_miners(
     limit: int = Query(default=20, ge=1, le=400),
 ) -> MinersListResponse:
     """List only miners that uploaded a script in the latest active competition."""
+    _cached = await _cache.get(f"miners_{page}_{limit}")
+    if _cached is not None:
+        return _cached
 
     latest_active_competition_subq = _latest_active_competition_id_subquery()
 
@@ -717,76 +690,9 @@ async def list_miners(
         )
 
         # Top screener miners
-        top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
-        if top_fraction > 0:
-            # Get eligible miners who completed all their assigned screener challenges
-            eligible_subq = (
-                select(
-                    V_MINER_SCREENER_STATS.c.miner_id.label("miner_fk"),
-                    V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
-                    V_MINER_SCREENER_STATS.c.screener_scored.label("scored_count"),
-                )
-                .select_from(V_MINER_SCREENER_STATS)
-                .join(
-                    Miner,
-                    Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
-                )
-                .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
-                .where(Miner.miner_banned_status.is_(False))
-                .subquery()
-            )
-
-            # Filter to those who completed all assigned and rank them
-            filtered_subq = (
-                select(
-                    eligible_subq.c.miner_fk.label("miner_fk"),
-                    eligible_subq.c.avg_score.label("avg_score"),
-                )
-                .select_from(eligible_subq)
-                .join(
-                    screener_assigned_subq,
-                    screener_assigned_subq.c.miner_fk == eligible_subq.c.miner_fk,
-                )
-                .where(
-                    eligible_subq.c.scored_count
-                    >= screener_assigned_subq.c.screener_assigned
-                )
-                .subquery()
-            )
-
-            # Rank and get top N
-            ranked_subq = select(
-                filtered_subq.c.miner_fk.label("miner_fk"),
-                func.row_number()
-                .over(
-                    order_by=[
-                        filtered_subq.c.avg_score.desc().nullslast(),
-                        filtered_subq.c.miner_fk.asc(),
-                    ]
-                )
-                .label("rank"),
-                func.count(filtered_subq.c.miner_fk).over().label("total_eligible"),
-            ).subquery()
-
-            is_top_screener_subq = (
-                select(ranked_subq.c.miner_fk.label("miner_fk"))
-                .where(
-                    ranked_subq.c.rank
-                    <= func.greatest(
-                        1,
-                        func.cast(
-                            func.ceil(
-                                func.cast(
-                                    ranked_subq.c.total_eligible, literal(1.0).type
-                                )
-                                * top_fraction
-                            ),
-                            literal(1).type,
-                        ),
-                    )
-                )
-                .subquery()
-            )
+        is_top_screener_subq = _build_top_screener_miners_subq(
+            latest_active_competition_id
+        )
 
     # Build main query with all subqueries
     base_select = select(
@@ -976,6 +882,7 @@ async def list_miners(
         ),
     )
 
+    await _cache.set(f"miners_{page}_{limit}", response, ttl=15)
     logger.info(
         f"[Frontend] Miners list: page={page}, limit={limit}, total={total_value}, "
         f"returned={len(miners)} miners"
@@ -990,6 +897,9 @@ async def get_miner(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> MinerDetailResponse:
+    _cached = await _cache.get(f"miner_{hotkey}")
+    if _cached is not None:
+        return _cached
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
         raise HTTPException(
@@ -1271,6 +1181,8 @@ async def get_miner(
             miner_rank = int(rank_row.rank) if rank_row.rank is not None else None
             total_miners_count = int(rank_row.total_miners or 0)
 
+    eval_started = await _is_eval_started(db, latest_active_competition_id)
+
     # Calculate pending assignments
     pending_screener = (
         (screener_assigned or 0) - (screener_scored or 0) if screener_assigned else None
@@ -1307,8 +1219,8 @@ async def get_miner(
             id=competition_id,
             name=f"{competition_name} #{competition_id}",
             date=last_upload_date,
-            score=float(competition_score) if ((competition_score is not None) and (miner_status in {"scored", "evaluating"})) else None,
-            rank=display_rank if miner_status in {"scored", "evaluating"} else None,
+            score=float(competition_score) if ((competition_score is not None) and (miner_status in {"scored", "evaluating"}) and eval_started) else None,
+            rank=display_rank if ((miner_status in {"scored", "evaluating"}) and eval_started) else None,
         )
 
     response = MinerDetailResponse(
@@ -1319,13 +1231,14 @@ async def get_miner(
             contests=int(competitions_count or 0),
             status=miner_status,
             total_score=(
-                float(total_score_result) if ((total_score_result is not None) and (miner_status in {"scored", "evaluating"})) else None
+                float(total_score_result) if ((total_score_result is not None) and (miner_status in {"scored", "evaluating"}) and eval_started) else None
             ),
         ),
         last_contest=last_competition,
         source_code=SourceCodeSummary(available=False, code=None),
     )
 
+    await _cache.set(f"miner_{hotkey}", response, ttl=15)
     logger.info(
         f"[Frontend] Miner detail: hotkey={hotkey}, uid={miner.id}, "
         f"status={response.miner.status}, contests={response.miner.contests}, "
@@ -1348,6 +1261,9 @@ async def get_miner_contest_challenge_detail(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> ChallengeDetailResponse:
+    _cached = await _cache.get(f"miner_challenge_{hotkey}_{batch_challenge_id}")
+    if _cached is not None:
+        return _cached
     # Verify miner exists
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
@@ -1424,7 +1340,7 @@ async def get_miner_contest_challenge_detail(
         created_at,
         overall_score,
     ) = batch_challenge_data
-    mask_text = await _should_mask_challenge_text(db, competition_id)
+    eval_started = await _is_eval_started(db, competition_id)
 
     # Get all questions for this challenge with answers and scores
     questions_result = await db.execute(
@@ -1465,11 +1381,11 @@ async def get_miner_contest_challenge_detail(
         QuestionDetail(
             question_id=question.id,
             question_text=(
-                TEXT_HIDDEN_PLACEHOLDER if mask_text else question.question
+                TEXT_HIDDEN_PLACEHOLDER if not eval_started else question.question
             ),
-            miner_answer=TEXT_HIDDEN_PLACEHOLDER if mask_text else produced_answer,
+            miner_answer=TEXT_HIDDEN_PLACEHOLDER if not eval_started else produced_answer,
             ground_truth_answer=(
-                TEXT_HIDDEN_PLACEHOLDER if mask_text else ground_truth
+                TEXT_HIDDEN_PLACEHOLDER if not eval_started else ground_truth
             ),
             score=float(avg_score) if avg_score is not None else None,
             score_details=(
@@ -1487,7 +1403,7 @@ async def get_miner_contest_challenge_detail(
             challenge_id=challenge.id,
             challenge_name=challenge.challenge_name,
             challenge_text=(
-                TEXT_HIDDEN_PLACEHOLDER if mask_text else challenge.challenge_text
+                TEXT_HIDDEN_PLACEHOLDER if not eval_started else challenge.challenge_text
             ),
             competition_name=competition_name,
             competition_id=competition_id,
@@ -1498,6 +1414,7 @@ async def get_miner_contest_challenge_detail(
         )
     )
 
+    await _cache.set(f"miner_challenge_{hotkey}_{batch_challenge_id}", response, ttl=15)
     logger.info(
         f"[Frontend] Challenge detail: batch_challenge_id={batch_challenge_id}, "
         f"hotkey={hotkey}, challenge_id={challenge.id}, "
@@ -1515,6 +1432,9 @@ async def get_miner_contests_challenges(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> MinerChallengesResponse:
+    _cached = await _cache.get(f"miner_challenges_{hotkey}")
+    if _cached is not None:
+        return _cached
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
         raise HTTPException(
@@ -1579,6 +1499,11 @@ async def get_miner_contests_challenges(
 
     challenges_data = result.all()
 
+    eval_started = await _is_eval_started(db, latest_active_competition_id)
+
+    if not eval_started:
+        return MinerChallengesResponse(challenges=[], total=0)
+
     challenges = [
         ChallengeItem(
             challenge_id=challenge_id,
@@ -1607,6 +1532,7 @@ async def get_miner_contests_challenges(
         total=len(challenges),
     )
 
+    await _cache.set(f"miner_challenges_{hotkey}", response, ttl=15)
     logger.info(
         f"[Frontend] Miner challenges: hotkey={hotkey}, total={response.total}, "
         f"scored={sum(1 for c in challenges if c.score is not None)}, "
@@ -1622,6 +1548,9 @@ async def get_miner_contests(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> MinerContestsResponse:
+    _cached = await _cache.get(f"miner_contests_{hotkey}")
+    if _cached is not None:
+        return _cached
     logger.info(f"Received request for miner competitions: hotkey={hotkey}")
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
@@ -1714,6 +1643,10 @@ async def get_miner_contests(
             miner_rank = int(rank_row.rank) if rank_row.rank is not None else None
             total_miners_count = int(rank_row.total_miners or 0)
 
+    eval_started = await _is_eval_started(db, latest_active_competition_id)
+    if not eval_started:
+        return MinerContestsResponse(contests=[], total=0)
+
     competitions = [
         ContestSummary(
             id=competition_id,
@@ -1730,6 +1663,7 @@ async def get_miner_contests(
         total=len(competitions),
     )
 
+    await _cache.set(f"miner_contests_{hotkey}", response, ttl=15)
     logger.info(
         f"[Frontend] Miner competitions: hotkey={hotkey}, total={response.total}, "
         f"returned={len(competitions)} competitions, miner_rank={miner_rank}/{total_miners_count}, "
@@ -1748,6 +1682,9 @@ async def get_miner_screener_contests(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> ScreenerChallengesResponse:
+    _cached = await _cache.get(f"miner_screener_{hotkey}")
+    if _cached is not None:
+        return _cached
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
     if miner is None:
         raise HTTPException(
@@ -1775,7 +1712,6 @@ async def get_miner_screener_contests(
             BatchChallenge.id.label("batch_challenge_id"),
             Challenge.id.label("challenge_id"),
             Challenge.challenge_name,
-            Challenge.challenge_text,
             Competition.competition_name,
             Competition.id.label("competition_id"),
             BatchChallenge.compression_ratio,
@@ -1812,7 +1748,7 @@ async def get_miner_screener_contests(
             BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
         )
         .where(ChallengeBatch.miner_fk == miner.id)
-        .where(BatchChallenge.challenge_fk.in_(select(screening_challenges_subq)))
+        .where(BatchChallenge.challenge_fk.in_(screening_challenges_subq))
         .where(MinerUpload.competition_fk == latest_active_competition_id)
         .where(Competition.id == latest_active_competition_id)
         .where(CompetitionChallenge.is_active.is_(True))
@@ -1824,22 +1760,15 @@ async def get_miner_screener_contests(
     if not batch_challenges_data:
         return ScreenerChallengesResponse(avg_score=None, challenges=[], total=0)
 
-    avg_score_result = await db.scalar(
-        select(V_MINER_SCREENER_STATS.c.avg_score)
-        .select_from(V_MINER_SCREENER_STATS)
-        .where(V_MINER_SCREENER_STATS.c.competition_id == latest_active_competition_id)
-        .where(V_MINER_SCREENER_STATS.c.miner_id == miner.id)
-        .limit(1)
-    )
-    avg_score = float(avg_score_result) if avg_score_result is not None else None
-
-    # Calculate miner's rank among all miners on screener challenges
+    # Calculate miner's avg_score and rank in a single query
     miner_rank = None
     total_miners_count = 0
+    avg_score = None
 
     ranked_subq = (
         select(
             V_MINER_SCREENER_STATS.c.miner_id.label("miner_id"),
+            V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
             func.row_number()
             .over(
                 order_by=(
@@ -1858,16 +1787,16 @@ async def get_miner_screener_contests(
 
     rank_row = (
         await db.execute(
-            select(ranked_subq.c.rank, ranked_subq.c.total_miners)
+            select(ranked_subq.c.avg_score, ranked_subq.c.rank, ranked_subq.c.total_miners)
             .where(ranked_subq.c.miner_id == miner.id)
             .limit(1)
         )
     ).first()
 
     if rank_row is not None:
+        avg_score = float(rank_row.avg_score) if rank_row.avg_score is not None else None
         miner_rank = int(rank_row.rank) if rank_row.rank is not None else None
         total_miners_count = int(rank_row.total_miners or 0)
-    mask_text = await _should_mask_challenge_text(db, latest_active_competition_id)
 
     # Get detailed questions for each challenge
     challenges = []
@@ -1875,7 +1804,6 @@ async def get_miner_screener_contests(
         batch_challenge_id,
         challenge_id,
         challenge_name,
-        challenge_text,
         competition_name,
         competition_id,
         compression_ratio,
@@ -1883,71 +1811,18 @@ async def get_miner_screener_contests(
         overall_score,
     ) in batch_challenges_data:
         # Get all questions for this challenge with answers and scores
-        questions_result = await db.execute(
-            select(
-                Question,
-                BatchQuestionAnswer.produced_answer,
-                Answer.answer.label("ground_truth"),
-                func.avg(BatchQuestionScore.score).label("avg_score"),
-                func.json_agg(BatchQuestionScore.details).label("score_details"),
-            )
-            .select_from(Question)
-            .outerjoin(
-                BatchQuestionAnswer,
-                (BatchQuestionAnswer.question_fk == Question.id)
-                & (BatchQuestionAnswer.batch_challenge_fk == batch_challenge_id),
-            )
-            .outerjoin(
-                Answer,
-                Answer.question_fk == Question.id,
-            )
-            .outerjoin(
-                BatchQuestionScore,
-                (BatchQuestionScore.question_fk == Question.id)
-                & (BatchQuestionScore.batch_challenge_fk == batch_challenge_id),
-            )
-            .where(Question.challenge_fk == challenge_id)
-            .group_by(
-                Question.id,
-                BatchQuestionAnswer.produced_answer,
-                Answer.answer,
-            )
-            .order_by(Question.id)
-        )
-
-        questions_data = questions_result.all()
-
-        questions = [
-            QuestionDetail(
-                question_id=question.id,
-                question_text=(
-                    TEXT_HIDDEN_PLACEHOLDER if mask_text else question.question
-                ),
-                miner_answer=TEXT_HIDDEN_PLACEHOLDER if mask_text else produced_answer,
-                ground_truth_answer=(
-                    TEXT_HIDDEN_PLACEHOLDER if mask_text else ground_truth
-                ),
-                score=float(avg_score_q) if avg_score_q is not None else None,
-                score_details=(
-                    score_details[0]
-                    if score_details and score_details[0] is not None
-                    else None
-                ),
-            )
-            for question, produced_answer, ground_truth, avg_score_q, score_details in questions_data
-        ]
 
         challenge_detail = ChallengeDetail(
             batch_challenge_id=batch_challenge_id,
             challenge_id=challenge_id,
             challenge_name=challenge_name,
-            challenge_text=TEXT_HIDDEN_PLACEHOLDER if mask_text else challenge_text,
+            challenge_text="",
             competition_name=competition_name,
             competition_id=competition_id,
             compression_ratio=compression_ratio,
             created_at=created_at,
             overall_score=float(overall_score) if overall_score is not None else None,
-            questions=questions,
+            questions=[],
         )
         challenges.append(challenge_detail)
 
@@ -1959,6 +1834,7 @@ async def get_miner_screener_contests(
         total=len(challenges),
     )
 
+    await _cache.set(f"miner_screener_{hotkey}", response, ttl=15)
     logger.info(
         f"[Frontend] Miner screener challenges: hotkey={hotkey}, "
         f"competition_id={latest_active_competition_id}, total={response.total}, "
@@ -1973,12 +1849,20 @@ async def list_validators(
     db: AsyncSession = Depends(get_db_session),
     _: None = Depends(_require_private_network),
 ) -> ValidatorsListResponse:
-    result = await db.execute(select(Validator).order_by(Validator.id.asc()))
+    _cached = await _cache.get("validators")
+    if _cached is not None:
+        return _cached
+    result = await db.execute(
+        select(Validator)
+        .where(Validator.is_archive.is_(False))
+        .order_by(Validator.id.asc())
+    )
     validators = [
         ValidatorListItem(
             id=validator.id,
             name=validator.ss58,
-            status=validator.current_status,
+            status="archive" if validator.is_archive else validator.current_status,
+            is_archive=bool(validator.is_archive),
             register_date=validator.created_at,
         )
         for validator in result.scalars().all()
@@ -1986,6 +1870,7 @@ async def list_validators(
 
     response = ValidatorsListResponse(validators=validators)
 
+    await _cache.set("validators", response, ttl=120)
     logger.info(
         f"[Frontend] Validators list: total={len(validators)}, "
         f"statuses={[v.status for v in validators]}"

@@ -1,20 +1,38 @@
-"""Run local sample tasks through miner.main and save compressed outputs."""
+"""Run miner code in Docker on all sample tasks using sandbox-equivalent settings.
+
+Usage:
+    python -m miner.run_local_tasks [path/to/miner_code.py] [--ratios 0.2,0.4]
+
+If no miner path is provided, uses miner/miner.py.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import subprocess
+import tempfile
+import uuid
 from pathlib import Path
 
-from miner import main as miner_main, target_token_count, token_count
+
+TASKS_PATH = Path(__file__).parent / "sample_tasks" / "context_compression_tasks.jsonl"
+RESULTS_DIR = Path(__file__).parent / "sample_results"
+SANDBOX_IMAGE = "sandbox-runner:local"
+SANDBOX_IMAGE_DIR = Path(__file__).resolve().parents[1] / "sandbox_service" / "sandbox_image"
+MAX_CODE_BYTES = 2 * 1024 * 1024
+TASK_TIMEOUT_SECONDS = 10.0
+CONTAINER_TIMEOUT_SECONDS = 60.0
+DEFAULT_RATIO = 0.2
 
 
 def _parse_ratios(raw: str) -> list[float]:
     ratios = [float(x.strip()) for x in raw.split(",") if x.strip()]
-    for r in ratios:
-        if r <= 0 or r > 1:
-            raise ValueError(f"Invalid ratio {r}. Use values in (0, 1].")
+    if not ratios:
+        raise ValueError("At least one compression ratio is required")
+    for ratio in ratios:
+        if ratio <= 0 or ratio > 1:
+            raise ValueError(f"Invalid ratio {ratio}. Use values in (0, 1].")
     return ratios
 
 
@@ -26,105 +44,182 @@ def _extract_text(task_obj: dict) -> str:
     return ""
 
 
-def run(tasks_path: Path, ratios: list[float], limit: int | None, results_dir: Path) -> None:
-    # Clear previous results
-    if results_dir.exists():
-        shutil.rmtree(results_dir)
-    results_dir.mkdir(parents=True)
+def _load_tasks() -> list[dict]:
+    tasks: list[dict] = []
+    for line in TASKS_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        tasks.append(json.loads(line))
+    return tasks
 
-    processed = 0
 
-    with tasks_path.open("r", encoding="utf-8") as f:
-        for i, line in enumerate(f, start=1):
-            if limit is not None and processed >= limit:
-                break
+def _ensure_sandbox_image() -> None:
+    if not SANDBOX_IMAGE_DIR.exists():
+        raise FileNotFoundError(f"Sandbox image directory not found: {SANDBOX_IMAGE_DIR}")
 
-            line = line.strip()
-            if not line:
-                continue
+    print(f"Building sandbox image (fresh): {SANDBOX_IMAGE}")
+    subprocess.run(
+        ["docker", "build", "--pull", "--no-cache", "-t", SANDBOX_IMAGE, str(SANDBOX_IMAGE_DIR)],
+        check=True,
+    )
 
-            task_obj = json.loads(line)
-            source_text = _extract_text(task_obj)
-            if not source_text:
-                print(f"Task {i}: skipped (no text field found)")
-                continue
 
-            challenge_name = task_obj.get("challenge_name", "task")
-            safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in challenge_name).strip("_")
-            if not safe_name:
-                safe_name = "task"
-            task_slug = f"task_{i:04d}_{safe_name}"
-            original_bytes = len(source_text.encode("utf-8"))
-            original_tokens = token_count(source_text)
+def _run_single_task(miner_code: str, text: str, ratio: float) -> tuple[str, str]:
+    with tempfile.TemporaryDirectory(prefix="soma-local-") as tmp:
+        tmp_path = Path(tmp)
+        input_dir = tmp_path / "input"
+        output_dir = tmp_path / "output"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.chmod(0o777)
 
-            print(f"\n=== Task {i}: {challenge_name} ===")
-            print(f"original_bytes={original_bytes}  original_tokens={original_tokens}")
+        (input_dir / "code.py").write_text(miner_code, encoding="utf-8")
+        (input_dir / "task.json").write_text(
+            json.dumps({"batch": [text], "compression_ratios": [ratio]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-            task_dir = results_dir / task_slug
-            task_dir.mkdir(parents=True, exist_ok=True)
+        container_name = f"soma-local-{uuid.uuid4().hex[:10]}"
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--network",
+            "none",
+            "--memory",
+            "2g",
+            "--cpus",
+            "1",
+            "--pids-limit",
+            "256",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=64m",
+            "--user",
+            "65534:65534",
+            "-e",
+            f"TASK_TIMEOUT={TASK_TIMEOUT_SECONDS}",
+            "-e",
+            "TIKTOKEN_CACHE_DIR=/tiktoken_cache",
+            "-e",
+            "INPUT_PATH=/sandbox/input/code.py",
+            "-e",
+            "TASK_PATH=/sandbox/input/task.json",
+            "-e",
+            "OUTPUT_PATH=/sandbox/output/output.json",
+            "-v",
+            f"{input_dir}:/sandbox/input:ro",
+            "-v",
+            f"{output_dir}:/sandbox/output:rw",
+            SANDBOX_IMAGE,
+            "python",
+            "/sandbox/run_code.py",
+        ]
 
-            for ratio in ratios:
-                compressed = miner_main(source_text, ratio)
-                target_tokens = target_token_count(source_text, ratio)
-                compressed_bytes = len(compressed.encode("utf-8"))
-                compressed_tokens = token_count(compressed)
-                realized_bytes = (compressed_bytes / original_bytes) if original_bytes else 0.0
-                realized_tokens = (compressed_tokens / original_tokens) if original_tokens else 0.0
-                verification = "OK" if compressed_tokens <= target_tokens else "FAIL"
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=CONTAINER_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, text=True)
+            return "", f"CONTAINER_TIMEOUT: {exc}"
 
-                ratio_label = f"ratio_{int(ratio * 100):02d}"
-                out_file = task_dir / f"{ratio_label}.txt"
-                out_file.write_text(compressed, encoding="utf-8")
+        if proc.returncode != 0:
+            return "", f"CONTAINER_EXIT_{proc.returncode}:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
 
-                print(
-                    f"  ratio={ratio:.2f} -> "
-                    f"target_tokens={target_tokens}  "
-                    f"tokens={compressed_tokens}/{original_tokens} (realized={realized_tokens:.3f}) [{verification}]  "
-                    f"bytes={compressed_bytes}/{original_bytes} (realized={realized_bytes:.3f})  "
-                    f"saved={out_file}"
-                )
+        output_path = output_dir / "output.json"
+        if not output_path.exists():
+            return "", "MISSING_OUTPUT_JSON"
 
-                if verification == "FAIL":
-                    raise ValueError(
-                        f"Token verification failed for task {i}, ratio {ratio:.2f}: "
-                        f"compressed_tokens={compressed_tokens} > target_tokens={target_tokens}"
-                    )
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        compressed = payload.get("compressed", [])
+        if not compressed:
+            return "", payload.get("error", "EMPTY_COMPRESSED_OUTPUT")
 
-            processed += 1
-
-    print(f"\nDone. Processed {processed} task(s). Results in: {results_dir}")
+        first = compressed[0]
+        if isinstance(first, list):
+            text_out = str(first[0] or "") if first else ""
+            logs = str(first[1] or "") if len(first) > 1 else ""
+            return text_out, logs
+        if isinstance(first, tuple):
+            text_out = str(first[0] or "") if first else ""
+            logs = str(first[1] or "") if len(first) > 1 else ""
+            return text_out, logs
+        return str(first or ""), ""
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run SOMA local sample tasks")
+    parser = argparse.ArgumentParser(
+        description="Run miner in Docker on all sample tasks using platform sandbox settings"
+    )
     parser.add_argument(
-        "--tasks",
-        type=Path,
-        default=Path(__file__).parent / "sample_tasks" / "context_compression_tasks.jsonl",
-        help="Path to JSONL sample tasks",
+        "miner_code",
+        nargs="?",
+        default=str(Path(__file__).parent / "miner.py"),
+        help="Path to miner python file (default: miner/miner.py)",
     )
     parser.add_argument(
         "--ratios",
         type=str,
-        default="0.2,0.4,0.6",
-        help="Comma-separated compression ratios (e.g. 0.2,0.4,0.6)",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Optional max number of tasks to run",
-    )
-    parser.add_argument(
-        "--results-dir",
-        type=Path,
-        default=Path(__file__).parent / "sample_results",
-        help="Directory to write compressed outputs (cleared on each run)",
+        default=str(DEFAULT_RATIO),
+        help="Comma-separated compression ratios, e.g. 0.2 or 0.2,0.4",
     )
     args = parser.parse_args()
 
+    miner_path = Path(args.miner_code).resolve()
     ratios = _parse_ratios(args.ratios)
-    run(args.tasks, ratios, args.limit, args.results_dir)
+
+    if not miner_path.exists():
+        raise FileNotFoundError(f"Miner code file not found: {miner_path}")
+
+    code_bytes = miner_path.read_bytes()
+    if len(code_bytes) > MAX_CODE_BYTES:
+        raise ValueError(
+            f"Miner code is too large: {len(code_bytes)} bytes (max {MAX_CODE_BYTES} bytes / 2MB)"
+        )
+
+    _ensure_sandbox_image()
+
+    tasks = _load_tasks()
+    if not tasks:
+        print("No tasks found.")
+        return
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    miner_code = code_bytes.decode("utf-8")
+
+    print(f"Miner file: {miner_path}")
+    print(f"Sandbox image: {SANDBOX_IMAGE}")
+    print(f"Compression ratios: {', '.join(f'{r:.2f}' for r in ratios)}")
+    print("Sandbox limits: timeout=10s/task, RAM=2GB, CPU=1, pids=256, network=none, read_only=true")
+
+    for idx, task in enumerate(tasks, start=1):
+        source_text = _extract_text(task)
+        if not source_text:
+            print(f"Task {idx}: skipped (no text)")
+            continue
+
+        for ratio in ratios:
+            compressed, logs = _run_single_task(miner_code, source_text, ratio)
+            ratio_suffix = int(ratio * 100)
+            out_file = RESULTS_DIR / f"task_{idx:04d}_r{ratio_suffix:02d}.txt"
+            out_file.write_text(compressed, encoding="utf-8")
+
+            print(
+                f"Task {idx} ratio={ratio:.2f}: output={len(compressed.encode('utf-8'))} bytes -> {out_file}"
+            )
+            if logs:
+                print(f"Task {idx} ratio={ratio:.2f} logs/error:\n{logs}\n")
 
 
 if __name__ == "__main__":

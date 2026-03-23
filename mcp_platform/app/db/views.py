@@ -29,6 +29,19 @@ V_MINER_SCREENER_STATS = sa.table(
     sa.column("first_upload_at"),
 )
 
+V_MINER_SCREENER_ELIGIBLE_RANKED = sa.table(
+    "v_miner_screener_eligible_ranked",
+    sa.column("competition_id"),
+    sa.column("miner_id"),
+    sa.column("script_id"),
+    sa.column("avg_score"),
+    sa.column("first_upload_at"),
+    sa.column("screener_scored"),
+    sa.column("screener_required"),
+    sa.column("rank"),
+    sa.column("total_eligible"),
+)
+
 V_MINER_COMPETITION_RANK = sa.table(
     "v_miner_competition_rank",
     sa.column("competition_id"),

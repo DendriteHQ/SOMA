@@ -230,7 +230,8 @@ class SandboxExecutor:
                         detach=True,
                         environment={
                             "TASK_TIMEOUT": str(timeout_per_task),
-                            "TIKTOKEN_CACHE_DIR": "/tiktoken_cache"
+                            "TIKTOKEN_CACHE_DIR": "/tiktoken_cache",
+                            "NLTK_DATA": "/usr/local/share/nltk_data",
                         },
                         volumes={
                             str(input_dir): {"bind": "/sandbox/input", "mode": "ro"},

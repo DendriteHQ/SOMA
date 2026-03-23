@@ -56,23 +56,26 @@ class RemoteSandboxManager:
         self,
         *,
         batch_id: str,
-        script_s3_key: str,
+        script_presigned_url: str,
         challenge_texts: list[str],
         compression_ratios: list[float | None],
         storage_uuids: list[str],
+        storage_presigned_urls: list[str],
     ) -> tuple[list[str], str | None]:
         """Execute a batch of challenges on remote sandbox service.
-        
+
         Args:
             batch_id: Unique batch identifier from ChallengeBatch (for logging)
-            script_s3_key: S3 key of the miner's challenge script
+            script_presigned_url: Presigned S3 URL (GET) for the miner's challenge script
             challenge_texts: List of texts to compress
             compression_ratios: Target compression ratios
-            storage_uuids: S3 storage UUIDs, one per challenge_text entry
-            
+            storage_uuids: S3 storage UUIDs used to read back results after execution
+            storage_presigned_urls: Presigned S3 URLs (PUT) for the sandbox to upload
+                compressed results, one per challenge_text entry
+
         Returns:
             Tuple of (compressed_texts, error_message). error_message is None on success.
-            
+
         Raises:
             RuntimeError: If platform is at capacity
             SandboxExecutionError: If sandbox execution fails
@@ -80,10 +83,11 @@ class RemoteSandboxManager:
         try:
             return await self._execute_remote_batch(
                 batch_id,
-                script_s3_key,
+                script_presigned_url,
                 challenge_texts,
                 compression_ratios,
                 storage_uuids,
+                storage_presigned_urls,
             )
         except RuntimeError:
             raise
@@ -96,36 +100,39 @@ class RemoteSandboxManager:
     async def _execute_remote_batch(
         self,
         batch_id: str,
-        script_s3_key: str,
+        script_presigned_url: str,
         challenge_texts: list[str],
         compression_ratios: list[float | None],
         storage_uuids: list[str],
+        storage_presigned_urls: list[str],
     ) -> tuple[list[str], str | None]:
         """Execute batch on remote sandbox service and retrieve results from S3.
-        
+
         Args:
             batch_id: Unique batch identifier from ChallengeBatch (for logging)
-            script_s3_key: S3 key of the miner's challenge script
+            script_presigned_url: Presigned S3 URL (GET) for the miner's challenge script
             challenge_texts: List of texts to compress
             compression_ratios: Target compression ratios
-            storage_uuids: S3 storage UUIDs, one per challenge_text entry
-            
+            storage_uuids: S3 storage UUIDs used to read back results after execution
+            storage_presigned_urls: Presigned S3 URLs (PUT) for the sandbox to upload results
+
         Returns:
             Tuple of (compressed_texts, error_message). error_message is None on success.
         """
         num_tasks = len(challenge_texts)
-        
+
         # Calculate timeouts based on number of tasks
         container_timeout = (self._timeout_per_task * num_tasks) + self._container_timeout_offset
         request_timeout = (self._timeout_per_task * num_tasks) + self._request_timeout_offset
-        
-        # Prepare request payload
+
+        # Prepare request payload — presigned URLs are used so the sandbox never
+        # needs direct S3 credentials; access is scoped to exactly these objects.
         payload = {
             "batch_id": batch_id,
-            "script_s3_key": script_s3_key,
+            "script_presigned_url": script_presigned_url,
             "challenge_texts": challenge_texts,
             "compression_ratios": compression_ratios,
-            "storage_uuids": storage_uuids,
+            "storage_presigned_urls": storage_presigned_urls,
             "timeout_per_task": self._timeout_per_task,
             "container_timeout": container_timeout,
         }

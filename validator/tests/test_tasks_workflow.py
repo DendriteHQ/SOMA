@@ -23,6 +23,7 @@ from soma_shared.contracts.validator.v1.messages import (
     Challenge,
     QA,
     QuestionScore,
+    ScoreSubmissionType,
 )
 from validator.validator import Validator
 
@@ -33,6 +34,8 @@ def _make_validator():
         platform_url="http://platform:8000",
         platform_signer_ss58="expected-signer",
         wallet=object(),
+        llm_provider_error_cooldown_seconds=600.0,
+        llm_scoring_error_cooldown_seconds=600.0,
     )
     validator.evaluator = Mock()
     validator.client = Mock()
@@ -116,6 +119,30 @@ def test_compute_backoff_interval_hybrid_policy():
             max_backoff_interval=max_backoff,
         )
         == 300.0
+    )
+
+
+def test_resolve_scoring_error_cooldown_seconds():
+    validator = _make_validator()
+
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("provider_insufficient_funds")
+        == 600.0
+    )
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("provider_auth_failed")
+        == 600.0
+    )
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("validator_scoring_failed")
+        == 600.0
+    )
+    assert validator._resolve_scoring_error_cooldown_seconds("unknown_error") == 0.0
+
+    validator.settings.llm_scoring_error_cooldown_seconds = 10.0
+    assert (
+        validator._resolve_scoring_error_cooldown_seconds("validator_scoring_failed")
+        == 30.0
     )
 
 
@@ -220,6 +247,53 @@ async def test_report_results_posts_to_platform():
     args, kwargs = mock_client.post.call_args
     assert args[0].endswith("/validator/score_challenges")
     assert kwargs["json"]["payload"]["batch_id"] == "batch-2"
+
+
+@pytest.mark.asyncio
+async def test_report_batch_error_posts_error_submission():
+    validator = _make_validator()
+    task = GetChallengesResponse(
+        batch_id="batch-err-1",
+        challenges=[
+            Challenge(
+                batch_challenge_id="ch-1",
+                compressed_text="task-x",
+                challenge_questions=[QA(question_id="q1", question="q1", answer="a1")],
+            ),
+        ],
+    )
+    response = Mock()
+    response.status_code = 200
+    response.raise_for_status = Mock()
+    signed = SignedEnvelope(
+        payload=PostChallengeScoresResponse(ok=True),
+        sig=Signature(signer_ss58="expected-signer", nonce="n", signature="s"),
+    )
+
+    with (
+        patch("validator.validator.generate_nonce", return_value="n"),
+        patch("validator.validator.sign_payload_model", return_value=signed.sig),
+        patch("validator.validator.verify_httpx_response", return_value=signed),
+    ):
+        mock_client = _mock_client(response)
+        validator.client = mock_client
+        await validator.report_batch_error(
+            task,
+            error_code="provider_insufficient_funds",
+            error_message="Insufficient funds",
+            error_details={"reason": "payment"},
+            retryable=True,
+        )
+
+    mock_client.post.assert_called_once()
+    args, kwargs = mock_client.post.call_args
+    assert args[0].endswith("/validator/score_challenges")
+    payload = kwargs["json"]["payload"]
+    assert payload["batch_id"] == "batch-err-1"
+    assert payload["question_scores"] == []
+    assert payload["submission_type"] == ScoreSubmissionType.ERROR.value
+    assert payload["error_code"] == "provider_insufficient_funds"
+    assert payload["retryable"] is True
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+import json
 import math
+import time
 import uuid
 import bittensor as bt
 
 from fastapi import APIRouter, HTTPException, status, Depends, Request
-from sqlalchemy import func, select, update, literal
+from sqlalchemy import delete, func, select, update, literal
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -22,6 +24,7 @@ from soma_shared.contracts.validator.v1.messages import (
     QA,
     PostChallengeScores,
     PostChallengeScoresResponse,
+    ScoreSubmissionType,
     GetBestMinersUidRequest,
     GetBestMinersUidResponse,
     MinerWeight,
@@ -33,11 +36,9 @@ from soma_shared.db.models.batch_compressed_text import BatchCompressedText
 from soma_shared.db.models.batch_question_answer import BatchQuestionAnswer
 from soma_shared.db.models.batch_question_score import BatchQuestionScore
 from soma_shared.db.models.challenge import Challenge
-from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.question import Question
-from soma_shared.db.models.script import Script
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
 from soma_shared.db.models.top_miner import TopMiner
@@ -59,23 +60,99 @@ from soma_shared.utils.verifier import verify_validator_stake_dep
 from app.api.deps import verify_request_dep_tz
 from app.core.config import settings
 from app.api.routes.utils import (
+    _build_top_screener_ranked_subq,
     _count_tokens,
     _get_request_row,
     _log_error_response,
     _select_miner_ss58,
     _get_validator,
     _get_active_competition_id,
-    _get_screener_challenges,
-    _get_ratio_count,
     _get_current_burn_state,
     _is_compressed_enough,
     get_script_s3_key,
 )
-from app.db.views import V_MINER_SCREENER_STATS
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
+
+_OPENROUTER_ERROR_MARKERS = (
+    "openrouter",
+    "openrouter.ai",
+    "/api/v1/chat/completions",
+)
+
+
+def _get_validator_fetch_block_cache(request: Request) -> dict[str, float]:
+    cache = getattr(request.app.state, "validator_fetch_block_until", None)
+    if cache is None:
+        # TODO: Move this process-local cache to a shared store (Redis) for multi-instance deployments.
+        cache = {}
+        request.app.state.validator_fetch_block_until = cache
+    return cache
+
+
+def _get_validator_fetch_block_remaining_secs(
+    request: Request,
+    validator_ss58: str,
+) -> float:
+    cache = _get_validator_fetch_block_cache(request)
+    blocked_until = cache.get(validator_ss58)
+    if blocked_until is None:
+        return 0.0
+    remaining = blocked_until - time.monotonic()
+    if remaining <= 0:
+        cache.pop(validator_ss58, None)
+        return 0.0
+    return remaining
+
+
+def _set_validator_fetch_block(
+    request: Request,
+    validator_ss58: str,
+    *,
+    cooldown_seconds: float | None = None,
+) -> float:
+    cooldown = max(
+        30.0,
+        cooldown_seconds or settings.validator_openrouter_error_cooldown_seconds,
+    )
+    now = time.monotonic()
+    blocked_until = now + cooldown
+    cache = _get_validator_fetch_block_cache(request)
+    previous_blocked_until = cache.get(validator_ss58)
+    if previous_blocked_until is not None:
+        blocked_until = max(blocked_until, previous_blocked_until)
+    cache[validator_ss58] = blocked_until
+    return blocked_until - now
+
+
+def _is_openrouter_error_submission(payload: PostChallengeScores) -> bool:
+    error_code = (payload.error_code or "").strip().lower()
+    if error_code.startswith("provider_"):
+        return True
+
+    parts: list[str] = []
+    if payload.error_message:
+        parts.append(str(payload.error_message))
+    if payload.error_details is not None:
+        try:
+            parts.append(json.dumps(payload.error_details))
+        except TypeError:
+            parts.append(str(payload.error_details))
+    haystack = " ".join(parts).lower()
+    return any(marker in haystack for marker in _OPENROUTER_ERROR_MARKERS)
+
+
+def _get_s3_storage(request: Request) -> S3BlobStorage:
+    """Get or create the shared S3 storage instance."""
+    s3_storage = getattr(request.app.state, "s3_storage", None)
+    if s3_storage is None:
+        if not settings.s3_bucket:
+            raise RuntimeError("S3_BUCKET must be set in configuration")
+        s3_storage = S3BlobStorage()
+        request.app.state.s3_storage = s3_storage
+    return s3_storage
 
 
 def _get_sandbox_manager(request: Request) -> RemoteSandboxManager:
@@ -86,14 +163,9 @@ def _get_sandbox_manager(request: Request) -> RemoteSandboxManager:
             raise RuntimeError(
                 "SANDBOX_SERVICE_URL must be set in configuration"
             )
-        if not settings.s3_bucket:
-            raise RuntimeError(
-                "S3_BUCKET must be set in configuration"
-            )
-        
-        s3_storage = S3BlobStorage()
+        s3_storage = _get_s3_storage(request)
         compressed_text_storage = CompressedTextStorage(s3_storage)
-        
+
         sandbox_manager = RemoteSandboxManager(
             sandbox_service_url=settings.sandbox_service_url,
             compressed_text_storage=compressed_text_storage,
@@ -195,6 +267,49 @@ async def _upsert_batch_scoring_rows(
         await db.execute(rollup_stmt)
 
 
+async def _release_batch_assignment_for_retry(
+    db: AsyncSession,
+    *,
+    batch_id: int,
+    validator_id: int,
+) -> tuple[int, int]:
+    """Release an assigned batch so it can be retried.
+
+    Returns:
+        tuple: (deleted_assignment_count, deleted_compressed_text_count)
+    """
+    batch_challenge_ids = list(
+        (
+            await db.execute(
+                select(BatchChallenge.id).where(
+                    BatchChallenge.challenge_batch_fk == batch_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    deleted_compressed_count = 0
+    if batch_challenge_ids:
+        compressed_delete_result = await db.execute(
+            delete(BatchCompressedText).where(
+                BatchCompressedText.batch_challenge_fk.in_(batch_challenge_ids)
+            )
+        )
+        deleted_compressed_count = compressed_delete_result.rowcount or 0
+
+    assignment_delete_result = await db.execute(
+        delete(BatchAssignment)
+        .where(BatchAssignment.challenge_batch_fk == batch_id)
+        .where(BatchAssignment.validator_fk == validator_id)
+        .where(BatchAssignment.done_at.is_(None))
+    )
+    deleted_assignment_count = assignment_delete_result.rowcount or 0
+
+    return deleted_assignment_count, deleted_compressed_count
+
+
 @router.post(
     "/validator/register",
     response_model=SignedEnvelope[ValidatorRegisterResponse],
@@ -259,6 +374,17 @@ async def register(
         select(Validator).where(Validator.ss58 == payload.validator_hotkey)
     )
     validator = result.scalars().first()
+    if validator is not None and validator.is_archive:
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_403_FORBIDDEN,
+            "Validator is archived",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Validator is archived",
+        )
 
     if validator is None:
         validator = Validator(
@@ -268,6 +394,7 @@ async def register(
             created_at=now,
             last_seen_at=now,
             current_status="registered",
+            is_archive=False,
         )
         db.add(validator)
         await db.flush()
@@ -375,6 +502,28 @@ async def request_challenge(
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Validator must have status 'working' to request challenges",
+                )
+            block_remaining_secs = _get_validator_fetch_block_remaining_secs(
+                request,
+                validator.ss58,
+            )
+            if block_remaining_secs > 0:
+                retry_after_secs = max(1, int(math.ceil(block_remaining_secs)))
+                logger.warning(
+                    "request_challenge_blocked_due_to_openrouter_error",
+                    extra={
+                        "request_id": request_id,
+                        "validator_ss58": validator.ss58,
+                        "retry_after_secs": retry_after_secs,
+                    },
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=(
+                        "Validator is temporarily blocked from fetching new assignments "
+                        "after recent OpenRouter scoring errors"
+                    ),
+                    headers={"Retry-After": str(retry_after_secs)},
                 )
             for attempt in range(max_attempts):
                 miner, script = await _select_miner_ss58(request, db)
@@ -566,17 +715,64 @@ async def request_challenge(
     try:
         script_s3_key = get_script_s3_key(miner.ss58, script)
         sandbox_manager = _get_sandbox_manager(request)
+        s3_storage = _get_s3_storage(request)
+
+        # Compute expiry long enough to cover sandbox execution + network overhead.
+        _presigned_expires_in = int(
+            settings.sandbox_timeout_per_task_seconds * len(challenge_texts)
+            + settings.sandbox_container_timeout_offset
+            + settings.sandbox_request_timeout_offset
+        ) + 60  # 60 s buffer
+
+        script_presigned_url: str = await s3_storage.generate_presigned_url(
+            script_s3_key, "get_object", expires_in=_presigned_expires_in
+        )
+        storage_keys = [f"compressed-texts/{su}.json" for su in storage_uuids]
+        storage_presigned_urls: list[str] = await s3_storage.generate_presigned_url(
+            storage_keys, "put_object", expires_in=_presigned_expires_in
+        )
+
         compressed_texts, sandbox_error = await sandbox_manager.run_batch(
             batch_id=str(challenge_batch.id),
-            script_s3_key=script_s3_key,
+            script_presigned_url=script_presigned_url,
             challenge_texts=challenge_texts,
             compression_ratios=compression_ratios,
             storage_uuids=storage_uuids,
+            storage_presigned_urls=storage_presigned_urls,
         )
         if sandbox_error:
             logger.error(
                 "request_challenge: sandbox returned error "
                 f"request_id={request_id} batch_id={challenge_batch.id}: {sandbox_error}"
+            )
+            deleted_assignment_count, deleted_compressed_count = (
+                await _release_batch_assignment_for_retry(
+                    db,
+                    batch_id=challenge_batch.id,
+                    validator_id=validator.id,
+                )
+            )
+            await db.commit()
+            logger.warning(
+                "request_challenge: released batch after sandbox error",
+                extra={
+                    "request_id": request_id,
+                    "batch_id": challenge_batch.id,
+                    "validator_ss58": validator.ss58,
+                    "sandbox_error": sandbox_error,
+                    "deleted_assignment_count": deleted_assignment_count,
+                    "deleted_compressed_count": deleted_compressed_count,
+                },
+            )
+            await _log_error_response(
+                request,
+                db,
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Sandbox execution failed; batch released for retry",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Sandbox execution failed; batch released for retry",
             )
         compressed_lengths = [len(text or "") for text in compressed_texts]
         logger.info(
@@ -615,6 +811,8 @@ async def request_challenge(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Sandbox execution failed: {exc}",
         ) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error(
             "request_challenge: error preparing sandbox batch "
@@ -850,17 +1048,6 @@ async def score_challenges(
 ) -> SignedEnvelope[PostChallengeScoresResponse]:
     request_id = getattr(request.state, "request_id", None)
     payload = _req.payload
-    if not payload.question_scores:
-        await _log_error_response(
-            request,
-            db,
-            status.HTTP_400_BAD_REQUEST,
-            "No question scores provided",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No question scores provided",
-        )
 
     try:
         batch_id = int(payload.batch_id)
@@ -919,6 +1106,205 @@ async def score_challenges(
         db,
         ss58=_req.sig.signer_ss58,
     )
+    assignment_result = await db.execute(
+        select(BatchAssignment)
+        .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
+        .where(BatchAssignment.validator_fk == validator.id)
+        .where(BatchAssignment.done_at.is_(None))
+    )
+    assignment = assignment_result.scalars().first()
+
+    if payload.submission_type == ScoreSubmissionType.ERROR:
+        if payload.question_scores:
+            await _log_error_response(
+                request,
+                db,
+                status.HTTP_400_BAD_REQUEST,
+                "question_scores must be empty when submission_type=error",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="question_scores must be empty when submission_type=error",
+            )
+
+        error_code = (payload.error_code or "").strip()
+        if not error_code:
+            await _log_error_response(
+                request,
+                db,
+                status.HTTP_400_BAD_REQUEST,
+                "error_code is required when submission_type=error",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="error_code is required when submission_type=error",
+            )
+        if error_code.startswith("miner_"):
+            await _log_error_response(
+                request,
+                db,
+                status.HTTP_400_BAD_REQUEST,
+                "miner_* error_code is not allowed for submission_type=error",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="miner_* error_code is not allowed for submission_type=error",
+            )
+
+        if _is_openrouter_error_submission(payload):
+            block_window_secs = _set_validator_fetch_block(
+                request,
+                validator.ss58,
+            )
+            logger.warning(
+                "score_challenges_openrouter_error_validator_blocked",
+                extra={
+                    "request_id": request_id,
+                    "validator_ss58": validator.ss58,
+                    "error_code": error_code,
+                    "retryable": payload.retryable,
+                    "block_window_secs": block_window_secs,
+                },
+            )
+
+        if assignment is None:
+            other_open_assignment = await db.scalar(
+                select(BatchAssignment.id)
+                .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
+                .where(BatchAssignment.done_at.is_(None))
+                .limit(1)
+            )
+            if other_open_assignment is not None:
+                await _log_error_response(
+                    request,
+                    db,
+                    status.HTTP_403_FORBIDDEN,
+                    "Batch is not assigned to this validator",
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Batch is not assigned to this validator",
+                )
+            # Idempotent response: assignment may already be released or completed.
+            logger.info(
+                "score_challenges_error_no_open_assignment",
+                extra={
+                    "request_id": request_id,
+                    "batch_id": payload.batch_id,
+                    "validator_ss58": _req.sig.signer_ss58,
+                    "error_code": error_code,
+                    "retryable": payload.retryable,
+                },
+            )
+        else:
+            try:
+                if payload.retryable:
+                    (
+                        deleted_assignment_count,
+                        deleted_compressed_count,
+                    ) = await _release_batch_assignment_for_retry(
+                        db,
+                        batch_id=batch_entry.id,
+                        validator_id=validator.id,
+                    )
+                    logger.warning(
+                        "score_challenges_retryable_error_released",
+                        extra={
+                            "request_id": request_id,
+                            "batch_id": payload.batch_id,
+                            "validator_ss58": _req.sig.signer_ss58,
+                            "error_code": error_code,
+                            "error_message": payload.error_message,
+                            "retryable": payload.retryable,
+                            "deleted_assignment_count": deleted_assignment_count,
+                            "deleted_compressed_count": deleted_compressed_count,
+                            "error_details": payload.error_details,
+                        },
+                    )
+                else:
+                    await db.execute(
+                        update(BatchAssignment)
+                        .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
+                        .where(BatchAssignment.validator_fk == validator.id)
+                        .where(BatchAssignment.done_at.is_(None))
+                        .values(done_at=datetime.now(timezone.utc))
+                    )
+                    logger.warning(
+                        "score_challenges_non_retryable_error_completed",
+                        extra={
+                            "request_id": request_id,
+                            "batch_id": payload.batch_id,
+                            "validator_ss58": _req.sig.signer_ss58,
+                            "error_code": error_code,
+                            "error_message": payload.error_message,
+                            "retryable": payload.retryable,
+                            "error_details": payload.error_details,
+                        },
+                    )
+                await db.commit()
+            except Exception as exc:
+                await db.rollback()
+                logger.exception(
+                    "score_challenges_error_mode_persistence_failed",
+                    extra={
+                        "request_id": request_id,
+                        "batch_id": payload.batch_id,
+                        "validator_ss58": _req.sig.signer_ss58,
+                        "error_code": error_code,
+                        "retryable": payload.retryable,
+                        "error": str(exc),
+                    },
+                )
+                await _log_error_response(
+                    request,
+                    db,
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    "Error submission persistence failed",
+                    exc=exc,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Error submission persistence failed",
+                ) from exc
+
+        response_payload = PostChallengeScoresResponse(ok=True)
+        response_nonce = generate_nonce()
+        response_sig = sign_payload_model(
+            response_payload, nonce=response_nonce, wallet=settings.wallet
+        )
+        response = SignedEnvelope(payload=response_payload, sig=response_sig)
+        log_payload = response_payload.model_dump(mode="json")
+        log_payload["batch_id"] = payload.batch_id
+        log_payload["submission_type"] = payload.submission_type.value
+        log_payload["error_code"] = payload.error_code
+        log_payload["retryable"] = payload.retryable
+        if request_id is not None:
+            log_payload["request_id"] = request_id
+        await log_validator_message(
+            db,
+            direction="response",
+            endpoint=request.url.path,
+            method=request.method,
+            signature=response_sig.signature,
+            nonce=response_sig.nonce,
+            request_id=request_id,
+            payload=log_payload,
+            status_code=status.HTTP_200_OK,
+        )
+        return response
+
+    if not payload.question_scores:
+        await _log_error_response(
+            request,
+            db,
+            status.HTTP_400_BAD_REQUEST,
+            "No question scores provided",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No question scores provided",
+        )
+
     pre_scored_batch_challenge_ids = set(
         (
             await db.execute(
@@ -1058,13 +1444,6 @@ async def score_challenges(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=detail,
         )
-    assignment_result = await db.execute(
-        select(BatchAssignment)
-        .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
-        .where(BatchAssignment.validator_fk == validator.id)
-        .where(BatchAssignment.done_at.is_(None))
-    )
-    assignment = assignment_result.scalars().first()
     if assignment is None:
         await _log_error_response(
             request,
@@ -1159,7 +1538,7 @@ async def score_challenges(
             score_rows=score_rows,
             rollup_rows=rollup_rows,
         )
-        validator.current_status = "active"
+        validator.current_status = "working"
         await db.execute(
             update(BatchAssignment)
             .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
@@ -1292,118 +1671,64 @@ async def get_best_miners(
                 miners = [MinerWeight(uid=0, weight=1.0)]
                 response_payload = GetBestMinersUidResponse(miners=miners)
             else:
-                # Get top miners from screener scores (buffer based on total uploads)
+                # Get top miners from screener ranking.
                 top_screener_miners = []
                 try:
                     active_competition_id = current_competition_id
-                    screener_challenges, screener_challenges_count = (
-                        await _get_screener_challenges(db, active_competition_id)
+                    top_screener_scripts = float(
+                        getattr(settings, "top_screener_scripts", 0.2)
+                    )
+                    ranked_top_subq = _build_top_screener_ranked_subq(
+                        active_competition_id,
+                        top_fraction=top_screener_scripts,
                     )
                     logger.info(
                         "get_best_miners_screener_context",
                         extra={
                             "request_id": request_id,
                             "active_competition_id": active_competition_id,
-                            "screener_challenges_count": screener_challenges_count,
+                            "top_screener_scripts": top_screener_scripts,
                         },
                     )
 
-                    if screener_challenges_count > 0:
-                        # Count total unique uploads in competition
-                        total_uploads = await db.scalar(
+                    if ranked_top_subq is not None:
+                        qualified_miners_result = await db.execute(
                             select(
-                                func.count(func.distinct(MinerUpload.script_fk))
+                                Miner.ss58,
+                                ranked_top_subq.c.rank.label("rank"),
                             )
-                            .select_from(MinerUpload)
-                            .join(Script, Script.id == MinerUpload.script_fk)
-                            .join(Miner, Miner.id == Script.miner_fk)
-                            .where(MinerUpload.competition_fk == active_competition_id)
+                            .select_from(ranked_top_subq)
+                            .join(Miner, Miner.id == ranked_top_subq.c.miner_id)
                             .where(Miner.miner_banned_status.is_(False))
+                            .order_by(ranked_top_subq.c.rank.asc())
                         )
-                        total_uploads = int(total_uploads or 0)
 
-                        if total_uploads > 0:
-                            # Calculate buffer size as % of total uploads
-                            top_screener_scripts = float(
-                                getattr(settings, "top_screener_scripts", 0.2)
-                            )
-                            buffer_size = max(
-                                1, int(math.ceil(total_uploads * top_screener_scripts))
-                            )
+                        qualified_miners = [
+                            (str(row.ss58), int(row.rank))
+                            for row in qualified_miners_result
+                        ]
+                        logger.info(
+                            "get_best_miners_screener_scores",
+                            extra={
+                                "request_id": request_id,
+                                "qualified_miners_count": len(qualified_miners),
+                            },
+                        )
+
+                        if qualified_miners:
+                            # Map to UIDs
+                            for ss58, _rank in qualified_miners:
+                                uid = hotkey_to_uid.get(str(ss58))
+                                if uid is not None:
+                                    top_screener_miners.append(uid)
                             logger.info(
-                                "get_best_miners_screener_buffer",
+                                "get_best_miners_screener_selected",
                                 extra={
                                     "request_id": request_id,
-                                    "total_uploads": total_uploads,
-                                    "top_screener_scripts": top_screener_scripts,
-                                    "buffer_size": buffer_size,
+                                    "top_screener_miners": top_screener_miners,
+                                    "selected_count": len(top_screener_miners),
                                 },
                             )
-
-                            ratio_count = await _get_ratio_count(
-                                db, active_competition_id
-                            )
-                            screener_scores_result = await db.execute(
-                                select(
-                                    Miner.ss58,
-                                    V_MINER_SCREENER_STATS.c.screener_scored.label(
-                                        "scored_count"
-                                    ),
-                                    V_MINER_SCREENER_STATS.c.avg_score.label("avg_score"),
-                                    V_MINER_SCREENER_STATS.c.first_upload_at.label(
-                                        "earliest_upload"
-                                    ),
-                                )
-                                .select_from(V_MINER_SCREENER_STATS)
-                                .join(
-                                    Miner,
-                                    Miner.id == V_MINER_SCREENER_STATS.c.miner_id,
-                                )
-                                .where(
-                                    V_MINER_SCREENER_STATS.c.competition_id
-                                    == active_competition_id
-                                )
-                                .where(
-                                    V_MINER_SCREENER_STATS.c.screener_scored
-                                    >= screener_challenges_count * ratio_count
-                                )
-                                .where(Miner.miner_banned_status.is_(False))
-                            )
-
-                            screener_scores = [
-                                (row.ss58, float(row.avg_score), row.earliest_upload)
-                                for row in screener_scores_result
-                            ]
-                            logger.info(
-                                "get_best_miners_screener_scores",
-                                extra={
-                                    "request_id": request_id,
-                                    "ratio_count": ratio_count,
-                                    "screener_scores_count": len(screener_scores),
-                                },
-                            )
-
-                            if screener_scores:
-                                # Sort by score descending, then by upload time ascending (earlier = better)
-                                screener_scores.sort(key=lambda x: (-x[1], x[2]))
-
-                                # Take top N miners up to buffer_size
-                                top_miners = screener_scores[:buffer_size]
-
-                                # Map to UIDs
-                                for ss58, score, upload_time in top_miners:
-                                    uid = hotkey_to_uid.get(str(ss58))
-                                    if uid is not None:
-                                        top_screener_miners.append(uid)
-                                logger.info(
-                                    "get_best_miners_screener_selected",
-                                    extra={
-                                        "request_id": request_id,
-                                        "top_screener_miners": top_screener_miners,
-                                        "buffer_size": buffer_size,
-                                        "selected_count": len(top_screener_miners),
-                                    },
-                                )
                 except Exception as exc:
                     logger.warning(
                         "get_best_miners_screener_calculation_failed",

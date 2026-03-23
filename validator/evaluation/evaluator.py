@@ -10,6 +10,21 @@ from .llm_scorer import Scoring, LLMInsufficientFundsError
 from soma_shared.contracts.validator.v1.messages import GetChallengesResponse, QuestionScore
 
 
+class BatchScoringError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        error_code: str,
+        message: str,
+        retryable: bool = True,
+        details: dict | None = None,
+    ):
+        super().__init__(message)
+        self.error_code = error_code
+        self.retryable = retryable
+        self.details = details or {}
+
+
 class Evaluator(AbstractEvaluator):
     """
     Base class for evaluators.
@@ -90,22 +105,26 @@ class Evaluator(AbstractEvaluator):
                 except Exception as exc:
                     logging.error(f"Scoring failed for task index={index}: {exc}", exc_info=True)
                     if isinstance(exc, LLMInsufficientFundsError):
-                        logging.critical(
-                            "OpenRouter insufficient funds detected during scoring; exiting validator process."
-                        )
-                        logging.shutdown()
-                        os._exit(1)
-                    # Add QuestionScore with 0.0 for each question on error
-                    for qa in challenge.challenge_questions:
-                        question_scores.append(
-                            QuestionScore(
-                                batch_challenge_id=challenge.batch_challenge_id,
-                                question_id=qa.question_id,
-                                produced_answer="",
-                                score=0.0,
-                                details={"reason": "scoring_error", "error": str(exc)}
-                            )
-                        )
+                        raise BatchScoringError(
+                            error_code="provider_insufficient_funds",
+                            message="OpenRouter insufficient funds detected during scoring",
+                            retryable=True,
+                            details={
+                                "task_index": index,
+                                "batch_challenge_id": challenge.batch_challenge_id,
+                                "error": str(exc),
+                            },
+                        ) from exc
+                    raise BatchScoringError(
+                        error_code="validator_scoring_failed",
+                        message=f"Scoring failed at task index={index}: {exc}",
+                        retryable=True,
+                        details={
+                            "task_index": index,
+                            "batch_challenge_id": challenge.batch_challenge_id,
+                            "error": str(exc),
+                        },
+                    ) from exc
             
             logging.info(f"[Evaluator] Generated {len(question_scores)} question scores")
             

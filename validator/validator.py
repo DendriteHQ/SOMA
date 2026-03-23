@@ -19,6 +19,7 @@ from soma_shared.contracts.validator.v1.messages import (
     HeartbeatResponse,
     PostChallengeScores,
     PostChallengeScoresResponse,
+    ScoreSubmissionType,
     ValidatorRegisterRequest,
     ValidatorRegisterResponse,
     GetBestMinersUidRequest,
@@ -33,10 +34,11 @@ import logging
 import httpx
 from soma_shared.utils.signer import sign_payload_model, generate_nonce
 from validator.chain.weigt_setter import WeightSetter
-from validator.evaluation.evaluator import Evaluator
+from validator.evaluation.evaluator import BatchScoringError, Evaluator
 from validator.evaluation.llm_scorer import LLMClient, LLMInsufficientFundsError
 from soma_shared.utils.verifier import verify_httpx_response
 import bittensor as bt
+
 
 def configure_logging() -> None:
     root = logging.getLogger()
@@ -56,6 +58,7 @@ class Validator(AbstractValidator):
         self.settings = self.init_settings()
         self.verify_openrouter_startup()
         self._last_fetch_cause = "unknown"
+        self._provider_degraded_until = 0.0
         self.evaluator = Evaluator(settings=self.settings)
         self.weight_setter = WeightSetter(
             netuid=self.settings.netuid, subtensor=self.settings.subtensor
@@ -448,6 +451,15 @@ class Validator(AbstractValidator):
     def _loop_tick_interval(base_poll_interval: float) -> float:
         return max(0.5, min(base_poll_interval, 1.0))
 
+    def _resolve_scoring_error_cooldown_seconds(self, error_code: str) -> float:
+        if error_code == "provider_insufficient_funds":
+            return max(30.0, self.settings.llm_provider_error_cooldown_seconds)
+        if error_code.startswith("provider_"):
+            return max(30.0, self.settings.llm_scoring_error_cooldown_seconds)
+        if error_code == "validator_scoring_failed":
+            return max(30.0, self.settings.llm_scoring_error_cooldown_seconds)
+        return 0.0
+
     async def report_results(self, task, results):
         try:
             payload = PostChallengeScores(
@@ -490,6 +502,60 @@ class Validator(AbstractValidator):
         except Exception as e:
             logging.error(f"Exception during reporting results: {e}", exc_info=True)
 
+    async def report_batch_error(
+        self,
+        task: GetChallengesResponse,
+        *,
+        error_code: str,
+        error_message: str,
+        error_details: dict | None = None,
+        retryable: bool = True,
+    ) -> None:
+        try:
+            payload = PostChallengeScores(
+                batch_id=task.batch_id,
+                question_scores=[],
+                submission_type=ScoreSubmissionType.ERROR,
+                error_code=error_code,
+                error_message=error_message,
+                error_details=error_details,
+                retryable=retryable,
+            )
+            nonce = generate_nonce()
+            signature = sign_payload_model(
+                payload=payload, nonce=nonce, wallet=self.settings.wallet
+            )
+            signed_payload = SignedEnvelope(payload=payload, sig=signature)
+            logging.warning(
+                "Reporting batch error for batch_id=%s code=%s retryable=%s",
+                task.batch_id,
+                error_code,
+                retryable,
+            )
+            response = await self.client.post(
+                f"{self.settings.platform_url}/validator/score_challenges",
+                json=signed_payload.model_dump(),
+            )
+            response.raise_for_status()
+            verify_httpx_response(
+                response,
+                PostChallengeScoresResponse,
+                expected_key=self.settings.platform_signer_ss58,
+            )
+            logging.info(
+                "Successfully reported batch error for batch_id=%s code=%s",
+                task.batch_id,
+                error_code,
+            )
+        except Exception as exc:
+            logging.error(
+                "Failed to report batch error for batch_id=%s code=%s: %s",
+                getattr(task, "batch_id", "unknown"),
+                error_code,
+                exc,
+                exc_info=True,
+            )
+
     def has_eval_capacity(self) -> bool:
         return self.evaluator.has_eval_capacity()
 
@@ -497,8 +563,6 @@ class Validator(AbstractValidator):
         # Initialize async resources in the correct event loop
         await self.async_init()
         
-        # TODO change this for a blocks from chain instead of mocked time intervals
-        weight_interval_seconds = 360 * 12
         base_poll_interval = self.settings.task_poll_interval_seconds
         max_backoff_interval = self.settings.max_backoff_interval_seconds
         backoff_multiplier = self.settings.backoff_multiplier
@@ -509,7 +573,7 @@ class Validator(AbstractValidator):
         fetch_cooldown_until = 0.0
 
         in_flight: set[asyncio.Task] = set()
-        last_weight_set = 0.0
+        last_weight_set_block: int | None = None
         weight_task: asyncio.Task | None = None
 
         async def process_task(task: GetChallengesResponse) -> None:
@@ -519,40 +583,82 @@ class Validator(AbstractValidator):
                 if results:
                     logging.info(f"Reporting results for task {task.batch_id}")
                     await self.report_results(task, results)
-
+            except BatchScoringError as exc:
+                await self.report_batch_error(
+                    task,
+                    error_code=exc.error_code,
+                    error_message=str(exc),
+                    error_details=exc.details,
+                    retryable=exc.retryable,
+                )
+                cooldown = self._resolve_scoring_error_cooldown_seconds(exc.error_code)
+                if cooldown > 0:
+                    self._provider_degraded_until = max(
+                        self._provider_degraded_until,
+                        time.monotonic() + cooldown,
+                    )
+                    logging.warning(
+                        "Fetch cooldown activated for %.1fs due to scoring error code=%s",
+                        cooldown,
+                        exc.error_code,
+                    )
             except Exception as exc:
                 logging.error(
                     f"Failed to process task {getattr(task, 'batch_id', 'unknown')}: {exc}",
                     exc_info=True,
+                )
+                await self.report_batch_error(
+                    task,
+                    error_code="validator_processing_error",
+                    error_message=f"Task processing failed: {exc}",
+                    error_details={"error": str(exc)},
+                    retryable=True,
                 )
 
         try:
             logging.info("Validator run loop started")
             while True:
                 now = time.monotonic()
-                # TODO Change to blocks operation
-                if (
-                    weight_interval_seconds > 0
-                    and (now - last_weight_set) >= weight_interval_seconds
-                ):
-                    if weight_task is None or weight_task.done():
-                        logging.info("Creating weight setting task")
-                        weight_task = asyncio.create_task(self.set_weights())
-                        last_weight_set = now
+
+                try:
+                    current_block = await self.settings.subtensor.get_current_block()
+                    if last_weight_set_block is None:
+                        last_weight_set_block = current_block
+                        logging.info(f"Initialized last_weight_set_block={current_block}")
+                    blocks_since_last = current_block - last_weight_set_block
+                    if blocks_since_last >= self.settings.weight_block_interval:
+                        if weight_task is None or weight_task.done():
+                            logging.info(
+                                f"Block {current_block}: {blocks_since_last} blocks since last weight set "
+                                f"(interval={self.settings.weight_block_interval}), setting weights"
+                            )
+                            weight_task = asyncio.create_task(self.set_weights())
+                            last_weight_set_block = current_block
+                except Exception as block_exc:
+                    logging.warning(f"Failed to fetch current block: {block_exc}", exc_info=True)
 
                 in_flight = {task for task in in_flight if not task.done()}
                 has = self.has_eval_capacity()
-                max_in_flight = (
-                    1 if consecutive_ratio_failures > 0 else self.settings.max_concurrent_evaluations
-                )
+                max_in_flight = self.settings.max_concurrent_evaluations
                 fetch_due = now >= fetch_cooldown_until
-                can_fetch = has and len(in_flight) < max_in_flight and fetch_due
+                provider_ready = now >= self._provider_degraded_until
+                can_fetch = (
+                    has
+                    and len(in_flight) < max_in_flight
+                    and fetch_due
+                    and provider_ready
+                )
                 cooldown_remaining = max(0.0, fetch_cooldown_until - now)
+                provider_cooldown_remaining = max(
+                    0.0, self._provider_degraded_until - now
+                )
                 logging.info(
                     f"Has evaluation capacity: {has}, in_flight tasks: {len(in_flight)}, "
                     f"max_in_flight: {max_in_flight}, can_fetch: {can_fetch}, "
                     f"ratio_fail_streak: {consecutive_ratio_failures}, "
-                    f"fetch_due: {fetch_due}, cooldown_remaining: {cooldown_remaining:.1f}s"
+                    f"fetch_due: {fetch_due}, cooldown_remaining: {cooldown_remaining:.1f}s, "
+                    f"provider_ready: {provider_ready}, "
+                    f"provider_cooldown_remaining: {provider_cooldown_remaining:.1f}s"
                 )
                 if can_fetch:
                     logging.info("Fetching tasks from platform...")
@@ -574,18 +680,12 @@ class Validator(AbstractValidator):
                         if cause == "compression_ratio_all_failed":
                             consecutive_ratio_failures += 1
                             consecutive_no_tasks = 0
-                            current_poll_interval = self._compute_backoff_interval(
-                                streak=consecutive_ratio_failures,
-                                base_poll_interval=base_poll_interval,
-                                backoff_multiplier=backoff_multiplier,
-                                max_backoff_interval=max_backoff_interval,
-                            )
+                            current_poll_interval = base_poll_interval
                             logging.info(
                                 "All challenges failed compression ratio check "
-                                f"(attempt {consecutive_ratio_failures}), backing off to "
-                                f"{current_poll_interval:.1f}s and limiting intake concurrency to 1"
+                                f"(attempt {consecutive_ratio_failures}), retrying immediately"
                             )
-                            fetch_cooldown_until = time.monotonic() + current_poll_interval
+                            fetch_cooldown_until = now
                         else:
                             # No tasks available (503 response) - apply standard backoff
                             consecutive_no_tasks += 1
