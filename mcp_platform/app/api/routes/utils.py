@@ -685,7 +685,8 @@ async def _select_miner_ss58(
                     "_select_miner_ss58: No screener challenges found for evaluation"
                 )
                 return None, None
-            top_scripts_subq = _build_top_screener_scripts_subq(
+            top_scripts_subq = await _build_top_screener_scripts_subq(
+                db,
                 active_competition_id,
                 top_fraction,
             )
