@@ -133,19 +133,48 @@ def _miner_status(
     has_script: bool = False,
     miner_banned_status: bool = False,
 ) -> str:
-    """Determine miner status based on challenges and scores.
+    """Determine miner status based on assigned challenges, scores, and role.
 
     Args:
-        total_challenges: Total number of active challenges in the competition
-        miner_challenges: Number of challenges assigned to the miner
-        scored_challenges: Number of challenges that have been scored
-        has_script: Whether miner has uploaded a script for active competition
+        competition_challenges: Total number of active competition challenges
+            for which this miner could receive scores, or None if unknown.
+        screener_challenges: Total number of screener challenges assigned to
+            this miner, or None if the miner has no screener role/assignments.
+        pending_assignments_competition: Number of pending competition
+            assignments (unscored competition challenges) for this miner, or
+            None if not applicable.
+        pending_assignments_screener: Number of pending screener assignments
+            (unscored screener challenges) for this miner, or None if not
+            applicable.
+        scored_screened_challenges: Number of screener challenges that have
+            been scored for this miner, or None if screener scoring does not
+            apply.
+        scored_competition_challanges: Number of competition challenges that
+            have been scored for this miner, or None if competition scoring
+            does not apply.
+        is_in_top_screener: Whether this miner is in the top screener set for
+            the current competition.
+        has_script: Whether the miner has uploaded a script for the active
+            competition.
+        miner_banned_status: Whether the miner is currently banned from
+            participating in the competition.
 
     Returns:
-        - 'scored': All competition challenges have been scored for this miner
-        - 'evaluating': Some challenges scored, some pending
-        - 'in queue': Miner uploaded script but waiting for challenges or scoring
-        - 'idle': No script uploaded
+        One of:
+            - 'banned': Miner is banned from participating.
+            - 'idle': Miner has not uploaded a script.
+            - 'scored': All competition challenges have been scored for this
+              miner.
+            - 'evaluating': The miner has competition challenges that are
+              pending scoring.
+            - 'screening': The miner is actively screening challenges (has
+              pending or partially scored screener assignments).
+            - 'qualified': The miner has completed screener challenges, is in
+              the top screener set, and has no competition work in progress.
+            - 'not qualified': The miner has completed screener challenges but
+              is not in the top screener set.
+            - 'in queue': Miner has uploaded a script but has no active
+              competition or screener work in progress.
     """
     if miner_banned_status:
         return "banned"
