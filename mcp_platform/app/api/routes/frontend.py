@@ -141,7 +141,7 @@ async def frontend_summary(
     active_competition_challenges_count = 0
 
     if comp_id is not None:
-        # Miners = distinct ss58 presente w MV_MINER_STATUS dla tego comp
+        # Miners = distinct ss58 present in MV_MINER_STATUS for this competition
         miners_count = int(
             await db.scalar(
                 select(func.count())
