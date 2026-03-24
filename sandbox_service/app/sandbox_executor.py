@@ -129,7 +129,7 @@ class SandboxExecutor:
         compression_ratios: List[Optional[float]],
         timeout_per_task: float,
         container_timeout: float,
-    ) -> tuple[List[str], str | None]:
+    ) -> tuple[List[str], List[str | None]]:
         """Execute a batch of compression tasks.
         
         Args:
@@ -140,7 +140,8 @@ class SandboxExecutor:
             container_timeout: Global timeout for entire execution
             
         Returns:
-            Tuple of (compressed_texts, error_message). error_message is None on full success.
+            Tuple of (compressed_texts, task_errors). task_errors has one entry per
+            challenge_text: None if the task succeeded, error string if it failed.
         """
         import asyncio
         
@@ -160,7 +161,7 @@ class SandboxExecutor:
         compression_ratios: List[Optional[float]],
         timeout_per_task: float,
         container_timeout: float,
-    ) -> tuple[List[str], str | None]:
+    ) -> tuple[List[str], List[str | None]]:
         """Synchronous batch execution.
         
         Args:
@@ -171,7 +172,8 @@ class SandboxExecutor:
             container_timeout: Global timeout for entire execution
             
         Returns:
-            Tuple of (compressed_texts, error_message). error_message is None on full success.
+            Tuple of (compressed_texts, task_errors). task_errors has one entry per
+            challenge_text: None if the task succeeded, error string if it failed.
         """
         import asyncio
         try:
@@ -182,7 +184,7 @@ class SandboxExecutor:
                 exc,
                 exc_info=True,
             )
-            return [""] * len(challenge_texts), str(exc)
+            return [""] * len(challenge_texts), [str(exc)] * len(challenge_texts)
         
         sandbox_id = f"sandbox-{uuid.uuid4().hex}"
         
@@ -277,8 +279,7 @@ class SandboxExecutor:
                 # Read output
                 output_path = output_dir / "output.json"
                 responses: List[str] = []
-
-                task_error: str | None = None
+                task_errors: List[str | None] = []
 
                 if output_path.exists():
                     try:
@@ -298,17 +299,19 @@ class SandboxExecutor:
                                         text = str(text_raw or "")
                                     responses.append(text)
                                     if text:
+                                        task_errors.append(None)
                                         logger.info("Output %d: %d bytes", idx, len(text))
                                     else:
+                                        err = task_logs if task_logs else "ERROR: empty result"
+                                        task_errors.append(err)
                                         logger.warning(
                                             "Output %d: empty result. Task logs:\n%s",
                                             idx,
                                             task_logs or "(no logs)",
                                         )
-                                        if task_logs and task_error is None:
-                                            task_error = task_logs
                                 else:
                                     responses.append(str(item or ""))
+                                    task_errors.append(None if item else "ERROR: empty result")
                     except Exception as exc:
                         logger.error(
                             "Failed to parse output.json: %s",
@@ -316,8 +319,10 @@ class SandboxExecutor:
                             exc_info=True,
                         )
                         responses = []
+                        task_errors = []
                 else:
                     logger.warning("output.json does not exist at %s", output_path)
+                    task_errors = ["ERROR: no output"] * len(challenge_texts)
 
                 # Normalize result length
                 if len(responses) < len(challenge_texts):
@@ -325,7 +330,13 @@ class SandboxExecutor:
                 elif len(responses) > len(challenge_texts):
                     responses = responses[:len(challenge_texts)]
 
-                return responses, task_error
+                # Normalize task_errors length to match challenge_texts
+                if len(task_errors) < len(challenge_texts):
+                    task_errors.extend(["ERROR: no output"] * (len(challenge_texts) - len(task_errors)))
+                elif len(task_errors) > len(challenge_texts):
+                    task_errors = task_errors[:len(challenge_texts)]
+
+                return responses, task_errors
             finally:
                 self._cleanup_limited_fs(fs_img, output_dir)
 

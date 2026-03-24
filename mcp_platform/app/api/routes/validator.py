@@ -732,7 +732,7 @@ async def request_challenge(
             storage_keys, "put_object", expires_in=_presigned_expires_in
         )
 
-        compressed_texts, sandbox_error = await sandbox_manager.run_batch(
+        compressed_texts, task_errors = await sandbox_manager.run_batch(
             batch_id=str(challenge_batch.id),
             script_presigned_url=script_presigned_url,
             challenge_texts=challenge_texts,
@@ -740,39 +740,18 @@ async def request_challenge(
             storage_uuids=storage_uuids,
             storage_presigned_urls=storage_presigned_urls,
         )
-        if sandbox_error:
-            logger.error(
-                "request_challenge: sandbox returned error "
-                f"request_id={request_id} batch_id={challenge_batch.id}: {sandbox_error}"
-            )
-            deleted_assignment_count, deleted_compressed_count = (
-                await _release_batch_assignment_for_retry(
-                    db,
-                    batch_id=challenge_batch.id,
-                    validator_id=validator.id,
-                )
-            )
-            await db.commit()
+        failed_task_count = sum(1 for e in task_errors if e)
+        if failed_task_count:
             logger.warning(
-                "request_challenge: released batch after sandbox error",
+                "request_challenge: sandbox returned %d/%d task errors, "
+                "continuing with available results",
+                failed_task_count,
+                len(task_errors),
                 extra={
                     "request_id": request_id,
                     "batch_id": challenge_batch.id,
                     "validator_ss58": validator.ss58,
-                    "sandbox_error": sandbox_error,
-                    "deleted_assignment_count": deleted_assignment_count,
-                    "deleted_compressed_count": deleted_compressed_count,
                 },
-            )
-            await _log_error_response(
-                request,
-                db,
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "Sandbox execution failed; batch released for retry",
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Sandbox execution failed; batch released for retry",
             )
         compressed_lengths = [len(text or "") for text in compressed_texts]
         logger.info(
@@ -842,6 +821,7 @@ async def request_challenge(
     challenges_response = []
     for idx, (batch_challenge, challenge) in enumerate(response_items):
         compressed_text = compressed_texts[idx] if idx < len(compressed_texts) else ""
+        task_error = task_errors[idx] if idx < len(task_errors) else None
         ratio = (
             float(batch_challenge.compression_ratio)
             if batch_challenge.compression_ratio is not None
@@ -908,8 +888,8 @@ async def request_challenge(
                         validator_fk=validator.id,
                         score=0.0,
                         details=(
-                            {"reason": "sandbox_error", "error": sandbox_error}
-                            if sandbox_error
+                            {"reason": "sandbox_error", "error": task_error}
+                            if task_error
                             else {"reason": "not_compressed_enough"}
                         ),
                     )
