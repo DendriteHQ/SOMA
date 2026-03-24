@@ -16,6 +16,7 @@ from soma_shared.contracts.api.v1.frontend import (
     CurrentCompetitionTimeframeResponse,
     FrontendSummaryResponse,
     MinerChallengesResponse,
+    MinerCompetitionItem,
     MinerDetail,
     MinerDetailResponse,
     MinerListItem,
@@ -113,6 +114,34 @@ async def get_current_competition_timeframe(
     )
 
     return response
+
+
+@router.get(
+    "/competitions-list",
+    response_model=list[MinerCompetitionItem],
+)
+async def get_active_competitions(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    _: None = Depends(_require_private_network),
+) -> list[MinerCompetitionItem]:
+    # Temporary endpoint for competition list - needs to be changed in the future
+    rows = (
+        await db.execute(
+            select(
+                V_ACTIVE_COMPETITION.c.competition_id,
+                V_ACTIVE_COMPETITION.c.competition_name,
+            ).order_by(V_ACTIVE_COMPETITION.c.competition_id)
+        )
+    ).all()
+
+    return [
+        MinerCompetitionItem(
+            competition_id=int(row.competition_id),
+            competition_name=row.competition_name,
+        )
+        for row in rows
+    ]
 
 
 @router.get("/summary", response_model=FrontendSummaryResponse)
