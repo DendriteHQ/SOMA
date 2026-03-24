@@ -386,7 +386,6 @@ async def get_miner_by_competition(
                 MV_MINER_COMPETITION_STATS.c.rank,
                 MV_MINER_SCREENER_STATS.c.total_screener_score,
                 MV_MINER_SCREENER_STATS.c.screener_rank.label("screener_rank_stats"),
-                MV_MINER_SCREENER_STATS.c.total_screener_miners,
             )
             .select_from(MV_MINER_STATUS)
             .outerjoin(
@@ -763,7 +762,6 @@ async def get_miner_screener(
             select(
                 MV_MINER_SCREENER_STATS.c.total_screener_score,
                 MV_MINER_SCREENER_STATS.c.screener_rank,
-                MV_MINER_SCREENER_STATS.c.total_screener_miners,
                 MV_MINER_SCREENER_STATS.c.first_upload_at,
             )
             .where(MV_MINER_SCREENER_STATS.c.competition_id == comp_id)
@@ -788,7 +786,7 @@ async def get_miner_screener(
     await _cache.set(cache_key, response, ttl=15)
     logger.info(
         f"[Frontend] Miner screener: comp_id={comp_id}, hotkey={hotkey}, "
-        f"score={row.total_screener_score}, rank={row.screener_rank}/{row.total_screener_miners}"
+        f"score={row.total_screener_score}, rank={row.screener_rank}"
     )
 
     return response
@@ -810,15 +808,15 @@ async def get_miner_screener_challenges(
     if _cached is not None:
         return _cached
 
-    eval_starts_at = await db.scalar(
-        select(V_ACTIVE_COMPETITION.c.eval_starts_at)
+    upload_starts_at = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.upload_starts_at)
         .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
     )
-    if eval_starts_at is None:
+    if upload_starts_at is None:
         return MinerChallengesResponse(challenges=[], total=0)
-    if eval_starts_at.tzinfo is None:
-        eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
-    if datetime.now(timezone.utc) < eval_starts_at:
+    if upload_starts_at.tzinfo is None:
+        upload_starts_at = upload_starts_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) < upload_starts_at:
         return MinerChallengesResponse(challenges=[], total=0)
 
     rows = (

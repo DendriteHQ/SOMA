@@ -67,7 +67,7 @@ async def _run_refresh_loop() -> None:
                                 execution_options={"isolation_level": "AUTOCOMMIT"},
                             )
                         last_refresh[mv.name] = time.monotonic()
-                        logger.debug("mv_refreshed", extra={"view": mv.name})
+                        logger.info(f"mv_refreshed view: {mv.name}")
                     except Exception:
                         logger.exception("mv_refresh_failed", extra={"view": mv.name})
 
