@@ -21,6 +21,8 @@ async def log_validator_heartbeat(
     request_id: str | None,
     validator_ss58: str,
     status: str,
+    version: str | None = None,
+    code_changed: bool | None = None,
 ) -> None:
     try:
         request_fk = None
@@ -64,6 +66,8 @@ async def log_validator_heartbeat(
             request_fk=request_fk,
             validator_fk=validator.id,
             status=status,
+            version=version,
+            code_changed=code_changed,
         )
         session.add(entry)
         await session.commit()
