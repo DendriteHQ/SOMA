@@ -350,7 +350,6 @@ async def list_miners_by_competition(
         )
         miners.append(
             MinerListItem(
-                uid=1,
                 hotkey=r.ss58,
                 score=competition_score,
                 last_submit=r.last_submit_at,
@@ -360,7 +359,6 @@ async def list_miners_by_competition(
                     if r.total_screener_score is not None
                     else None
                 ),
-                competitions=[],
             )
         )
 
@@ -499,7 +497,6 @@ async def get_miner_by_competition(
 
     response = MinerDetailResponse(
         miner=MinerDetail(
-            uid=1,
             hotkey=hotkey,
             registered_at=miner.created_at if miner else None,
             contests=1,
@@ -659,6 +656,7 @@ async def get_miner_competition_challenges(
     challenges = [
         ChallengeItem(
             challenge_id=r.challenge_id,
+            challenge_name=r.challenge_name,
             batch_challenge_id=r.batch_challenge_id,
             competition_name=r.competition_name,
             competition_id=r.competition_id,
@@ -879,6 +877,7 @@ async def get_miner_screener_challenges(
     challenges = [
         ChallengeItem(
             challenge_id=r.challenge_id,
+            challenge_name=r.challenge_name,
             batch_challenge_id=r.batch_challenge_id,
             competition_name=r.competition_name,
             competition_id=r.competition_id,
