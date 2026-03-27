@@ -19,7 +19,11 @@ from soma_shared.contracts.validator.v1.messages import (
     HeartbeatRequest,
     HeartbeatResponse,
 )
-from soma_shared.db.session import get_db_session
+from soma_shared.db.session import (
+    get_db_session,
+    begin_db_request_metrics_scope,
+    end_db_request_metrics_scope,
+)
 from app.db.validator_heartbeat_log import log_validator_heartbeat
 from soma_shared.utils.signer import (
     generate_nonce,
@@ -248,12 +252,17 @@ async def _log_heartbeat_entry(
     version: str | None = None,
     code_changed: bool | None = None,
 ) -> None:
-    async for session in get_db_session():
-        await log_validator_heartbeat(
-            session,
-            request_id=request_id,
-            validator_ss58=validator_ss58,
-            status=status,
-            version=version,
-            code_changed=code_changed,
-        )
+  
+    metrics_token = begin_db_request_metrics_scope()
+    try:
+      async for session in get_db_session():
+          await log_validator_heartbeat(
+              session,
+              request_id=request_id,
+              validator_ss58=validator_ss58,
+              status=status,
+              version=version,
+              code_changed=code_changed,
+          )
+    finally:
+        end_db_request_metrics_scope(metrics_token)

@@ -5,6 +5,7 @@ from math import ceil
 
 from aiocache import Cache
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.routing import APIRoute
 from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +32,9 @@ from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
-from soma_shared.db.session import get_db_session
+from soma_shared.db.models.request import Request as RequestModel
+from soma_shared.db.request_metrics import apply_db_metrics_snapshot_to_request
+from soma_shared.db.session import get_current_db_request_metrics_snapshot, get_db_session
 from app.db.views import (
     MV_COMPETITION_CHALLENGES,
     MV_MINER_COMPETITION_STATS,
@@ -52,7 +55,77 @@ from app.api.routes.utils import (
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/api/private/frontend", tags=["frontend"])
+async def _log_frontend_request_metrics(request: Request, status_code: int) -> None:
+    request_id = getattr(request.state, "request_id", None)
+    if not request_id:
+        return
+
+    try:
+        payload = {"query": dict(request.query_params)}
+        metrics_snapshot = get_current_db_request_metrics_snapshot()
+
+        async for session in get_db_session():
+            result = await session.execute(
+                select(RequestModel).where(RequestModel.external_request_id == request_id)
+            )
+            request_row = result.scalars().first()
+            if request_row is None:
+                request_row = RequestModel(
+                    external_request_id=request_id,
+                    endpoint=request.url.path,
+                    method=request.method,
+                    payload=payload,
+                    status_code=status_code,
+                )
+                session.add(request_row)
+            else:
+                request_row.endpoint = request.url.path
+                request_row.method = request.method
+                request_row.payload = payload
+                request_row.status_code = status_code
+
+            apply_db_metrics_snapshot_to_request(request_row, metrics_snapshot)
+            await session.commit()
+            break
+    except Exception:
+        logger.exception(
+            "Failed to log frontend request metrics",
+            extra={
+                "request_id": request_id,
+                "status_code": status_code,
+            },
+        )
+
+
+class FrontendMetricsRoute(APIRoute):
+    def get_route_handler(self):
+        route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request):
+            try:
+                response = await route_handler(request)
+            except HTTPException as exc:
+                await _log_frontend_request_metrics(request, exc.status_code)
+                raise
+            except Exception:
+                await _log_frontend_request_metrics(
+                    request,
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+                raise
+
+            await _log_frontend_request_metrics(request, response.status_code)
+            return response
+
+        return custom_route_handler
+
+
+router = APIRouter(
+    prefix="/api/private/frontend",
+    tags=["frontend"],
+    route_class=FrontendMetricsRoute,
+)
+TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
 
 _cache = Cache(Cache.MEMORY)
 
