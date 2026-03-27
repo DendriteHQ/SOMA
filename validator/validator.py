@@ -32,6 +32,7 @@ from validator.config.settings import Settings
 from soma_shared.utils.verifier import verify_request_dep_no_db
 import logging
 import httpx
+import subprocess
 from soma_shared.utils.signer import sign_payload_model, generate_nonce
 from validator.chain.weigt_setter import WeightSetter
 from validator.evaluation.evaluator import BatchScoringError, Evaluator
@@ -738,6 +739,22 @@ def get_heartbeat_dependency():
     
     return _dependency
 
+def is_code_changed():
+    try:
+        result = subprocess.run(['git', 'status', '--porcelain'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception as e:
+        print(f"Error checking git status: {e}")
+        return False
+
+def version_check():
+    try:
+        result = subprocess.run(['git', 'describe', '--tags', '--always'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.stdout.strip()
+    except Exception as e:
+        print(f"Error checking git version: {e}")
+        return False
+
 def create_app() -> FastAPI:
     configure_logging()
     app = FastAPI(title="MCP Validator")
@@ -771,7 +788,13 @@ def create_app() -> FastAPI:
         if validator is None:
             logging.error("Validator is None, raising 503")
             raise HTTPException(status_code=503, detail="Validator not initialized")
-        payload = HeartbeatResponse(ok=True, server_ts=datetime.now(timezone.utc))
+        payload = HeartbeatResponse(
+            ok=True,
+            server_ts=datetime.now(timezone.utc),
+            version=version_check(),
+            code_changed=is_code_changed(),
+            model=validator.settings.openrouter_model,
+        )
         nonce = generate_nonce()
         signature = sign_payload_model(
             payload=payload, nonce=nonce, wallet=validator.settings.wallet

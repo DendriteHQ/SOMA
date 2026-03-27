@@ -101,6 +101,8 @@ def _send_heartbeat_and_log(
     port = validator.get("port")
 
     status = "failed"
+    version: str | None = None
+    code_changed: bool | None = None
     if ip and port:
         logger.info(
             "heartbeat_request_start validator_ss58=%s ip=%s port=%s request_id=%s",
@@ -109,7 +111,7 @@ def _send_heartbeat_and_log(
             port,
             request_id,
         )
-        status = _send_heartbeat_request(
+        status, version, code_changed = _send_heartbeat_request(
             request_id=request_id,
             ip=str(ip),
             port=int(port),
@@ -127,6 +129,8 @@ def _send_heartbeat_and_log(
             request_id=request_id,
             validator_ss58=validator_ss58,
             status=status,
+            version=version,
+            code_changed=code_changed,
         ),
         loop,
     )
@@ -146,7 +150,7 @@ def _send_heartbeat_request(
     port: int,
     timeout_secs: int,
     validator_ss58: str,
-) -> str:
+) -> tuple[str, str | None, bool | None]:
     url = f"http://{ip}:{port}/heartbeat"
     payload = HeartbeatRequest(
         ts=datetime.now(timezone.utc),
@@ -204,7 +208,7 @@ def _send_heartbeat_request(
                 )
                 return "failed"
             if not payload_obj.ok:
-                return "failed"
+                return ("failed", None, None)
             try:
                 ok = verify_payload_model(
                     payload_obj,
@@ -220,7 +224,7 @@ def _send_heartbeat_request(
                     env_raw.sig.signer_ss58,
                     exc_info=exc,
                 )
-                return "failed"
+                return ("failed", None, None)
             if not ok:
                 logger.warning(
                     "heartbeat_signature_verification_failed url=%s request_id=%s signer_ss58=%s",
@@ -228,8 +232,8 @@ def _send_heartbeat_request(
                     request_id,
                     env_raw.sig.signer_ss58,
                 )
-                return "failed"
-            return "working"
+                return ("failed", None, None)
+            return ("working", payload_obj.version, payload_obj.code_changed)
     except (HTTPError, URLError, ValueError):
         logger.info(
             "heartbeat_request_failed url=%s request_id=%s",
@@ -237,7 +241,7 @@ def _send_heartbeat_request(
             request_id,
         )
 
-    return "failed"
+    return ("failed", None, None)
 
 
 async def _log_heartbeat_entry(
@@ -245,15 +249,20 @@ async def _log_heartbeat_entry(
     request_id: str,
     validator_ss58: str,
     status: str,
+    version: str | None = None,
+    code_changed: bool | None = None,
 ) -> None:
+  
     metrics_token = begin_db_request_metrics_scope()
     try:
-        async for session in get_db_session():
-            await log_validator_heartbeat(
-                session,
-                request_id=request_id,
-                validator_ss58=validator_ss58,
-                status=status,
-            )
+      async for session in get_db_session():
+          await log_validator_heartbeat(
+              session,
+              request_id=request_id,
+              validator_ss58=validator_ss58,
+              status=status,
+              version=version,
+              code_changed=code_changed,
+          )
     finally:
         end_db_request_metrics_scope(metrics_token)
