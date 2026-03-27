@@ -36,7 +36,7 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_HEARTBEAT_INTERVAL_SECS = 10
-DEFAULT_HEARTBEAT_TIMEOUT_SECS = 5
+DEFAULT_HEARTBEAT_TIMEOUT_SECS = 10
 
 
 def start_heartbeat_thread(
@@ -103,6 +103,7 @@ def _send_heartbeat_and_log(
     status = "failed"
     version: str | None = None
     code_changed: bool | None = None
+    model_name: str | None = None
     if ip and port:
         logger.info(
             "heartbeat_request_start validator_ss58=%s ip=%s port=%s request_id=%s",
@@ -111,7 +112,7 @@ def _send_heartbeat_and_log(
             port,
             request_id,
         )
-        status, version, code_changed = _send_heartbeat_request(
+        status, version, code_changed, model_name = _send_heartbeat_request(
             request_id=request_id,
             ip=str(ip),
             port=int(port),
@@ -131,6 +132,7 @@ def _send_heartbeat_and_log(
             status=status,
             version=version,
             code_changed=code_changed,
+            model_name=model_name,
         ),
         loop,
     )
@@ -150,7 +152,7 @@ def _send_heartbeat_request(
     port: int,
     timeout_secs: int,
     validator_ss58: str,
-) -> tuple[str, str | None, bool | None]:
+) -> tuple[str, str | None, bool | None, str | None]:
     url = f"http://{ip}:{port}/heartbeat"
     payload = HeartbeatRequest(
         ts=datetime.now(timezone.utc),
@@ -180,7 +182,7 @@ def _send_heartbeat_request(
                     url,
                     request_id,
                 )
-                return "failed"
+                return ("failed", None, None, None)
             try:
                 payload = json.loads(body)
             except json.JSONDecodeError:
@@ -189,7 +191,7 @@ def _send_heartbeat_request(
                     url,
                     request_id,
                 )
-                return "failed"
+                return ("failed", None, None, None)
             try:
                 env_raw = SignedEnvelope[dict].model_validate(payload)
                 payload_obj = HeartbeatResponse.model_validate(env_raw.payload)
@@ -199,14 +201,14 @@ def _send_heartbeat_request(
                     url,
                     request_id,
                 )
-                return "failed"
+                return ("failed", None, None, None)
             if env_raw.sig.signer_ss58 != validator_ss58:
                 logger.warning(
                     "heartbeat_signer_mismatch url=%s request_id=%s",
                     url,
                     request_id,
                 )
-                return "failed"
+                return ("failed", None, None, None)
             if not payload_obj.ok:
                 return ("failed", None, None)
             try:
@@ -224,7 +226,7 @@ def _send_heartbeat_request(
                     env_raw.sig.signer_ss58,
                     exc_info=exc,
                 )
-                return ("failed", None, None)
+                return ("failed", None, None, None)
             if not ok:
                 logger.warning(
                     "heartbeat_signature_verification_failed url=%s request_id=%s signer_ss58=%s",
@@ -232,8 +234,8 @@ def _send_heartbeat_request(
                     request_id,
                     env_raw.sig.signer_ss58,
                 )
-                return ("failed", None, None)
-            return ("working", payload_obj.version, payload_obj.code_changed)
+                return ("failed", None, None, None)
+            return ("working", payload_obj.version, payload_obj.code_changed, payload_obj.model)
     except (HTTPError, URLError, ValueError):
         logger.info(
             "heartbeat_request_failed url=%s request_id=%s",
@@ -241,7 +243,7 @@ def _send_heartbeat_request(
             request_id,
         )
 
-    return ("failed", None, None)
+    return ("failed", None, None, None)
 
 
 async def _log_heartbeat_entry(
@@ -251,6 +253,7 @@ async def _log_heartbeat_entry(
     status: str,
     version: str | None = None,
     code_changed: bool | None = None,
+    model_name: str | None = None,
 ) -> None:
   
     metrics_token = begin_db_request_metrics_scope()
@@ -263,6 +266,7 @@ async def _log_heartbeat_entry(
               status=status,
               version=version,
               code_changed=code_changed,
+              model_name=model_name,
           )
     finally:
         end_db_request_metrics_scope(metrics_token)

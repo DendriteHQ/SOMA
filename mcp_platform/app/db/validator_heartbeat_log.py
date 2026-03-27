@@ -25,6 +25,7 @@ async def log_validator_heartbeat(
     status: str,
     version: str | None = None,
     code_changed: bool | None = None,
+    model_name: str | None = None,
 ) -> None:
     try:
         request_fk = None
@@ -71,6 +72,8 @@ async def log_validator_heartbeat(
                 validator.version = version
             if code_changed is not None:
                 validator.code_changed = code_changed
+            if model_name is not None:
+                validator.model = model_name
         entry = ValidatorHeartbeat(
             request_fk=request_fk,
             validator_fk=validator.id,
