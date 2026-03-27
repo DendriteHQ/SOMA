@@ -11,3 +11,4 @@ summa>=1.2.0
 
 yake>=0.4.8
 rake-nltk>=1.0.6
+sentence-transformers==5.3.0

@@ -11,5 +11,6 @@ RUN mkdir -p /tiktoken_cache "${NLTK_DATA}" \
     && python -c "import tiktoken; tiktoken.get_encoding('cl100k_base');" \
     && chmod -R 755 /tiktoken_cache "${NLTK_DATA}"
 COPY run_code.py /sandbox/run_code.py
-
+COPY sentence-transformers/paraphrase-MiniLM-L3-v2 /app/sentence-transformers/paraphrase-MiniLM-L3-v2
+ENV TRANSFORMERS_OFFLINE=1
 CMD ["python", "/sandbox/run_code.py"]

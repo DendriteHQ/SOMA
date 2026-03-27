@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+sentence-transformers/
 # C extensions
 *.so
 scripts/
