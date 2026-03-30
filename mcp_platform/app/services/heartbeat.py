@@ -35,8 +35,8 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_HEARTBEAT_INTERVAL_SECS = 10
-DEFAULT_HEARTBEAT_TIMEOUT_SECS = 10
+DEFAULT_HEARTBEAT_INTERVAL_SECS = 60
+DEFAULT_HEARTBEAT_TIMEOUT_SECS = 20
 
 
 def start_heartbeat_thread(
@@ -137,7 +137,7 @@ def _send_heartbeat_and_log(
         loop,
     )
     try:
-        future.result(timeout=5)
+        future.result(timeout=20)
     except Exception:
         logger.exception(
             "heartbeat_log_failed",

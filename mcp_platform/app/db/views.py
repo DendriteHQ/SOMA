@@ -89,6 +89,7 @@ V_MINER_STATUS = sa.table(
 V_MINER_SCREENER_ELIGIBLE_RANKED = sa.table(
     "v_miner_screener_eligible_ranked",
     sa.column("competition_id"),
+    sa.column("ss58"),
     sa.column("miner_id"),
     sa.column("script_id"),
     sa.column("avg_score"),

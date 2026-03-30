@@ -304,6 +304,8 @@ async def _get_current_burn_state(db: AsyncSession) -> tuple[bool, float]:
             select(BurnRequest).order_by(BurnRequest.created_at.desc()).limit(1)
         )
     except Exception as exc:
+        if db.in_transaction():
+            await db.rollback()
         logger.warning(
             "burn_state_load_failed",
             extra={"error": str(exc)},
