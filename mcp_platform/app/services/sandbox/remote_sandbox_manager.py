@@ -61,7 +61,7 @@ class RemoteSandboxManager:
         compression_ratios: list[float | None],
         storage_uuids: list[str],
         storage_presigned_urls: list[str],
-    ) -> tuple[list[str], str | None]:
+    ) -> tuple[list[str], list[str | None]]:
         """Execute a batch of challenges on remote sandbox service.
 
         Args:
@@ -74,7 +74,8 @@ class RemoteSandboxManager:
                 compressed results, one per challenge_text entry
 
         Returns:
-            Tuple of (compressed_texts, error_message). error_message is None on success.
+            Tuple of (compressed_texts, task_errors). task_errors has one entry per
+            challenge_text: None if the task succeeded, error string if it failed.
 
         Raises:
             RuntimeError: If platform is at capacity
@@ -95,7 +96,7 @@ class RemoteSandboxManager:
             logger.error(
                 "[RemoteSandbox] Batch execution failed: %s", exc, exc_info=True
             )
-            return [""] * len(challenge_texts), str(exc)
+            return [""] * len(challenge_texts), [str(exc)] * len(challenge_texts)
 
     async def _execute_remote_batch(
         self,
@@ -105,7 +106,7 @@ class RemoteSandboxManager:
         compression_ratios: list[float | None],
         storage_uuids: list[str],
         storage_presigned_urls: list[str],
-    ) -> tuple[list[str], str | None]:
+    ) -> tuple[list[str], list[str | None]]:
         """Execute batch on remote sandbox service and retrieve results from S3.
 
         Args:
@@ -117,7 +118,8 @@ class RemoteSandboxManager:
             storage_presigned_urls: Presigned S3 URLs (PUT) for the sandbox to upload results
 
         Returns:
-            Tuple of (compressed_texts, error_message). error_message is None on success.
+            Tuple of (compressed_texts, task_errors). task_errors has one entry per
+            challenge_text: None if the task succeeded, error string if it failed.
         """
         num_tasks = len(challenge_texts)
 
@@ -147,7 +149,7 @@ class RemoteSandboxManager:
             request_timeout,
         )
 
-        sandbox_error: str | None = None
+        sandbox_result: dict = {}
 
         # Send request to sandbox service
         async with httpx.AsyncClient() as client:
@@ -158,10 +160,9 @@ class RemoteSandboxManager:
                     timeout=request_timeout,
                 )
                 response.raise_for_status()
-                result = response.json()
-                sandbox_error = result.get("error")
-                if not result.get("success"):
-                    error_msg = result.get("error", "Unknown sandbox error")
+                sandbox_result = response.json()
+                if not sandbox_result.get("success"):
+                    error_msg = sandbox_result.get("error", "Unknown sandbox error")
                     logger.error(
                         "[RemoteSandbox] Sandbox service returned error: %s",
                         error_msg,
@@ -230,7 +231,18 @@ class RemoteSandboxManager:
             "[RemoteSandbox] Retrieved %d compressed texts from storage",
             len(compressed_texts),
         )
-        return compressed_texts, sandbox_error
+
+        # Extract and normalise per-task errors from the sandbox response.
+        raw_task_errors: list = sandbox_result.get("task_errors") or []
+        task_errors: list[str | None] = [
+            (e if e else None) for e in raw_task_errors
+        ]
+        if len(task_errors) < len(challenge_texts):
+            task_errors.extend([None] * (len(challenge_texts) - len(task_errors)))
+        elif len(task_errors) > len(challenge_texts):
+            task_errors = task_errors[:len(challenge_texts)]
+
+        return compressed_texts, task_errors
 
     def shutdown(self) -> None:
         """Compatibility lifecycle hook used by app shutdown."""

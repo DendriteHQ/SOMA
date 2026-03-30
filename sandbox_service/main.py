@@ -119,7 +119,7 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
         executor = get_sandbox_executor()
 
         # Execute sandbox
-        compressed_texts, task_error = await executor.execute_batch(
+        compressed_texts, task_errors = await executor.execute_batch(
             challenge_code=challenge_code,
             challenge_texts=request.challenge_texts,
             compression_ratios=request.compression_ratios,
@@ -143,19 +143,20 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
             request.batch_id,
             len(compressed_texts),
         )
-        if task_error:
+        failed_count = sum(1 for e in task_errors if e)
+        if failed_count:
             logger.warning(
-                "Batch completed with task failures: batch_id=%s\n%s",
+                "Batch completed with %d/%d task failures: batch_id=%s",
+                failed_count,
+                len(task_errors),
                 request.batch_id,
-                task_error,
             )
 
         return ExecuteBatchResponse(
             success=True,
             batch_id=request.batch_id,
-            error=task_error,
+            task_errors=task_errors,
         )
-
 
     except Exception as exc:
         tb = traceback.format_exc()
