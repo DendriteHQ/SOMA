@@ -44,10 +44,8 @@ from app.db.views import (
     V_BATCH_CHALLENGE_QUESTIONS,
     V_COMPETITION_CHALLENGES,
 )
-from app.core.config import settings
 from app.core.logging import get_logger
 from app.api.routes.utils import (
-    _miner_status,
     _require_private_network,
     _get_current_burn_state,
 )
@@ -351,21 +349,12 @@ async def list_miners_by_competition(
     )
     total_pages = max(1, ceil(total_value / limit)) if total_value else 1
     offset = (page - 1) * limit
-    
+
     rows = (
         await db.execute(
             select(
                 MV_MINER_STATUS.c.ss58,
-                MV_MINER_STATUS.c.is_banned,
-                MV_MINER_STATUS.c.has_script,
-                MV_MINER_STATUS.c.competition_challenges,
-                MV_MINER_STATUS.c.screener_challenges,
-                MV_MINER_STATUS.c.scored_screened_challenges,
-                MV_MINER_STATUS.c.pending_assignments_screener,
-                MV_MINER_STATUS.c.scored_competition_challenges,
-                MV_MINER_STATUS.c.pending_assignments_competition,
-                MV_MINER_STATUS.c.screener_rank,
-                MV_MINER_STATUS.c.total_eligible_screener,
+                MV_MINER_STATUS.c.status,
                 MV_MINER_STATUS.c.last_submit_at,
                 MV_MINER_COMPETITION_STATS.c.total_score,
                 MV_MINER_SCREENER_STATS.c.total_screener_score,
@@ -395,27 +384,9 @@ async def list_miners_by_competition(
         )
     ).all()
 
-    top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
-
     miners = []
     for r in rows:
-        is_in_top = (
-            top_fraction > 0
-            and r.screener_rank is not None
-            and r.total_eligible_screener is not None
-            and r.screener_rank <= max(1, ceil(r.total_eligible_screener * top_fraction))
-        )
-        miner_st = _miner_status(
-            competition_challenges=r.competition_challenges,
-            screener_challenges=r.screener_challenges,
-            pending_assignments_competition=r.pending_assignments_competition,
-            pending_assignments_screener=r.pending_assignments_screener,
-            scored_screened_challenges=r.scored_screened_challenges,
-            scored_competition_challanges=r.scored_competition_challenges,
-            is_in_top_screener=is_in_top,
-            has_script=bool(r.has_script),
-            miner_banned_status=bool(r.is_banned),
-        )
+        miner_st = r.status or "in queue"
         competition_score = (
             float(r.total_score)
             if r.total_score is not None and miner_st in {"scored", "evaluating"}
@@ -471,21 +442,10 @@ async def get_miner_by_competition(
         await db.execute(
             select(
                 MV_MINER_STATUS.c.ss58,
-                MV_MINER_STATUS.c.is_banned,
-                MV_MINER_STATUS.c.has_script,
-                MV_MINER_STATUS.c.competition_challenges,
-                MV_MINER_STATUS.c.screener_challenges,
-                MV_MINER_STATUS.c.scored_screened_challenges,
-                MV_MINER_STATUS.c.pending_assignments_screener,
-                MV_MINER_STATUS.c.scored_competition_challenges,
-                MV_MINER_STATUS.c.pending_assignments_competition,
-                MV_MINER_STATUS.c.screener_rank,
-                MV_MINER_STATUS.c.total_eligible_screener,
+                MV_MINER_STATUS.c.status,
                 MV_MINER_STATUS.c.last_submit_at,
                 MV_MINER_COMPETITION_STATS.c.total_score,
                 MV_MINER_COMPETITION_STATS.c.rank,
-                MV_MINER_SCREENER_STATS.c.total_screener_score,
-                MV_MINER_SCREENER_STATS.c.screener_rank.label("screener_rank_stats"),
             )
             .select_from(MV_MINER_STATUS)
             .outerjoin(
@@ -493,13 +453,6 @@ async def get_miner_by_competition(
                 and_(
                     MV_MINER_COMPETITION_STATS.c.competition_id == comp_id,
                     MV_MINER_COMPETITION_STATS.c.ss58 == MV_MINER_STATUS.c.ss58,
-                ),
-            )
-            .outerjoin(
-                MV_MINER_SCREENER_STATS,
-                and_(
-                    MV_MINER_SCREENER_STATS.c.competition_id == comp_id,
-                    MV_MINER_SCREENER_STATS.c.ss58 == MV_MINER_STATUS.c.ss58,
                 ),
             )
             .where(MV_MINER_STATUS.c.competition_id == comp_id)
@@ -538,25 +491,7 @@ async def get_miner_by_competition(
             detail="Competition not found",
         )
 
-    top_fraction = float(getattr(settings, "top_screener_scripts", 0.0))
-    is_in_top = (
-        top_fraction > 0
-        and row.screener_rank is not None
-        and row.total_eligible_screener is not None
-        and row.screener_rank <= max(1, ceil(row.total_eligible_screener * top_fraction))
-    )
-
-    miner_st = _miner_status(
-        competition_challenges=row.competition_challenges,
-        screener_challenges=row.screener_challenges,
-        pending_assignments_competition=row.pending_assignments_competition,
-        pending_assignments_screener=row.pending_assignments_screener,
-        scored_screened_challenges=row.scored_screened_challenges,
-        scored_competition_challanges=row.scored_competition_challenges,
-        is_in_top_screener=is_in_top,
-        has_script=bool(row.has_script),
-        miner_banned_status=bool(row.is_banned),
-    )
+    miner_st = row.status or "in queue"
 
     show_score = miner_st in {"scored", "evaluating"} and eval_started
 
