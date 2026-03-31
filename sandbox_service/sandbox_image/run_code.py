@@ -4,6 +4,7 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
+import time
 
 DEFAULT_OUTPUT = {"compressed": []}
 
@@ -47,10 +48,11 @@ def run_single(
     task: str,
     compression_ratio: float | None,
     timeout: float,
-) -> tuple[str, str]:
+) -> tuple[str, str, float | None]:
     """Run one task in an isolated subprocess."""
     payload = json.dumps({"task": task, "compression_ratio": compression_ratio})
     try:
+        start = time.perf_counter()
         proc = subprocess.run(
             [sys.executable, "-c", LOADER, str(code_path)],
             input=payload,
@@ -58,14 +60,16 @@ def run_single(
             capture_output=True,
             timeout=timeout,
         )
+        end = time.perf_counter()
+        exec_time = end - start
         logs = proc.stderr
         if proc.returncode != 0:
-            return ("", f"ERROR: exit code {proc.returncode}\n{logs}")
-        return (proc.stdout, logs)
+            return ("", f"ERROR: exit code {proc.returncode}\n{logs}", None)
+        return (proc.stdout, logs, exec_time)
     except subprocess.TimeoutExpired:
-        return ("", f"ERROR: Task execution timed out after {timeout}s")
+        return ("", f"ERROR: Task execution timed out after {timeout}s", None)
     except Exception as exc:
-        return ("", f"ERROR: {exc}")
+        return ("", f"ERROR: {exc}", None)
 
 
 def run_batch(
@@ -73,8 +77,8 @@ def run_batch(
     batch: list,
     compression_ratios: list[float | None],
     timeout_per_task: float,
-) -> list[tuple[str, str]]:
-    """Run user main() on all tasks and return [(result, logs), ...]."""
+) -> list[tuple[str, str, float | None]]:
+    """Run user main() on all tasks and return [(result, logs, execution_time), ...]."""
     return [
         run_single(
             input_path,

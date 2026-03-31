@@ -119,7 +119,7 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
         executor = get_sandbox_executor()
 
         # Execute sandbox
-        compressed_texts, task_errors = await executor.execute_batch(
+        compressed_texts, task_errors, execution_times = await executor.execute_batch(
             challenge_code=challenge_code,
             challenge_texts=request.challenge_texts,
             compression_ratios=request.compression_ratios,
@@ -128,20 +128,35 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
         )
 
         # Upload each compressed result via its presigned PUT URL — scoped write access only.
+        # Skip uploading empty strings for failed tasks to avoid S3 clutter.
+        uploaded_count = 0
+        skipped_count = 0
         async with httpx.AsyncClient() as http_client:
-            for presigned_url, compressed_text in zip(
+            for idx, (presigned_url, compressed_text) in enumerate(zip(
                 request.storage_presigned_urls, compressed_texts
-            ):
+            )):
+                # Skip uploading empty results (failed tasks)
+                if not compressed_text or not compressed_text.strip():
+                    skipped_count += 1
+                    logger.debug(
+                        "Skipping S3 upload for empty result: batch_id=%s, idx=%d",
+                        request.batch_id,
+                        idx,
+                    )
+                    continue
+                
                 put_resp = await http_client.put(
                     presigned_url,
                     content=compressed_text.encode("utf-8"),
                 )
                 put_resp.raise_for_status()
+                uploaded_count += 1
 
         logger.info(
-            "Batch execution completed: batch_id=%s, results=%d",
+            "Batch execution completed: batch_id=%s, uploaded=%d, skipped=%d",
             request.batch_id,
-            len(compressed_texts),
+            uploaded_count,
+            skipped_count,
         )
         failed_count = sum(1 for e in task_errors if e)
         if failed_count:
@@ -156,6 +171,7 @@ async def execute_batch(request: ExecuteBatchRequest) -> ExecuteBatchResponse:
             success=True,
             batch_id=request.batch_id,
             task_errors=task_errors,
+            execution_times=execution_times,
         )
 
     except Exception as exc:
