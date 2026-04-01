@@ -691,7 +691,7 @@ async def request_challenge(
 
     challenge_by_id = {challenge.id: challenge for challenge in challenge_list}
 
-    response_items: list[tuple[BatchChallenge, Challenge]] = []
+    response_items: list[tuple[BatchChallenge, Challenge, str]] = []
     challenge_texts: list[str] = []
     compression_ratios: list[float | None] = []
     storage_uuids: list[str] = []
@@ -701,13 +701,8 @@ async def request_challenge(
         if challenge is None:
             continue
         storage_uuid = f"{script.script_uuid}/{uuid.uuid4()}"
-        db.add(
-            BatchCompressedText(
-                batch_challenge_fk=batch_challenge.id,
-                storage_uuid=storage_uuid,
-            )
-        )
-        response_items.append((batch_challenge, challenge))
+        # Don't create BatchCompressedText yet - wait for sandbox results
+        response_items.append((batch_challenge, challenge, storage_uuid))
         challenge_texts.append(challenge.challenge_text or "")
         compression_ratios.append(float(batch_challenge.compression_ratio))
         storage_uuids.append(storage_uuid)
@@ -732,7 +727,7 @@ async def request_challenge(
             storage_keys, "put_object", expires_in=_presigned_expires_in
         )
 
-        compressed_texts, task_errors = await sandbox_manager.run_batch(
+        compressed_texts, task_errors, execution_times = await sandbox_manager.run_batch(
             batch_id=str(challenge_batch.id),
             script_presigned_url=script_presigned_url,
             challenge_texts=challenge_texts,
@@ -757,6 +752,38 @@ async def request_challenge(
         logger.info(
             "request_challenge: compressed text lengths "
             f"request_id={request_id} lengths={compressed_lengths}"
+        )
+        
+        # Create BatchCompressedText records only for successful tasks (no task_error)
+        # Failed tasks already have errors recorded in batch_question_score.details
+        created_count = 0
+        skipped_count = 0
+        for idx, (batch_challenge, challenge, storage_uuid) in enumerate(response_items):
+            task_error = task_errors[idx] if idx < len(task_errors) else None
+            
+            # Skip creating record if task failed
+            if task_error:
+                skipped_count += 1
+                logger.debug(
+                    "request_challenge: skipping BatchCompressedText for failed task "
+                    f"idx={idx} batch_challenge_id={batch_challenge.id} error={task_error}"
+                )
+                continue
+            
+            execution_time = execution_times[idx] if idx < len(execution_times) else None
+            db.add(
+                BatchCompressedText(
+                    batch_challenge_fk=batch_challenge.id,
+                    storage_uuid=storage_uuid,
+                    execution_time_seconds=float(execution_time) if execution_time is not None else None,
+                )
+            )
+            created_count += 1
+        
+        logger.info(
+            "request_challenge: created BatchCompressedText records "
+            f"request_id={request_id} created={created_count} skipped={skipped_count} "
+            f"execution_times={execution_times}"
         )
     except RuntimeError as exc:
         if "Platform is at capacity" in str(exc):
@@ -819,7 +846,7 @@ async def request_challenge(
     zero_score_questions: list[BatchQuestionScore] = []
     zero_score_rollups: list[BatchChallengeScore] = []
     challenges_response = []
-    for idx, (batch_challenge, challenge) in enumerate(response_items):
+    for idx, (batch_challenge, challenge, storage_uuid) in enumerate(response_items):
         compressed_text = compressed_texts[idx] if idx < len(compressed_texts) else ""
         task_error = task_errors[idx] if idx < len(task_errors) else None
         ratio = (

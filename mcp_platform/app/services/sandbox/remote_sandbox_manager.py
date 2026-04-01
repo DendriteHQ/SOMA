@@ -61,7 +61,7 @@ class RemoteSandboxManager:
         compression_ratios: list[float | None],
         storage_uuids: list[str],
         storage_presigned_urls: list[str],
-    ) -> tuple[list[str], list[str | None]]:
+    ) -> tuple[list[str], list[str | None], list[float | None]]:
         """Execute a batch of challenges on remote sandbox service.
 
         Args:
@@ -96,7 +96,7 @@ class RemoteSandboxManager:
             logger.error(
                 "[RemoteSandbox] Batch execution failed: %s", exc, exc_info=True
             )
-            return [""] * len(challenge_texts), [str(exc)] * len(challenge_texts)
+            return [""] * len(challenge_texts), [str(exc)] * len(challenge_texts), [None] * len(challenge_texts)
 
     async def _execute_remote_batch(
         self,
@@ -106,7 +106,7 @@ class RemoteSandboxManager:
         compression_ratios: list[float | None],
         storage_uuids: list[str],
         storage_presigned_urls: list[str],
-    ) -> tuple[list[str], list[str | None]]:
+    ) -> tuple[list[str], list[str | None], list[float | None]]:
         """Execute batch on remote sandbox service and retrieve results from S3.
 
         Args:
@@ -211,21 +211,34 @@ class RemoteSandboxManager:
                 ) from exc
         
         # Retrieve individual compressed texts from S3 using per-challenge UUIDs
+        # Failed tasks won't have S3 objects (sandbox skips uploading empty strings)
         compressed_texts: list[str] = []
-        for storage_uuid in storage_uuids:
+        for idx, storage_uuid in enumerate(storage_uuids):
             try:
                 text = await self._compressed_text_storage.get_single(storage_uuid)
                 compressed_texts.append(text)
             except Exception as exc:
-                logger.error(
-                    "[RemoteSandbox] Failed to retrieve compressed text for uuid=%s: %s",
-                    storage_uuid,
-                    exc,
-                    exc_info=True,
-                )
-                raise SandboxExecutionError(
-                    f"Failed to retrieve compressed text for uuid={storage_uuid}"
-                ) from exc
+                # Check if this is a known failed task (has task_error)
+                task_error = sandbox_result.get("task_errors", [])[idx] if idx < len(sandbox_result.get("task_errors", [])) else None
+                if task_error:
+                    # Expected: failed task has no S3 object
+                    logger.debug(
+                        "[RemoteSandbox] No S3 object for failed task: uuid=%s, error=%s",
+                        storage_uuid,
+                        task_error,
+                    )
+                    compressed_texts.append("")  # Empty string for failed task
+                else:
+                    # Unexpected: successful task should have S3 object
+                    logger.error(
+                        "[RemoteSandbox] Failed to retrieve compressed text for uuid=%s: %s",
+                        storage_uuid,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise SandboxExecutionError(
+                        f"Failed to retrieve compressed text for uuid={storage_uuid}"
+                    ) from exc
 
         logger.info(
             "[RemoteSandbox] Retrieved %d compressed texts from storage",
@@ -234,15 +247,28 @@ class RemoteSandboxManager:
 
         # Extract and normalise per-task errors from the sandbox response.
         raw_task_errors: list = sandbox_result.get("task_errors") or []
+        timeouts: list = sandbox_result.get("execution_times") or []
         task_errors: list[str | None] = [
             (e if e else None) for e in raw_task_errors
         ]
+
+        # Normalize all lists to match challenge_texts length
         if len(task_errors) < len(challenge_texts):
             task_errors.extend([None] * (len(challenge_texts) - len(task_errors)))
         elif len(task_errors) > len(challenge_texts):
             task_errors = task_errors[:len(challenge_texts)]
 
-        return compressed_texts, task_errors
+        if len(compressed_texts) < len(challenge_texts):
+            compressed_texts.extend([""] * (len(challenge_texts) - len(compressed_texts)))
+        elif len(compressed_texts) > len(challenge_texts):
+            compressed_texts = compressed_texts[:len(challenge_texts)]
+
+        if len(timeouts) < len(challenge_texts):
+            timeouts.extend([None] * (len(challenge_texts) - len(timeouts)))
+        elif len(timeouts) > len(challenge_texts):
+            timeouts = timeouts[:len(challenge_texts)]
+
+        return compressed_texts, task_errors, timeouts
 
     def shutdown(self) -> None:
         """Compatibility lifecycle hook used by app shutdown."""
