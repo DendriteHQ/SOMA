@@ -8,7 +8,7 @@ import uuid
 import bittensor as bt
 
 from fastapi import APIRouter, HTTPException, status, Depends, Request
-from sqlalchemy import delete, func, select, update, literal
+from sqlalchemy import delete, func, select, update, literal, or_, case
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -71,7 +71,6 @@ from app.api.routes.utils import (
     get_script_s3_key,
 )
 from app.db.views import (
-    V_MINER_COMPETITION_RATIO_RANKED,
     V_MINER_SCREENER_ELIGIBLE_RANKED,
 )
 from app.core.logging import get_logger
@@ -1608,13 +1607,25 @@ async def score_challenges(
 async def _get_active_top_miner_ss58(
     db: AsyncSession,
     now: datetime,
+    competition_id: int,
 ) -> str | None:
     try:
         result = await db.execute(
             select(TopMiner)
+            .where(TopMiner.winner_type == "overall")
             .where(TopMiner.starts_at <= now)
             .where(TopMiner.ends_at >= now)
-            .order_by(TopMiner.created_at.desc())
+            .where(
+                or_(
+                    TopMiner.competition_fk == competition_id,
+                    TopMiner.competition_fk.is_(None),
+                )
+            )
+            .order_by(
+                case((TopMiner.competition_fk == competition_id, 0), else_=1).asc(),
+                TopMiner.created_at.desc(),
+                TopMiner.id.desc(),
+            )
             .limit(1)
         )
         top_miner = result.scalars().first()
@@ -1630,34 +1641,52 @@ async def _get_active_top_miner_ss58(
 
 async def _get_per_compression_ratio_winners(
     db: AsyncSession,
+    now: datetime,
     competition_id: int,
 ) -> list[tuple[float, str]]:
-    rows = (
-        await db.execute(
-            select(
-                V_MINER_COMPETITION_RATIO_RANKED.c.compression_ratio,
-                V_MINER_COMPETITION_RATIO_RANKED.c.ss58,
+    try:
+        rows = (
+            await db.execute(
+                select(
+                    TopMiner.compression_ratio,
+                    TopMiner.ss58,
+                    TopMiner.competition_fk,
+                    TopMiner.created_at,
+                    TopMiner.id,
+                )
+                .where(TopMiner.winner_type == "compression_ratio")
+                .where(TopMiner.starts_at <= now)
+                .where(TopMiner.ends_at >= now)
+                .where(
+                    or_(
+                        TopMiner.competition_fk == competition_id,
+                        TopMiner.competition_fk.is_(None),
+                    )
+                )
+                .order_by(
+                    TopMiner.compression_ratio.asc(),
+                    case((TopMiner.competition_fk == competition_id, 0), else_=1).asc(),
+                    TopMiner.created_at.desc(),
+                    TopMiner.id.desc(),
+                )
             )
-            .where(
-                V_MINER_COMPETITION_RATIO_RANKED.c.competition_id == competition_id
-            )
-            .where(V_MINER_COMPETITION_RATIO_RANKED.c.rank == 1)
-            .where(V_MINER_COMPETITION_RATIO_RANKED.c.is_banned.is_(False))
-            .order_by(
-                V_MINER_COMPETITION_RATIO_RANKED.c.compression_ratio.asc(),
-                V_MINER_COMPETITION_RATIO_RANKED.c.ss58.asc(),
-            )
-        )
-    ).all()
+        ).all()
+    except Exception:
+        return []
 
     winners: list[tuple[float, str]] = []
+    seen_ratios: set[float] = set()
     for row in rows:
         if row.compression_ratio is None or row.ss58 is None:
+            continue
+        ratio = float(row.compression_ratio)
+        if ratio in seen_ratios:
             continue
         ss58 = str(row.ss58).strip()
         if not ss58:
             continue
-        winners.append((float(row.compression_ratio), ss58))
+        seen_ratios.add(ratio)
+        winners.append((ratio, ss58))
     return winners
 
 
@@ -1862,12 +1891,17 @@ async def get_best_miners(
 
                 # Winner categories:
                 # 1) overall winner (active TopMiner)
-                # 2) one winner per compression ratio from DB view
-                overall_winner_ss58 = await _get_active_top_miner_ss58(db, now)
+                # 2) one winner per compression ratio from TopMiner entries
+                overall_winner_ss58 = await _get_active_top_miner_ss58(
+                    db,
+                    now,
+                    active_competition_id,
+                )
                 ratio_winners: list[tuple[float, str]] = []
                 try:
                     ratio_winners = await _get_per_compression_ratio_winners(
                         db,
+                        now,
                         active_competition_id,
                     )
                 except Exception as exc:
@@ -1927,9 +1961,19 @@ async def get_best_miners(
                     for category in winner_categories_in_metagraph
                     if category["winner_type"] == "overall"
                 ]
+                configured_overall_categories = [
+                    category
+                    for category in winner_categories
+                    if category["winner_type"] == "overall"
+                ]
                 partial_winners_in_metagraph = [
                     category
                     for category in winner_categories_in_metagraph
+                    if category["winner_type"] == "compression_ratio"
+                ]
+                configured_partial_categories = [
+                    category
+                    for category in winner_categories
                     if category["winner_type"] == "compression_ratio"
                 ]
 
@@ -1946,45 +1990,61 @@ async def get_best_miners(
                 partial_winner_weight_per_category = 0.0
 
                 if remaining_weight > 0.0:
-                    has_overall = bool(overall_winners_in_metagraph)
-                    has_partials = bool(partial_winners_in_metagraph)
+                    has_overall_configured = bool(configured_overall_categories)
+                    has_partials_configured = bool(configured_partial_categories)
 
-                    if has_overall and has_partials:
+                    if has_overall_configured and has_partials_configured:
                         partial_winner_weight_total = (
                             remaining_weight * partial_winners_fraction_setting
                         )
                         overall_winner_weight_total = (
                             remaining_weight - partial_winner_weight_total
                         )
-                    elif has_overall:
+                    elif has_overall_configured:
                         overall_winner_weight_total = remaining_weight
-                    elif has_partials:
+                    elif has_partials_configured:
                         partial_winner_weight_total = remaining_weight
                     else:
                         burn_weight += remaining_weight
                         miners_by_uid[0] = miners_by_uid.get(0, 0.0) + remaining_weight
 
-                    if has_overall and overall_winner_weight_total > 0.0:
+                    if has_overall_configured and overall_winner_weight_total > 0.0:
                         overall_winner_weight_per_category = (
                             overall_winner_weight_total
-                            / len(overall_winners_in_metagraph)
+                            / len(configured_overall_categories)
                         )
-                        for winner_category in overall_winners_in_metagraph:
-                            winner_uid = int(winner_category["uid"])
-                            miners_by_uid[winner_uid] = (
-                                miners_by_uid.get(winner_uid, 0.0)
+                        for winner_category in configured_overall_categories:
+                            ss58 = str(winner_category["ss58"])
+                            winner_uid = hotkey_to_uid.get(ss58)
+                            if winner_uid is None:
+                                burn_weight += overall_winner_weight_per_category
+                                miners_by_uid[0] = (
+                                    miners_by_uid.get(0, 0.0)
+                                    + overall_winner_weight_per_category
+                                )
+                                continue
+                            miners_by_uid[int(winner_uid)] = (
+                                miners_by_uid.get(int(winner_uid), 0.0)
                                 + overall_winner_weight_per_category
                             )
 
-                    if has_partials and partial_winner_weight_total > 0.0:
+                    if has_partials_configured and partial_winner_weight_total > 0.0:
                         partial_winner_weight_per_category = (
                             partial_winner_weight_total
-                            / len(partial_winners_in_metagraph)
+                            / len(configured_partial_categories)
                         )
-                        for winner_category in partial_winners_in_metagraph:
-                            winner_uid = int(winner_category["uid"])
-                            miners_by_uid[winner_uid] = (
-                                miners_by_uid.get(winner_uid, 0.0)
+                        for winner_category in configured_partial_categories:
+                            ss58 = str(winner_category["ss58"])
+                            winner_uid = hotkey_to_uid.get(ss58)
+                            if winner_uid is None:
+                                burn_weight += partial_winner_weight_per_category
+                                miners_by_uid[0] = (
+                                    miners_by_uid.get(0, 0.0)
+                                    + partial_winner_weight_per_category
+                                )
+                                continue
+                            miners_by_uid[int(winner_uid)] = (
+                                miners_by_uid.get(int(winner_uid), 0.0)
                                 + partial_winner_weight_per_category
                             )
 
