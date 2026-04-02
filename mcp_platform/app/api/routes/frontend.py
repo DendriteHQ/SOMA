@@ -30,15 +30,25 @@ from soma_shared.contracts.api.v1.frontend import (
     ValidatorListItem,
     ValidatorsListResponse,
 )
+from soma_shared.db.models.answer import Answer
+from soma_shared.db.models.batch_challenge import BatchChallenge
+from soma_shared.db.models.batch_challenge_score import BatchChallengeScore
+from soma_shared.db.models.batch_question_answer import BatchQuestionAnswer
+from soma_shared.db.models.batch_question_score import BatchQuestionScore
+from soma_shared.db.models.challenge import Challenge as ChallengeModel
+from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.competition import Competition
+from soma_shared.db.models.competition_challenge import CompetitionChallenge
 from soma_shared.db.models.miner import Miner
+from soma_shared.db.models.miner_upload import MinerUpload
+from soma_shared.db.models.question import Question
+from soma_shared.db.models.script import Script
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
 from soma_shared.db.models.request import Request as RequestModel
 from soma_shared.db.request_metrics import apply_db_metrics_snapshot_to_request
 from soma_shared.db.session import get_current_db_request_metrics_snapshot, get_db_session
 from app.db.views import (
-    MV_BATCH_CHALLENGE_QUESTIONS,
     MV_COMPETITION_CHALLENGES,
     MV_MINER_COMPETITION_STATS,
     MV_MINER_SCREENER_STATS,
@@ -600,24 +610,79 @@ async def get_miner_contest_challenge_detail(
     if _cached is not None:
         return _cached
 
-    # Single query — mv_batch_challenge_questions includes all header columns.
-    rows = (
+    batch_challenge_data = (
         await db.execute(
-            select(MV_BATCH_CHALLENGE_QUESTIONS)
-            .where(MV_BATCH_CHALLENGE_QUESTIONS.c.batch_challenge_id == batch_challenge_id)
-            .where(MV_BATCH_CHALLENGE_QUESTIONS.c.miner_ss58 == hotkey)
-            .order_by(MV_BATCH_CHALLENGE_QUESTIONS.c.question_id)
+            select(
+                BatchChallenge,
+                ChallengeModel,
+                Competition.competition_name,
+                Competition.id.label("competition_id"),
+                ChallengeBatch.created_at,
+                func.avg(BatchChallengeScore.score).label("overall_score"),
+            )
+            .select_from(BatchChallenge)
+            .join(
+                ChallengeBatch,
+                ChallengeBatch.id == BatchChallenge.challenge_batch_fk,
+            )
+            .join(
+                Script,
+                Script.id == ChallengeBatch.script_fk,
+            )
+            .join(
+                Miner,
+                Miner.id == ChallengeBatch.miner_fk,
+            )
+            .join(
+                MinerUpload,
+                MinerUpload.script_fk == Script.id,
+            )
+            .join(
+                ChallengeModel,
+                ChallengeModel.id == BatchChallenge.challenge_fk,
+            )
+            .join(
+                CompetitionChallenge,
+                CompetitionChallenge.challenge_fk == ChallengeModel.id,
+            )
+            .join(
+                Competition,
+                and_(
+                    Competition.id == CompetitionChallenge.competition_fk,
+                    Competition.id == MinerUpload.competition_fk,
+                ),
+            )
+            .outerjoin(
+                BatchChallengeScore,
+                BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
+            )
+            .where(BatchChallenge.id == batch_challenge_id)
+            .where(Miner.ss58 == hotkey)
+            .where(CompetitionChallenge.is_active.is_(True))
+            .group_by(
+                BatchChallenge.id,
+                ChallengeModel.id,
+                Competition.competition_name,
+                Competition.id,
+                ChallengeBatch.created_at,
+            )
         )
-    ).all()
+    ).first()
 
-    if not rows:
+    if batch_challenge_data is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Challenge not found for this miner",
         )
 
-    header = rows[0]
-    competition_id = header.competition_id
+    (
+        batch_challenge,
+        challenge,
+        competition_name,
+        competition_id,
+        created_at,
+        overall_score,
+    ) = batch_challenge_data
 
     # eval_started — from V_ACTIVE_COMPETITION (live, cheap)
     eval_starts_at = await db.scalar(
@@ -628,31 +693,71 @@ async def get_miner_contest_challenge_detail(
         eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
     eval_started = eval_starts_at is not None and datetime.now(timezone.utc) >= eval_starts_at
 
+    questions_data = (
+        await db.execute(
+            select(
+                Question,
+                BatchQuestionAnswer.produced_answer,
+                Answer.answer.label("ground_truth"),
+                func.avg(BatchQuestionScore.score).label("avg_score"),
+                func.json_agg(BatchQuestionScore.details).label("score_details"),
+            )
+            .select_from(Question)
+            .outerjoin(
+                BatchQuestionAnswer,
+                and_(
+                    BatchQuestionAnswer.question_fk == Question.id,
+                    BatchQuestionAnswer.batch_challenge_fk == batch_challenge_id,
+                ),
+            )
+            .outerjoin(
+                Answer,
+                Answer.question_fk == Question.id,
+            )
+            .outerjoin(
+                BatchQuestionScore,
+                and_(
+                    BatchQuestionScore.question_fk == Question.id,
+                    BatchQuestionScore.batch_challenge_fk == batch_challenge_id,
+                ),
+            )
+            .where(Question.challenge_fk == challenge.id)
+            .group_by(
+                Question.id,
+                BatchQuestionAnswer.produced_answer,
+                Answer.answer,
+            )
+            .order_by(Question.id)
+        )
+    ).all()
+
     questions = [
         QuestionDetail(
-            question_id=r.question_id,
-            question_text=TEXT_HIDDEN_PLACEHOLDER if not eval_started else r.question_text,
-            miner_answer=TEXT_HIDDEN_PLACEHOLDER if not eval_started else r.produced_answer,
-            ground_truth_answer=TEXT_HIDDEN_PLACEHOLDER if not eval_started else r.ground_truth,
-            score=float(r.avg_score) if r.avg_score is not None else None,
+            question_id=question.id,
+            question_text=TEXT_HIDDEN_PLACEHOLDER if not eval_started else question.question,
+            miner_answer=TEXT_HIDDEN_PLACEHOLDER if not eval_started else produced_answer,
+            ground_truth_answer=TEXT_HIDDEN_PLACEHOLDER if not eval_started else ground_truth,
+            score=float(avg_score) if avg_score is not None else None,
             score_details=(
-                r.score_details[0] if r.score_details and r.score_details[0] is not None else None
+                score_details[0]
+                if score_details and score_details[0] is not None
+                else None
             ),
         )
-        for r in rows
+        for question, produced_answer, ground_truth, avg_score, score_details in questions_data
     ]
 
     response = ChallengeDetailResponse(
         challenge=ChallengeDetail(
             batch_challenge_id=batch_challenge_id,
-            challenge_id=header.challenge_id,
-            challenge_name=header.challenge_name,
-            challenge_text=TEXT_HIDDEN_PLACEHOLDER if not eval_started else header.challenge_text,
-            competition_name=header.competition_name,
+            challenge_id=challenge.id,
+            challenge_name=challenge.challenge_name,
+            challenge_text=TEXT_HIDDEN_PLACEHOLDER if not eval_started else challenge.challenge_text,
+            competition_name=competition_name,
             competition_id=competition_id,
-            compression_ratio=header.compression_ratio,
-            created_at=header.created_at,
-            overall_score=float(header.overall_score) if header.overall_score is not None else None,
+            compression_ratio=batch_challenge.compression_ratio,
+            created_at=created_at,
+            overall_score=float(overall_score) if overall_score is not None else None,
             questions=questions,
         )
     )
@@ -660,8 +765,8 @@ async def get_miner_contest_challenge_detail(
     await _cache.set(cache_key, response, ttl=15)
     logger.info(
         f"[Frontend] Challenge detail: batch_challenge_id={batch_challenge_id}, "
-        f"hotkey={hotkey}, challenge_id={header.challenge_id}, "
-        f"questions_count={len(questions)}, overall_score={header.overall_score}"
+        f"hotkey={hotkey}, challenge_id={challenge.id}, "
+        f"questions_count={len(questions)}, overall_score={overall_score}"
     )
 
     return response
@@ -694,24 +799,68 @@ async def get_miner_competition_challenges(
     if datetime.now(timezone.utc) < eval_starts_at:
         return MinerChallengesResponse(challenges=[], total=0)
 
-    # One row per batch_challenge — DISTINCT on header columns avoids per-question duplication.
     rows = (
         await db.execute(
             select(
-                MV_BATCH_CHALLENGE_QUESTIONS.c.batch_challenge_id,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.challenge_id,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.challenge_name,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.competition_id,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.competition_name,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.compression_ratio,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.created_at,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.overall_score,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.scored_at,
+                ChallengeModel.id.label("challenge_id"),
+                ChallengeModel.challenge_name,
+                BatchChallenge.id.label("batch_challenge_id"),
+                Competition.competition_name,
+                Competition.id.label("competition_id"),
+                BatchChallenge.compression_ratio,
+                ChallengeBatch.created_at,
+                func.avg(BatchChallengeScore.score).label("overall_score"),
+                func.max(BatchChallengeScore.created_at).label("scored_at"),
             )
-            .distinct()
-            .where(MV_BATCH_CHALLENGE_QUESTIONS.c.miner_ss58 == hotkey)
-            .where(MV_BATCH_CHALLENGE_QUESTIONS.c.competition_id == comp_id)
-            .order_by(MV_BATCH_CHALLENGE_QUESTIONS.c.created_at.desc())
+            .select_from(ChallengeBatch)
+            .join(
+                Script,
+                Script.id == ChallengeBatch.script_fk,
+            )
+            .join(
+                Miner,
+                Miner.id == ChallengeBatch.miner_fk,
+            )
+            .join(
+                MinerUpload,
+                MinerUpload.script_fk == Script.id,
+            )
+            .join(
+                BatchChallenge,
+                BatchChallenge.challenge_batch_fk == ChallengeBatch.id,
+            )
+            .join(
+                ChallengeModel,
+                ChallengeModel.id == BatchChallenge.challenge_fk,
+            )
+            .join(
+                CompetitionChallenge,
+                and_(
+                    CompetitionChallenge.challenge_fk == ChallengeModel.id,
+                    CompetitionChallenge.competition_fk == comp_id,
+                    CompetitionChallenge.is_active.is_(True),
+                ),
+            )
+            .join(
+                Competition,
+                Competition.id == CompetitionChallenge.competition_fk,
+            )
+            .outerjoin(
+                BatchChallengeScore,
+                BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
+            )
+            .where(Miner.ss58 == hotkey)
+            .where(MinerUpload.competition_fk == comp_id)
+            .group_by(
+                ChallengeModel.id,
+                ChallengeModel.challenge_name,
+                BatchChallenge.id,
+                Competition.competition_name,
+                Competition.id,
+                BatchChallenge.compression_ratio,
+                ChallengeBatch.created_at,
+            )
+            .order_by(ChallengeBatch.created_at.desc())
         )
     ).all()
 
@@ -925,28 +1074,72 @@ async def get_miner_screener_challenges(
     rows = (
         await db.execute(
             select(
-                MV_BATCH_CHALLENGE_QUESTIONS.c.batch_challenge_id,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.challenge_id,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.challenge_name,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.competition_id,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.competition_name,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.compression_ratio,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.created_at,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.overall_score,
-                MV_BATCH_CHALLENGE_QUESTIONS.c.scored_at,
+                ChallengeModel.id.label("challenge_id"),
+                ChallengeModel.challenge_name,
+                BatchChallenge.id.label("batch_challenge_id"),
+                Competition.competition_name,
+                Competition.id.label("competition_id"),
+                BatchChallenge.compression_ratio,
+                ChallengeBatch.created_at,
+                func.avg(BatchChallengeScore.score).label("overall_score"),
+                func.max(BatchChallengeScore.created_at).label("scored_at"),
             )
-            .distinct()
+            .select_from(ChallengeBatch)
             .join(
-                MV_COMPETITION_CHALLENGES,
+                Script,
+                Script.id == ChallengeBatch.script_fk,
+            )
+            .join(
+                Miner,
+                Miner.id == ChallengeBatch.miner_fk,
+            )
+            .join(
+                MinerUpload,
+                MinerUpload.script_fk == Script.id,
+            )
+            .join(
+                BatchChallenge,
+                BatchChallenge.challenge_batch_fk == ChallengeBatch.id,
+            )
+            .join(
+                ChallengeModel,
+                ChallengeModel.id == BatchChallenge.challenge_fk,
+            )
+            .join(
+                CompetitionChallenge,
                 and_(
-                    MV_COMPETITION_CHALLENGES.c.challenge_id == MV_BATCH_CHALLENGE_QUESTIONS.c.challenge_id,
-                    MV_COMPETITION_CHALLENGES.c.competition_id == comp_id,
-                    MV_COMPETITION_CHALLENGES.c.is_screener.is_(True),
+                    CompetitionChallenge.challenge_fk == ChallengeModel.id,
+                    CompetitionChallenge.competition_fk == comp_id,
+                    CompetitionChallenge.is_active.is_(True),
                 ),
             )
-            .where(MV_BATCH_CHALLENGE_QUESTIONS.c.miner_ss58 == hotkey)
-            .where(MV_BATCH_CHALLENGE_QUESTIONS.c.competition_id == comp_id)
-            .order_by(MV_BATCH_CHALLENGE_QUESTIONS.c.created_at.desc())
+            .join(
+                Competition,
+                Competition.id == CompetitionChallenge.competition_fk,
+            )
+            .outerjoin(
+                BatchChallengeScore,
+                BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
+            )
+            .where(Miner.ss58 == hotkey)
+            .where(MinerUpload.competition_fk == comp_id)
+            .where(
+                select(MV_COMPETITION_CHALLENGES.c.challenge_id)
+                .where(MV_COMPETITION_CHALLENGES.c.competition_id == comp_id)
+                .where(MV_COMPETITION_CHALLENGES.c.challenge_id == ChallengeModel.id)
+                .where(MV_COMPETITION_CHALLENGES.c.is_screener.is_(True))
+                .exists()
+            )
+            .group_by(
+                ChallengeModel.id,
+                ChallengeModel.challenge_name,
+                BatchChallenge.id,
+                Competition.competition_name,
+                Competition.id,
+                BatchChallenge.compression_ratio,
+                ChallengeBatch.created_at,
+            )
+            .order_by(ChallengeBatch.created_at.desc())
         )
     ).all()
 

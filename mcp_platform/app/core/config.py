@@ -127,7 +127,7 @@ class Settings(BaseSettings):
         default=10,
         alias="MV_REFRESH_FAST_INTERVAL_SECS",
     )
-    # Slow views: mv_competition_challenges, mv_batch_challenge_questions
+    # Slow views: mv_competition_challenges
     mv_refresh_interval_secs: int = Field(
         default=60,
         alias="MV_REFRESH_INTERVAL_SECS",

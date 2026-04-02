@@ -19,27 +19,6 @@ V_ACTIVE_COMPETITION = sa.table(
 )
 
 
-V_BATCH_CHALLENGE_QUESTIONS = sa.table(
-    "v_batch_challenge_questions",
-    sa.column("batch_challenge_id"),
-    sa.column("miner_ss58"),
-    sa.column("challenge_id"),
-    sa.column("challenge_name"),
-    sa.column("challenge_text"),
-    sa.column("competition_id"),
-    sa.column("competition_name"),
-    sa.column("compression_ratio"),
-    sa.column("created_at"),
-    sa.column("overall_score"),
-    sa.column("scored_at"),
-    sa.column("question_id"),
-    sa.column("question_text"),
-    sa.column("produced_answer"),
-    sa.column("ground_truth"),
-    sa.column("avg_score"),
-    sa.column("score_details"),
-)
-
 V_COMPETITION_CHALLENGES = sa.table(
     "v_competition_challenges",
     sa.column("competition_id"),
@@ -124,27 +103,6 @@ MV_COMPETITION_CHALLENGES = sa.table(
     sa.column("challenge_id"),
     sa.column("is_active"),
     sa.column("is_screener"),
-)
-
-MV_BATCH_CHALLENGE_QUESTIONS = sa.table(
-    "mv_batch_challenge_questions",
-    sa.column("batch_challenge_id"),
-    sa.column("miner_ss58"),
-    sa.column("challenge_id"),
-    sa.column("challenge_name"),
-    sa.column("challenge_text"),
-    sa.column("competition_id"),
-    sa.column("competition_name"),
-    sa.column("compression_ratio"),
-    sa.column("created_at"),
-    sa.column("overall_score"),
-    sa.column("scored_at"),
-    sa.column("question_id"),
-    sa.column("question_text"),
-    sa.column("produced_answer"),
-    sa.column("ground_truth"),
-    sa.column("avg_score"),
-    sa.column("score_details"),
 )
 
 MV_MINER_SCREENER_STATS = sa.table(
