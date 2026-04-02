@@ -37,11 +37,8 @@ from soma_shared.db.models.batch_question_answer import BatchQuestionAnswer
 from soma_shared.db.models.batch_question_score import BatchQuestionScore
 from soma_shared.db.models.challenge import Challenge
 from soma_shared.db.models.challenge_batch import ChallengeBatch
-from soma_shared.db.models.competition_challenge import CompetitionChallenge
 from soma_shared.db.models.miner import Miner
-from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.question import Question
-from soma_shared.db.models.script import Script
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
 from soma_shared.db.models.top_miner import TopMiner
@@ -73,7 +70,10 @@ from app.api.routes.utils import (
     _is_compressed_enough,
     get_script_s3_key,
 )
-from app.db.views import V_MINER_SCREENER_ELIGIBLE_RANKED
+from app.db.views import (
+    V_MINER_COMPETITION_RATIO_RANKED,
+    V_MINER_SCREENER_ELIGIBLE_RANKED,
+)
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -1632,69 +1632,21 @@ async def _get_per_compression_ratio_winners(
     db: AsyncSession,
     competition_id: int,
 ) -> list[tuple[float, str]]:
-    challenge_batches = ChallengeBatch.__table__
-    scripts = Script.__table__
-    miners = Miner.__table__
-    miner_uploads = MinerUpload.__table__
-    batch_challenges = BatchChallenge.__table__
-    scores = BatchChallengeScore.__table__
-    comp_challenges = CompetitionChallenge.__table__
-
-    base = (
-        select(
-            batch_challenges.c.compression_ratio.label("compression_ratio"),
-            miners.c.ss58.label("ss58"),
-            miners.c.miner_banned_status.label("is_banned"),
-            func.avg(scores.c.score).label("ratio_score"),
-            func.count(scores.c.id).label("scored_count"),
-            func.min(miner_uploads.c.created_at).label("first_upload_at"),
-        )
-        .select_from(
-            challenge_batches
-            .join(scripts, scripts.c.id == challenge_batches.c.script_fk)
-            .join(miners, miners.c.id == scripts.c.miner_fk)
-            .join(miner_uploads, miner_uploads.c.script_fk == scripts.c.id)
-            .join(batch_challenges, batch_challenges.c.challenge_batch_fk == challenge_batches.c.id)
-            .outerjoin(scores, scores.c.batch_challenge_fk == batch_challenges.c.id)
-            .join(comp_challenges, comp_challenges.c.challenge_fk == batch_challenges.c.challenge_fk)
-        )
-        .where(comp_challenges.c.competition_fk == competition_id)
-        .where(comp_challenges.c.is_active.is_(True))
-        .where(miner_uploads.c.competition_fk == comp_challenges.c.competition_fk)
-        .where(batch_challenges.c.compression_ratio.is_not(None))
-        .group_by(
-            batch_challenges.c.compression_ratio,
-            miners.c.ss58,
-            miners.c.miner_banned_status,
-        )
-        .subquery()
-    )
-
-    ranked = (
-        select(
-            base.c.compression_ratio,
-            base.c.ss58,
-            func.row_number()
-            .over(
-                partition_by=base.c.compression_ratio,
-                order_by=(
-                    base.c.ratio_score.desc().nullslast(),
-                    base.c.first_upload_at.asc().nullsfirst(),
-                    base.c.ss58.asc(),
-                ),
-            )
-            .label("rank"),
-        )
-        .where(base.c.is_banned.is_(False))
-        .where(base.c.scored_count > 0)
-        .subquery()
-    )
-
     rows = (
         await db.execute(
-            select(ranked.c.compression_ratio, ranked.c.ss58)
-            .where(ranked.c.rank == 1)
-            .order_by(ranked.c.compression_ratio.asc(), ranked.c.ss58.asc())
+            select(
+                V_MINER_COMPETITION_RATIO_RANKED.c.compression_ratio,
+                V_MINER_COMPETITION_RATIO_RANKED.c.ss58,
+            )
+            .where(
+                V_MINER_COMPETITION_RATIO_RANKED.c.competition_id == competition_id
+            )
+            .where(V_MINER_COMPETITION_RATIO_RANKED.c.rank == 1)
+            .where(V_MINER_COMPETITION_RATIO_RANKED.c.is_banned.is_(False))
+            .order_by(
+                V_MINER_COMPETITION_RATIO_RANKED.c.compression_ratio.asc(),
+                V_MINER_COMPETITION_RATIO_RANKED.c.ss58.asc(),
+            )
         )
     ).all()
 
@@ -1909,8 +1861,8 @@ async def get_best_miners(
                     miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn_weight
 
                 # Winner categories:
-                # 1) overall winner (active TopMiner, unchanged source)
-                # 2) one winner per compression ratio from active competition scores
+                # 1) overall winner (active TopMiner)
+                # 2) one winner per compression ratio from DB view
                 overall_winner_ss58 = await _get_active_top_miner_ss58(db, now)
                 ratio_winners: list[tuple[float, str]] = []
                 try:
@@ -1970,21 +1922,71 @@ async def get_best_miners(
                         }
                     )
 
-                winner_weight_per_category = (
-                    remaining_weight / len(winner_categories_in_metagraph)
-                    if remaining_weight > 0.0 and winner_categories_in_metagraph
-                    else 0.0
+                overall_winners_in_metagraph = [
+                    category
+                    for category in winner_categories_in_metagraph
+                    if category["winner_type"] == "overall"
+                ]
+                partial_winners_in_metagraph = [
+                    category
+                    for category in winner_categories_in_metagraph
+                    if category["winner_type"] == "compression_ratio"
+                ]
+
+                partial_winners_fraction_setting = float(
+                    settings.partial_winners_weight_fraction
                 )
-                if winner_weight_per_category > 0.0:
-                    for winner_category in winner_categories_in_metagraph:
-                        winner_uid = int(winner_category["uid"])
-                        miners_by_uid[winner_uid] = (
-                            miners_by_uid.get(winner_uid, 0.0)
-                            + winner_weight_per_category
+                partial_winners_fraction_setting = min(
+                    1.0, max(0.0, partial_winners_fraction_setting)
+                )
+
+                overall_winner_weight_total = 0.0
+                partial_winner_weight_total = 0.0
+                overall_winner_weight_per_category = 0.0
+                partial_winner_weight_per_category = 0.0
+
+                if remaining_weight > 0.0:
+                    has_overall = bool(overall_winners_in_metagraph)
+                    has_partials = bool(partial_winners_in_metagraph)
+
+                    if has_overall and has_partials:
+                        partial_winner_weight_total = (
+                            remaining_weight * partial_winners_fraction_setting
                         )
-                elif remaining_weight > 0.0 and not winner_categories_in_metagraph:
-                    burn_weight += remaining_weight
-                    miners_by_uid[0] = miners_by_uid.get(0, 0.0) + remaining_weight
+                        overall_winner_weight_total = (
+                            remaining_weight - partial_winner_weight_total
+                        )
+                    elif has_overall:
+                        overall_winner_weight_total = remaining_weight
+                    elif has_partials:
+                        partial_winner_weight_total = remaining_weight
+                    else:
+                        burn_weight += remaining_weight
+                        miners_by_uid[0] = miners_by_uid.get(0, 0.0) + remaining_weight
+
+                    if has_overall and overall_winner_weight_total > 0.0:
+                        overall_winner_weight_per_category = (
+                            overall_winner_weight_total
+                            / len(overall_winners_in_metagraph)
+                        )
+                        for winner_category in overall_winners_in_metagraph:
+                            winner_uid = int(winner_category["uid"])
+                            miners_by_uid[winner_uid] = (
+                                miners_by_uid.get(winner_uid, 0.0)
+                                + overall_winner_weight_per_category
+                            )
+
+                    if has_partials and partial_winner_weight_total > 0.0:
+                        partial_winner_weight_per_category = (
+                            partial_winner_weight_total
+                            / len(partial_winners_in_metagraph)
+                        )
+                        for winner_category in partial_winners_in_metagraph:
+                            winner_uid = int(winner_category["uid"])
+                            miners_by_uid[winner_uid] = (
+                                miners_by_uid.get(winner_uid, 0.0)
+                                + partial_winner_weight_per_category
+                            )
 
                 miners = [
                     MinerWeight(uid=uid, weight=weight)
@@ -2001,8 +2003,14 @@ async def get_best_miners(
                             "overall_winner_ss58": overall_winner_ss58,
                             "ratio_winners": ratio_winners,
                             "winner_categories": winner_categories_in_metagraph,
+                            "overall_winners_in_metagraph": overall_winners_in_metagraph,
+                            "partial_winners_in_metagraph": partial_winners_in_metagraph,
                             "dropped_winner_categories": dropped_categories,
-                            "winner_weight_per_category": winner_weight_per_category,
+                            "partial_winners_weight_fraction_setting": partial_winners_fraction_setting,
+                            "overall_winner_weight_total": overall_winner_weight_total,
+                            "partial_winner_weight_total": partial_winner_weight_total,
+                            "overall_winner_weight_per_category": overall_winner_weight_per_category,
+                            "partial_winner_weight_per_category": partial_winner_weight_per_category,
                             "top_screener_miners": top_screener_miners,
                             "screener_weight_total": screener_weight_total,
                             "screener_weight_per_miner": screener_weight_per_miner,
@@ -2027,6 +2035,9 @@ async def get_best_miners(
                             "overall_winner_ss58": overall_winner_ss58,
                             "ratio_winners": ratio_winners,
                             "dropped_winner_categories": dropped_categories,
+                            "partial_winners_weight_fraction_setting": partial_winners_fraction_setting,
+                            "overall_winner_weight_total": overall_winner_weight_total,
+                            "partial_winner_weight_total": partial_winner_weight_total,
                             "top_screener_miners": top_screener_miners,
                             "screener_weight_total": screener_weight_total,
                             "screener_weight_per_miner": screener_weight_per_miner,

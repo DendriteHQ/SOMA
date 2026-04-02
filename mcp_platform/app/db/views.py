@@ -65,6 +65,18 @@ V_MINER_COMPETITION_STATS = sa.table(
     sa.column("ss58"),
     sa.column("is_banned"),
     sa.column("total_score"),
+    sa.column("partial_scores"),
+    sa.column("first_upload_at"),
+    sa.column("rank"),
+)
+
+V_MINER_COMPETITION_RATIO_RANKED = sa.table(
+    "v_miner_competition_ratio_ranked",
+    sa.column("competition_id"),
+    sa.column("compression_ratio"),
+    sa.column("ss58"),
+    sa.column("is_banned"),
+    sa.column("ratio_score"),
     sa.column("first_upload_at"),
     sa.column("rank"),
 )
@@ -114,6 +126,27 @@ MV_COMPETITION_CHALLENGES = sa.table(
     sa.column("is_screener"),
 )
 
+MV_BATCH_CHALLENGE_QUESTIONS = sa.table(
+    "mv_batch_challenge_questions",
+    sa.column("batch_challenge_id"),
+    sa.column("miner_ss58"),
+    sa.column("challenge_id"),
+    sa.column("challenge_name"),
+    sa.column("challenge_text"),
+    sa.column("competition_id"),
+    sa.column("competition_name"),
+    sa.column("compression_ratio"),
+    sa.column("created_at"),
+    sa.column("overall_score"),
+    sa.column("scored_at"),
+    sa.column("question_id"),
+    sa.column("question_text"),
+    sa.column("produced_answer"),
+    sa.column("ground_truth"),
+    sa.column("avg_score"),
+    sa.column("score_details"),
+)
+
 MV_MINER_SCREENER_STATS = sa.table(
     "mv_miner_screener_stats",
     sa.column("competition_id"),
@@ -131,6 +164,7 @@ MV_MINER_COMPETITION_STATS = sa.table(
     sa.column("ss58"),
     sa.column("is_banned"),
     sa.column("total_score"),
+    sa.column("partial_scores"),
     sa.column("first_upload_at"),
     sa.column("rank"),
 )
