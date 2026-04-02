@@ -300,19 +300,19 @@ class SandboxExecutor:
                                     else:
                                         text = str(text_raw or "")
                                     responses.append(text)
-                                    execution_times.append(execution_time)
                                     if text:
                                         task_errors.append(None)
+                                        execution_times.append(execution_time)
                                         logger.info("Output %d: %d bytes", idx, len(text))
                                     else:
                                         err = task_logs if task_logs else "ERROR: empty result"
                                         task_errors.append(err)
+                                        execution_times.append(None)
                                         logger.warning(
                                             "Output %d: empty result. Task logs:\n%s",
                                             idx,
                                             task_logs or "(no logs)",
                                         )
-                                        execution_times.append(None)
                                 else:
                                     responses.append(str(item or ""))
                                     task_errors.append(None if item else "ERROR: empty result")
