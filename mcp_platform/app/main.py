@@ -7,8 +7,9 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
-from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy import select, text
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
@@ -33,6 +34,7 @@ from app.services.batch_cleanup import (
 from app.services.mv_refresh import start_mv_refresh_task, stop_mv_refresh_task
 from app.services.metagraph import MetagraphService
 from app.services.metagraph_runner import MetagraphServiceRunner
+from soma_shared.db.views.definitions import VIEW_DEFINITIONS
 
 logger = get_logger(__name__)
 
@@ -52,7 +54,7 @@ def _iter_exception_chain(exc: BaseException):
 
 
 def _is_db_connectivity_error(exc: BaseException) -> bool:
-    connectivity_types = (TimeoutError, ConnectionError, OSError, DBAPIError, OperationalError)
+    connectivity_types = (TimeoutError, ConnectionError, OSError, OperationalError)
     for chain_exc in _iter_exception_chain(exc):
         if isinstance(chain_exc, connectivity_types):
             return True
@@ -65,6 +67,33 @@ def _is_db_connectivity_error(exc: BaseException) -> bool:
         ):
             return True
     return False
+
+
+def _is_view_definition_mismatch_error(exc: BaseException) -> bool:
+    mismatch_markers = (
+        "cannot change name of view column",
+        "cannot drop columns from view",
+        "cannot change data type of view column",
+    )
+    for chain_exc in _iter_exception_chain(exc):
+        msg = str(chain_exc).lower()
+        if any(marker in msg for marker in mismatch_markers):
+            return True
+    return False
+
+
+async def _drop_live_views_for_rebuild(dsn: str, *, echo: bool) -> None:
+    engine = create_async_engine(
+        dsn,
+        echo=echo,
+        pool_pre_ping=True,
+    )
+    try:
+        async with engine.begin() as conn:
+            for view_def in reversed(VIEW_DEFINITIONS):
+                await conn.execute(text(f"DROP VIEW IF EXISTS {view_def.name}"))
+    finally:
+        await engine.dispose()
 
 
 def _db_target_from_dsn(dsn: str | None) -> dict[str, object]:
@@ -210,6 +239,14 @@ def create_app() -> FastAPI:
         _get_nlp()
         dsn: str | None = None
         db_target: dict[str, object] = {}
+        async def _init_db_once() -> None:
+            await init_db(
+                dsn=dsn,
+                echo=settings.db_echo,
+                pool_size=settings.db_pool_size,
+                max_overflow=settings.db_max_overflow,
+            )
+
         try:
             dsn = settings.get_postgres_dsn()
             if not dsn:
@@ -217,12 +254,23 @@ def create_app() -> FastAPI:
                     "Database DSN not configured (set POSTGRES_DSN or RDS_SECRET_ID)"
                 )
             db_target = _db_target_from_dsn(dsn)
-            await init_db(
-                dsn=dsn,
-                echo=settings.db_echo,
-                pool_size=settings.db_pool_size,
-                max_overflow=settings.db_max_overflow,
-            )
+            try:
+                await _init_db_once()
+            except BaseException as exc:
+                if _is_view_definition_mismatch_error(exc):
+                    _log_startup_failure(
+                        "init_db",
+                        exc,
+                        include_traceback=False,
+                        event="db_view_definition_conflict",
+                        extra={**db_target, "action": "drop_views_and_retry"},
+                    )
+                    await close_db()
+                    await _drop_live_views_for_rebuild(dsn, echo=settings.db_echo)
+                    await close_db()
+                    await _init_db_once()
+                else:
+                    raise
         except BaseException as exc:
             if _is_db_connectivity_error(exc):
                 _log_startup_failure(

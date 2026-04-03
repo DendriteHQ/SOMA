@@ -458,7 +458,10 @@ def _build_screener_task_queries(screener_challenges):
     return scored_pairs, assigned_pairs, pending_scripts
 
 
-def _build_competition_task_queries(active_competition_id: int):
+def _build_competition_task_queries(
+    active_competition_id: int,
+    screener_challenges=None,
+):
     scored_pairs = (
         select(
             ChallengeBatch.script_fk.label("script_fk"),
@@ -482,6 +485,15 @@ def _build_competition_task_queries(active_competition_id: int):
         .where(CompetitionChallenge.competition_fk == active_competition_id)
         .where(CompetitionChallenge.is_active.is_(True))
     )
+    if screener_challenges is not None:
+        scored_pairs = (
+            scored_pairs
+            .outerjoin(
+                screener_challenges,
+                screener_challenges.c.challenge_fk == BatchChallenge.challenge_fk,
+            )
+            .where(screener_challenges.c.challenge_fk.is_(None))
+        )
 
     assigned_pairs = (
         select(
@@ -507,6 +519,15 @@ def _build_competition_task_queries(active_competition_id: int):
         .where(CompetitionChallenge.is_active.is_(True))
         .where(BatchAssignment.done_at.is_(None))
     )
+    if screener_challenges is not None:
+        assigned_pairs = (
+            assigned_pairs
+            .outerjoin(
+                screener_challenges,
+                screener_challenges.c.challenge_fk == BatchChallenge.challenge_fk,
+            )
+            .where(screener_challenges.c.challenge_fk.is_(None))
+        )
 
     pending_scripts = (
         select(ChallengeBatch.script_fk.label("script_fk"))
@@ -530,6 +551,34 @@ def _build_competition_task_queries(active_competition_id: int):
         .distinct()
         .subquery()
     )
+    if screener_challenges is not None:
+        pending_scripts = (
+            select(ChallengeBatch.script_fk.label("script_fk"))
+            .select_from(ChallengeBatch)
+            .join(
+                BatchAssignment,
+                BatchAssignment.challenge_batch_fk == ChallengeBatch.id,
+            )
+            .join(
+                BatchChallenge,
+                BatchChallenge.challenge_batch_fk == ChallengeBatch.id,
+            )
+            .join(Challenge, Challenge.id == BatchChallenge.challenge_fk)
+            .join(
+                CompetitionChallenge,
+                CompetitionChallenge.challenge_fk == Challenge.id,
+            )
+            .outerjoin(
+                screener_challenges,
+                screener_challenges.c.challenge_fk == BatchChallenge.challenge_fk,
+            )
+            .where(CompetitionChallenge.competition_fk == active_competition_id)
+            .where(CompetitionChallenge.is_active.is_(True))
+            .where(screener_challenges.c.challenge_fk.is_(None))
+            .where(BatchAssignment.done_at.is_(None))
+            .distinct()
+            .subquery()
+        )
     return scored_pairs, assigned_pairs, pending_scripts
 
 
@@ -712,7 +761,10 @@ async def _select_miner_ss58(
                 logger.info("_select_miner_ss58: No active competition challenges")
                 return None, None
             scored_pairs, assigned_pairs, pending_scripts = (
-                _build_competition_task_queries(active_competition_id)
+                _build_competition_task_queries(
+                    active_competition_id,
+                    screener_challenges=screener_challenges,
+                )
             )
 
     accounted_pairs = scored_pairs.union(assigned_pairs).subquery()
