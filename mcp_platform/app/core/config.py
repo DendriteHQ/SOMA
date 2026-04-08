@@ -92,10 +92,11 @@ class Settings(BaseSettings):
         default=0.00002,
         alias="SCREENER_WEIGHT_PER_MINER",
     )
-    # Fraction of remaining winner pool allocated to per-compression-ratio
-    # (partial) winners. Supports ratio [0..1] or percent [0..100].
+    # Absolute weight per compression-ratio (partial) winner category.
+    # Each layer gets exactly this weight; the overall winner receives whatever
+    # remains after burn and partial allocations.
     partial_winners_weight_fraction: float = Field(
-        default=0.5,
+        default=0.05,
         alias="PARTIAL_WINNERS_WEIGHT_FRACTION",
     )
 

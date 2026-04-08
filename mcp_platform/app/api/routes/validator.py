@@ -395,7 +395,7 @@ async def register(
             port=payload.serving_port,
             created_at=now,
             last_seen_at=now,
-            current_status="registered",
+            current_status="working",
             is_archive=False,
         )
         db.add(validator)
@@ -404,7 +404,7 @@ async def register(
         validator.ip = payload.serving_ip
         validator.port = payload.serving_port
         validator.last_seen_at = now
-        validator.current_status = "registered"
+        validator.current_status = "working"
         await db.flush()
 
     await db.execute(
@@ -1977,11 +1977,11 @@ async def get_best_miners(
                     if category["winner_type"] == "compression_ratio"
                 ]
 
-                partial_winners_fraction_setting = float(
+                partial_winner_weight_per_category_setting = float(
                     settings.partial_winners_weight_fraction
                 )
-                partial_winners_fraction_setting = min(
-                    1.0, max(0.0, partial_winners_fraction_setting)
+                partial_winner_weight_per_category_setting = max(
+                    0.0, partial_winner_weight_per_category_setting
                 )
 
                 overall_winner_weight_total = 0.0
@@ -1994,8 +1994,11 @@ async def get_best_miners(
                     has_partials_configured = bool(configured_partial_categories)
 
                     if has_overall_configured and has_partials_configured:
-                        partial_winner_weight_total = (
-                            remaining_weight * partial_winners_fraction_setting
+                        # Each partial layer gets a fixed absolute weight; overall gets the rest.
+                        partial_winner_weight_per_category = partial_winner_weight_per_category_setting
+                        partial_winner_weight_total = min(
+                            partial_winner_weight_per_category * len(configured_partial_categories),
+                            remaining_weight,
                         )
                         overall_winner_weight_total = (
                             remaining_weight - partial_winner_weight_total
@@ -2004,6 +2007,9 @@ async def get_best_miners(
                         overall_winner_weight_total = remaining_weight
                     elif has_partials_configured:
                         partial_winner_weight_total = remaining_weight
+                        partial_winner_weight_per_category = (
+                            partial_winner_weight_total / len(configured_partial_categories)
+                        )
                     else:
                         burn_weight += remaining_weight
                         miners_by_uid[0] = miners_by_uid.get(0, 0.0) + remaining_weight
@@ -2029,10 +2035,6 @@ async def get_best_miners(
                             )
 
                     if has_partials_configured and partial_winner_weight_total > 0.0:
-                        partial_winner_weight_per_category = (
-                            partial_winner_weight_total
-                            / len(configured_partial_categories)
-                        )
                         for winner_category in configured_partial_categories:
                             ss58 = str(winner_category["ss58"])
                             winner_uid = hotkey_to_uid.get(ss58)
@@ -2066,7 +2068,7 @@ async def get_best_miners(
                             "overall_winners_in_metagraph": overall_winners_in_metagraph,
                             "partial_winners_in_metagraph": partial_winners_in_metagraph,
                             "dropped_winner_categories": dropped_categories,
-                            "partial_winners_weight_fraction_setting": partial_winners_fraction_setting,
+                            "partial_winner_weight_per_category_setting": partial_winner_weight_per_category_setting,
                             "overall_winner_weight_total": overall_winner_weight_total,
                             "partial_winner_weight_total": partial_winner_weight_total,
                             "overall_winner_weight_per_category": overall_winner_weight_per_category,
@@ -2095,7 +2097,7 @@ async def get_best_miners(
                             "overall_winner_ss58": overall_winner_ss58,
                             "ratio_winners": ratio_winners,
                             "dropped_winner_categories": dropped_categories,
-                            "partial_winners_weight_fraction_setting": partial_winners_fraction_setting,
+                            "partial_winner_weight_per_category_setting": partial_winner_weight_per_category_setting,
                             "overall_winner_weight_total": overall_winner_weight_total,
                             "partial_winner_weight_total": partial_winner_weight_total,
                             "top_screener_miners": top_screener_miners,
