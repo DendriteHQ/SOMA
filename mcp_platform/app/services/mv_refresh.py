@@ -9,6 +9,15 @@ from app.core.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _is_unpopulated_mv_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "materialized view" in message
+        and "concurrently" in message
+        and "not populated" in message
+    )
+
+
 def start_mv_refresh_task(app) -> None:
     task = asyncio.create_task(_run_refresh_loop())
     app.state.mv_refresh_task = task
@@ -68,8 +77,30 @@ async def _run_refresh_loop() -> None:
                             )
                         last_refresh[mv.name] = time.monotonic()
                         logger.info(f"mv_refreshed view: {mv.name}")
-                    except Exception:
-                        logger.exception("mv_refresh_failed", extra={"view": mv.name})
+                    except Exception as exc:
+                        if _is_unpopulated_mv_error(exc):
+                            try:
+                                async for conn in _get_raw_connection():
+                                    await conn.exec_driver_sql(
+                                        f"REFRESH MATERIALIZED VIEW {mv.name}",
+                                        execution_options={
+                                            "isolation_level": "AUTOCOMMIT"
+                                        },
+                                    )
+                                last_refresh[mv.name] = time.monotonic()
+                                logger.info(
+                                    f"mv_refreshed_initial_nonconcurrent view: {mv.name}"
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "mv_refresh_initial_failed",
+                                    extra={"view": mv.name},
+                                )
+                        else:
+                            logger.exception(
+                                "mv_refresh_failed",
+                                extra={"view": mv.name},
+                            )
 
             # Sleep for the smallest interval so we can wake up in time
             # for the next fast view refresh.

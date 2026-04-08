@@ -92,6 +92,13 @@ class Settings(BaseSettings):
         default=0.00002,
         alias="SCREENER_WEIGHT_PER_MINER",
     )
+    # Absolute weight per compression-ratio (partial) winner category.
+    # Each layer gets exactly this weight; the overall winner receives whatever
+    # remains after burn and partial allocations.
+    partial_winners_weight_fraction: float = Field(
+        default=0.05,
+        alias="PARTIAL_WINNERS_WEIGHT_FRACTION",
+    )
 
     # Private network CIDRs for frontend API access
     private_network_cidrs: list[str] = Field(
@@ -270,6 +277,28 @@ class Settings(BaseSettings):
         except (TypeError, ValueError) as exc:
             raise ValueError("SCREENER_EXTRA_SCORE_POINTS must be a number") from exc
         # Accept either ratio [0..1] or percent points [0..100].
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator("partial_winners_weight_fraction", mode="before")
+    @classmethod
+    def _parse_partial_winners_weight_fraction(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.5
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "PARTIAL_WINNERS_WEIGHT_FRACTION must be a number"
+            ) from exc
+        # Accept either ratio [0..1] or percent [0..100].
         if numeric > 1:
             if numeric > 100:
                 numeric = 100.0

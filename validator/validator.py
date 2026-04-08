@@ -624,8 +624,8 @@ class Validator(AbstractValidator):
                 try:
                     current_block = await self.settings.subtensor.get_current_block()
                     if last_weight_set_block is None:
-                        last_weight_set_block = current_block
-                        logging.info(f"Initialized last_weight_set_block={current_block}")
+                        last_weight_set_block = current_block - self.settings.weight_block_interval
+                        logging.info(f"Initialized last_weight_set_block={last_weight_set_block} (forcing immediate weight set on startup)")
                     blocks_since_last = current_block - last_weight_set_block
                     if blocks_since_last >= self.settings.weight_block_interval:
                         if weight_task is None or weight_task.done():

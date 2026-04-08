@@ -300,6 +300,7 @@ class SandboxExecutor:
                                     else:
                                         text = str(text_raw or "")
                                     responses.append(text)
+                                    execution_times.append(execution_time)
                                     if text:
                                         task_errors.append(None)
                                         execution_times.append(execution_time)
@@ -313,6 +314,7 @@ class SandboxExecutor:
                                             idx,
                                             task_logs or "(no logs)",
                                         )
+                                        execution_times.append(None)
                                 else:
                                     responses.append(str(item or ""))
                                     task_errors.append(None if item else "ERROR: empty result")
