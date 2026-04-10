@@ -1819,46 +1819,63 @@ async def get_best_miners(
                 # Assign each top miner their absolute weight directly.
                 # Miners not in the metagraph snapshot get their share redirected to uid 0.
                 # Whatever is not claimed by screeners or top miners goes to uid 0 (burn).
-                screener_used = sum(screener_weights_by_uid.values())
-                top_miners_assigned = 0.0
-                for ss58, w in top_miner_ss58_weights.items():
-                    if w <= 0.0:
-                        continue
-                    uid = hotkey_to_uid.get(ss58)
-                    if uid is None:
-                        miners_by_uid[0] = miners_by_uid.get(0, 0.0) + w
-                    else:
-                        miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + w
-                    top_miners_assigned += w
-                burn = max(0.0, 1.0 - screener_used - top_miners_assigned)
-                if burn > 0.0:
-                    miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn
-
-                miners = [
-                    MinerWeight(uid=uid, weight=weight)
-                    for uid, weight in miners_by_uid.items()
-                ]
-                if not miners:
-                    miners = [MinerWeight(uid=0, weight=1.0)]
-
-                logger.info(
-                    "get_best_miners_weights",
-                    extra={
-                        "request_id": request_id,
-                        "top_miners": [
-                            {"ss58": ss58, "weight": w}
-                            for ss58, w in top_miner_ss58_weights.items()
-                        ],
-                        "top_screener_miners": top_screener_miners,
-                        "screener_weight_total": screener_weight_total,
-                        "screener_weight_per_miner": screener_weight_per_miner,
-                        "top_miners_assigned": top_miners_assigned,
-                        "burn": burn,
-                        "miners": _miners_log(miners),
-                    },
+                top_miner_weight_total = sum(
+                    w for w in top_miner_ss58_weights.values() if w > 0.0
                 )
+                combined_weight = screener_weight_total + top_miner_weight_total
+                if combined_weight > 1.0 + 1e-6:
+                    logger.warning(
+                        "get_best_miners_combined_weight_exceeds_1",
+                        extra={
+                            "request_id": request_id,
+                            "screener_weight_total": screener_weight_total,
+                            "top_miner_weight_total": top_miner_weight_total,
+                            "combined_weight": combined_weight,
+                        },
+                    )
+                    miners = [MinerWeight(uid=0, weight=1.0)]
+                    response_payload = GetBestMinersUidResponse(miners=miners)
+                else:
+                    screener_used = sum(screener_weights_by_uid.values())
+                    top_miners_assigned = 0.0
+                    for ss58, w in top_miner_ss58_weights.items():
+                        if w <= 0.0:
+                            continue
+                        uid = hotkey_to_uid.get(ss58)
+                        if uid is None:
+                            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + w
+                        else:
+                            miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + w
+                        top_miners_assigned += w
+                    burn = max(0.0, 1.0 - screener_used - top_miners_assigned)
+                    if burn > 0.0:
+                        miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn
 
-                response_payload = GetBestMinersUidResponse(miners=miners)
+                    miners = [
+                        MinerWeight(uid=uid, weight=weight)
+                        for uid, weight in miners_by_uid.items()
+                    ]
+                    if not miners:
+                        miners = [MinerWeight(uid=0, weight=1.0)]
+
+                    logger.info(
+                        "get_best_miners_weights",
+                        extra={
+                            "request_id": request_id,
+                            "top_miners": [
+                                {"ss58": ss58, "weight": w}
+                                for ss58, w in top_miner_ss58_weights.items()
+                            ],
+                            "top_screener_miners": top_screener_miners,
+                            "screener_weight_total": screener_weight_total,
+                            "screener_weight_per_miner": screener_weight_per_miner,
+                            "top_miners_assigned": top_miners_assigned,
+                            "burn": burn,
+                            "miners": _miners_log(miners),
+                        },
+                    )
+
+                    response_payload = GetBestMinersUidResponse(miners=miners)
 
     response_nonce = generate_nonce()
     response_sig = sign_payload_model(response_payload, nonce=response_nonce, wallet=settings.wallet)
@@ -1903,5 +1920,6 @@ async def get_best_miners(
         request_id=request_id,
         payload=log_payload,
         status_code=status.HTTP_200_OK,
+        response_payload=response_payload.model_dump(mode="json"),
     )
     return response
