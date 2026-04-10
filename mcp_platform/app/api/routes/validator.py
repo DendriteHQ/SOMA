@@ -8,7 +8,7 @@ import uuid
 import bittensor as bt
 
 from fastapi import APIRouter, HTTPException, status, Depends, Request
-from sqlalchemy import delete, func, select, update, literal
+from sqlalchemy import delete, func, select, update, literal, or_, case
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -70,7 +70,9 @@ from app.api.routes.utils import (
     _is_compressed_enough,
     get_script_s3_key,
 )
-from app.db.views import V_MINER_SCREENER_ELIGIBLE_RANKED
+from app.db.views import (
+    V_MINER_SCREENER_ELIGIBLE_RANKED,
+)
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -393,7 +395,7 @@ async def register(
             port=payload.serving_port,
             created_at=now,
             last_seen_at=now,
-            current_status="registered",
+            current_status="working",
             is_archive=False,
         )
         db.add(validator)
@@ -402,7 +404,7 @@ async def register(
         validator.ip = payload.serving_ip
         validator.port = payload.serving_port
         validator.last_seen_at = now
-        validator.current_status = "registered"
+        validator.current_status = "working"
         await db.flush()
 
     await db.execute(
@@ -691,7 +693,7 @@ async def request_challenge(
 
     challenge_by_id = {challenge.id: challenge for challenge in challenge_list}
 
-    response_items: list[tuple[BatchChallenge, Challenge]] = []
+    response_items: list[tuple[BatchChallenge, Challenge, str]] = []
     challenge_texts: list[str] = []
     compression_ratios: list[float | None] = []
     storage_uuids: list[str] = []
@@ -701,13 +703,8 @@ async def request_challenge(
         if challenge is None:
             continue
         storage_uuid = f"{script.script_uuid}/{uuid.uuid4()}"
-        db.add(
-            BatchCompressedText(
-                batch_challenge_fk=batch_challenge.id,
-                storage_uuid=storage_uuid,
-            )
-        )
-        response_items.append((batch_challenge, challenge))
+        # Don't create BatchCompressedText yet - wait for sandbox results
+        response_items.append((batch_challenge, challenge, storage_uuid))
         challenge_texts.append(challenge.challenge_text or "")
         compression_ratios.append(float(batch_challenge.compression_ratio))
         storage_uuids.append(storage_uuid)
@@ -732,7 +729,7 @@ async def request_challenge(
             storage_keys, "put_object", expires_in=_presigned_expires_in
         )
 
-        compressed_texts, task_errors = await sandbox_manager.run_batch(
+        compressed_texts, task_errors, execution_times = await sandbox_manager.run_batch(
             batch_id=str(challenge_batch.id),
             script_presigned_url=script_presigned_url,
             challenge_texts=challenge_texts,
@@ -757,6 +754,38 @@ async def request_challenge(
         logger.info(
             "request_challenge: compressed text lengths "
             f"request_id={request_id} lengths={compressed_lengths}"
+        )
+        
+        # Create BatchCompressedText records only for successful tasks (no task_error)
+        # Failed tasks already have errors recorded in batch_question_score.details
+        created_count = 0
+        skipped_count = 0
+        for idx, (batch_challenge, challenge, storage_uuid) in enumerate(response_items):
+            task_error = task_errors[idx] if idx < len(task_errors) else None
+            
+            # Skip creating record if task failed
+            if task_error:
+                skipped_count += 1
+                logger.debug(
+                    "request_challenge: skipping BatchCompressedText for failed task "
+                    f"idx={idx} batch_challenge_id={batch_challenge.id} error={task_error}"
+                )
+                continue
+            
+            execution_time = execution_times[idx] if idx < len(execution_times) else None
+            db.add(
+                BatchCompressedText(
+                    batch_challenge_fk=batch_challenge.id,
+                    storage_uuid=storage_uuid,
+                    execution_time_seconds=float(execution_time) if execution_time is not None else None,
+                )
+            )
+            created_count += 1
+        
+        logger.info(
+            "request_challenge: created BatchCompressedText records "
+            f"request_id={request_id} created={created_count} skipped={skipped_count} "
+            f"execution_times={execution_times}"
         )
     except RuntimeError as exc:
         if "Platform is at capacity" in str(exc):
@@ -819,7 +848,7 @@ async def request_challenge(
     zero_score_questions: list[BatchQuestionScore] = []
     zero_score_rollups: list[BatchChallengeScore] = []
     challenges_response = []
-    for idx, (batch_challenge, challenge) in enumerate(response_items):
+    for idx, (batch_challenge, challenge, storage_uuid) in enumerate(response_items):
         compressed_text = compressed_texts[idx] if idx < len(compressed_texts) else ""
         task_error = task_errors[idx] if idx < len(task_errors) else None
         ratio = (
@@ -1731,17 +1760,12 @@ async def get_best_miners(
                         exc_info=exc,
                     )
 
-                _, burn_ratio = await _get_current_burn_state(db)
                 per_miner_setting = float(
                     getattr(settings, "screener_weight_per_miner", 0.0)
                 )
                 per_miner_setting = max(0.0, per_miner_setting)
                 screener_miners_count = len(top_screener_miners)
-                desired_screener_total = per_miner_setting * screener_miners_count
-                available_for_screener = max(0.0, 1.0 - burn_ratio)
-                screener_weight_total = min(
-                    desired_screener_total, available_for_screener
-                )
+                screener_weight_total = per_miner_setting * screener_miners_count
                 screener_weight_per_miner = (
                     screener_weight_total / screener_miners_count
                     if screener_miners_count > 0 and screener_weight_total > 0.0
@@ -1755,9 +1779,6 @@ async def get_best_miners(
                         "screener_weight_per_miner": screener_weight_per_miner,
                         "screener_weight_per_miner_setting": per_miner_setting,
                         "screener_miners_count": screener_miners_count,
-                        "desired_screener_total": desired_screener_total,
-                        "available_for_screener": available_for_screener,
-                        "burn_ratio": burn_ratio,
                     },
                 )
                 screener_weights_by_uid: dict[int, float] = {}
@@ -1768,130 +1789,92 @@ async def get_best_miners(
                             + screener_weight_per_miner
                         )
 
-                # Check TopMiner table for an active entry covering 'now'
-                try:
-                    result = await db.execute(
-                        select(TopMiner)
-                        .where(TopMiner.starts_at <= now)
-                        .where(TopMiner.ends_at >= now)
-                        .order_by(TopMiner.created_at.desc())
-                        .limit(1)
-                    )
-                    top_miner = result.scalars().first()
-                except Exception as _exc:
-                    top_miner = None
+                miners_by_uid = dict(screener_weights_by_uid)
 
-                if top_miner is None:
-                    # No active TopMiner configured; burn remaining weight to uid 0
-                    remaining_weight = max(
-                        0.0, 1.0 - burn_ratio - screener_weight_total
+                # Distribute remaining weight proportionally by top_miner.weight.
+                # Miners not in the metagraph snapshot and any leftover go to uid 0.
+                top_miner_ss58_weights: dict[str, float] = {}
+                try:
+                    tm_rows = (
+                        await db.execute(
+                            select(TopMiner.ss58, TopMiner.weight)
+                            .where(TopMiner.starts_at <= now)
+                            .where(TopMiner.ends_at >= now)
+                        )
+                    ).all()
+                    for row in tm_rows:
+                        ss58 = str(row.ss58).strip()
+                        if ss58:
+                            top_miner_ss58_weights[ss58] = (
+                                top_miner_ss58_weights.get(ss58, 0.0)
+                                + (float(row.weight) if row.weight else 0.0)
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "get_best_miners_top_miners_query_failed",
+                        extra={"request_id": request_id, "error": str(exc)},
+                        exc_info=exc,
                     )
-                    miners_by_uid = dict(screener_weights_by_uid)
-                    burn_weight = burn_ratio + remaining_weight
-                    if burn_weight > 0.0:
-                        miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn_weight
+
+                # Assign each top miner their absolute weight directly.
+                # Miners not in the metagraph snapshot get their share redirected to uid 0.
+                # Whatever is not claimed by screeners or top miners goes to uid 0 (burn).
+                top_miner_weight_total = sum(
+                    w for w in top_miner_ss58_weights.values() if w > 0.0
+                )
+                combined_weight = screener_weight_total + top_miner_weight_total
+                if combined_weight > 1.0 + 1e-6:
+                    logger.warning(
+                        "get_best_miners_combined_weight_exceeds_1",
+                        extra={
+                            "request_id": request_id,
+                            "screener_weight_total": screener_weight_total,
+                            "top_miner_weight_total": top_miner_weight_total,
+                            "combined_weight": combined_weight,
+                        },
+                    )
+                    miners = [MinerWeight(uid=0, weight=1.0)]
+                    response_payload = GetBestMinersUidResponse(miners=miners)
+                else:
+                    screener_used = sum(screener_weights_by_uid.values())
+                    top_miners_assigned = 0.0
+                    for ss58, w in top_miner_ss58_weights.items():
+                        if w <= 0.0:
+                            continue
+                        uid = hotkey_to_uid.get(ss58)
+                        if uid is None:
+                            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + w
+                        else:
+                            miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + w
+                        top_miners_assigned += w
+                    burn = max(0.0, 1.0 - screener_used - top_miners_assigned)
+                    if burn > 0.0:
+                        miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn
+
                     miners = [
                         MinerWeight(uid=uid, weight=weight)
                         for uid, weight in miners_by_uid.items()
                     ]
                     if not miners:
                         miners = [MinerWeight(uid=0, weight=1.0)]
+
                     logger.info(
-                        "get_best_miners_fallback",
+                        "get_best_miners_weights",
                         extra={
                             "request_id": request_id,
-                            "reason": "no_active_top_miner",
+                            "top_miners": [
+                                {"ss58": ss58, "weight": w}
+                                for ss58, w in top_miner_ss58_weights.items()
+                            ],
                             "top_screener_miners": top_screener_miners,
                             "screener_weight_total": screener_weight_total,
                             "screener_weight_per_miner": screener_weight_per_miner,
-                            "remaining_weight": remaining_weight,
-                            "burn_ratio": burn_ratio,
-                            "burn_weight": burn_weight,
+                            "top_miners_assigned": top_miners_assigned,
+                            "burn": burn,
                             "miners": _miners_log(miners),
                         },
                     )
-                    response_payload = GetBestMinersUidResponse(miners=miners)
-                else:
-                    # Map ss58 to uid using metagraph snapshot
-                    try:
-                        uid = hotkey_to_uid.get(str(top_miner.ss58))
-                    except Exception:
-                        uid = None
 
-                    if uid is None:
-                        # Configured TopMiner not present in metagraph; burn remaining weight to uid 0
-                        remaining_weight = max(
-                            0.0, 1.0 - burn_ratio - screener_weight_total
-                        )
-                        miners_by_uid = dict(screener_weights_by_uid)
-                        burn_weight = burn_ratio + remaining_weight
-                        if burn_weight > 0.0:
-                            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn_weight
-                        miners = [
-                            MinerWeight(uid=uid, weight=weight)
-                            for uid, weight in miners_by_uid.items()
-                        ]
-                        if not miners:
-                            miners = [MinerWeight(uid=0, weight=1.0)]
-                        logger.info(
-                            "get_best_miners_fallback",
-                            extra={
-                                "request_id": request_id,
-                                "reason": "top_miner_not_in_metagraph",
-                                "top_miner_ss58": str(top_miner.ss58),
-                                "screener_weight_total": screener_weight_total,
-                                "screener_weight_per_miner": screener_weight_per_miner,
-                                "remaining_weight": remaining_weight,
-                                "burn_ratio": burn_ratio,
-                                "burn_weight": burn_weight,
-                                "miners": _miners_log(miners),
-                            },
-                        )
-                    else:
-                        # Calculate weight distribution
-                        # Remaining weight after screener allocation
-                        remaining_weight = max(
-                            0.0, 1.0 - burn_ratio - screener_weight_total
-                        )
-                        burn_weight = burn_ratio
-                        top_miner_weight = remaining_weight
-
-                        # Build miners list
-                        miners_by_uid = dict(screener_weights_by_uid)
-
-                        # Add burn if applicable
-                        if burn_weight > 0.0:
-                            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn_weight
-
-                        # Add TopMiner weight
-                        if top_miner_weight > 0.0:
-                            miners_by_uid[uid] = (
-                                miners_by_uid.get(uid, 0.0) + top_miner_weight
-                            )
-
-                        miners = [
-                            MinerWeight(uid=uid, weight=weight)
-                            for uid, weight in miners_by_uid.items()
-                        ]
-                        if not miners:
-                            # Edge-case fallback
-                            miners = [MinerWeight(uid=0, weight=1.0)]
-                        logger.info(
-                            "get_best_miners_weights",
-                            extra={
-                                "request_id": request_id,
-                                "top_miner_uid": uid,
-                                "top_miner_ss58": str(top_miner.ss58),
-                                "top_screener_miners": top_screener_miners,
-                                "screener_weight_total": screener_weight_total,
-                                "screener_weight_per_miner": screener_weight_per_miner,
-                                "remaining_weight": remaining_weight,
-                                "burn_ratio": burn_ratio,
-                                "burn_weight": burn_weight,
-                                "top_miner_weight": top_miner_weight,
-                                "miners": _miners_log(miners),
-                            },
-                        )
                     response_payload = GetBestMinersUidResponse(miners=miners)
 
     response_nonce = generate_nonce()
@@ -1937,5 +1920,6 @@ async def get_best_miners(
         request_id=request_id,
         payload=log_payload,
         status_code=status.HTTP_200_OK,
+        response_payload=response_payload.model_dump(mode="json"),
     )
     return response

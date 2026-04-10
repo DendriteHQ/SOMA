@@ -129,7 +129,7 @@ class SandboxExecutor:
         compression_ratios: List[Optional[float]],
         timeout_per_task: float,
         container_timeout: float,
-    ) -> tuple[List[str], List[str | None]]:
+    ) -> tuple[List[str], List[str | None], List[float | None]]:
         """Execute a batch of compression tasks.
         
         Args:
@@ -161,7 +161,7 @@ class SandboxExecutor:
         compression_ratios: List[Optional[float]],
         timeout_per_task: float,
         container_timeout: float,
-    ) -> tuple[List[str], List[str | None]]:
+    ) -> tuple[List[str], List[str | None], List[float | None]]:
         """Synchronous batch execution.
         
         Args:
@@ -280,6 +280,7 @@ class SandboxExecutor:
                 output_path = output_dir / "output.json"
                 responses: List[str] = []
                 task_errors: List[str | None] = []
+                execution_times: List[float | None] = []
 
                 if output_path.exists():
                     try:
@@ -293,25 +294,31 @@ class SandboxExecutor:
                                 if isinstance(item, tuple) and len(item) >= 1:
                                     text_raw = item[0]
                                     task_logs = item[1] if len(item) >= 2 else ""
+                                    execution_time = item[2] if len(item) >= 3 else None    
                                     if isinstance(text_raw, list):
                                         text = text_raw[0] if text_raw else ""
                                     else:
                                         text = str(text_raw or "")
                                     responses.append(text)
+                                    execution_times.append(execution_time)
                                     if text:
                                         task_errors.append(None)
+                                        execution_times.append(execution_time)
                                         logger.info("Output %d: %d bytes", idx, len(text))
                                     else:
                                         err = task_logs if task_logs else "ERROR: empty result"
                                         task_errors.append(err)
+                                        execution_times.append(None)
                                         logger.warning(
                                             "Output %d: empty result. Task logs:\n%s",
                                             idx,
                                             task_logs or "(no logs)",
                                         )
+                                        execution_times.append(None)
                                 else:
                                     responses.append(str(item or ""))
                                     task_errors.append(None if item else "ERROR: empty result")
+                                    execution_times.append(None)
                     except Exception as exc:
                         logger.error(
                             "Failed to parse output.json: %s",
@@ -320,10 +327,11 @@ class SandboxExecutor:
                         )
                         responses = []
                         task_errors = []
+                        execution_times = []
                 else:
                     logger.warning("output.json does not exist at %s", output_path)
                     task_errors = ["ERROR: no output"] * len(challenge_texts)
-
+                    execution_times = [None] * len(challenge_texts)
                 # Normalize result length
                 if len(responses) < len(challenge_texts):
                     responses.extend([""] * (len(challenge_texts) - len(responses)))
@@ -336,7 +344,7 @@ class SandboxExecutor:
                 elif len(task_errors) > len(challenge_texts):
                     task_errors = task_errors[:len(challenge_texts)]
 
-                return responses, task_errors
+                return responses, task_errors, execution_times
             finally:
                 self._cleanup_limited_fs(fs_img, output_dir)
 
