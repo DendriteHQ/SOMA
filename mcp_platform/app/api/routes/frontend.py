@@ -104,6 +104,38 @@ def _normalize_partial_scores(raw: object) -> list[PartialScore] | None:
     return partial_scores
 
 
+async def _get_latest_competition_id(db: AsyncSession) -> int | None:
+    """Return the competition_id with the latest eval_ends_at."""
+    row = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.competition_id)
+        .order_by(V_ACTIVE_COMPETITION.c.eval_ends_at.desc())
+        .limit(1)
+    )
+    return int(row) if row is not None else None
+
+
+def _should_show_partial_scores(
+    comp_id: int,
+    latest_comp_id: int | None,
+    eval_ends_at: object,
+) -> bool:
+    """Return True if partial_scores should be exposed for this competition.
+
+    Rules:
+    - Always show for the latest (current) competition.
+    - Hide for archived competitions where evaluation has already ended.
+    """
+    if latest_comp_id is not None and comp_id == latest_comp_id:
+        return True
+    if eval_ends_at is None:
+        return False
+    from datetime import datetime, timezone as _tz  # local import to avoid shadowing
+    dt = eval_ends_at
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_tz.utc)
+    return datetime.now(_tz.utc) <= dt
+
+
 async def _log_frontend_request_metrics(request: Request, status_code: int) -> None:
     request_id = getattr(request.state, "request_id", None)
     if not request_id:
@@ -390,6 +422,13 @@ async def list_miners_by_competition(
             detail="Competition not found",
         )
 
+    latest_comp_id = await _get_latest_competition_id(db)
+    comp_eval_ends_at = await db.scalar(
+        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
+        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+    )
+    show_partial_scores = _should_show_partial_scores(comp_id, latest_comp_id, comp_eval_ends_at)
+
     total_value = int(
         await db.scalar(
             select(func.count())
@@ -446,7 +485,7 @@ async def list_miners_by_competition(
         )
         competition_partial_scores = (
             _normalize_partial_scores(r.partial_scores)
-            if competition_score is not None
+            if competition_score is not None and show_partial_scores
             else None
         )
         miners.append(
@@ -529,16 +568,24 @@ async def get_miner_by_competition(
     miner = await db.scalar(select(Miner).where(Miner.ss58 == hotkey))
 
     # eval_started — from V_ACTIVE_COMPETITION (live view, cheap)
-    eval_starts_at = await db.scalar(
-        select(V_ACTIVE_COMPETITION.c.eval_starts_at)
-        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
-    )
+    _comp_timeframe = (
+        await db.execute(
+            select(
+                V_ACTIVE_COMPETITION.c.eval_starts_at,
+                V_ACTIVE_COMPETITION.c.eval_ends_at,
+            ).where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
+        )
+    ).first()
+    eval_starts_at = _comp_timeframe.eval_starts_at if _comp_timeframe else None
+    _comp_eval_ends_at = _comp_timeframe.eval_ends_at if _comp_timeframe else None
     eval_started = (
         eval_starts_at is not None
         and datetime.now(timezone.utc) >= eval_starts_at.replace(tzinfo=timezone.utc)
         if eval_starts_at and eval_starts_at.tzinfo is None
         else eval_starts_at is not None and datetime.now(timezone.utc) >= eval_starts_at
     )
+    _latest_comp_id = await _get_latest_competition_id(db)
+    show_partial_scores = _should_show_partial_scores(comp_id, _latest_comp_id, _comp_eval_ends_at)
 
     # Competition name
     comp_name = await db.scalar(
@@ -554,7 +601,7 @@ async def get_miner_by_competition(
 
     show_score = miner_st in {"scored", "evaluating"} and eval_started
     contest_partial_scores = (
-        _normalize_partial_scores(row.partial_scores) if show_score else None
+        _normalize_partial_scores(row.partial_scores) if show_score and show_partial_scores else None
     )
 
     last_contest = ContestSummary(
@@ -911,6 +958,7 @@ async def get_miner_competition(
             select(
                 V_ACTIVE_COMPETITION.c.competition_name,
                 V_ACTIVE_COMPETITION.c.eval_starts_at,
+                V_ACTIVE_COMPETITION.c.eval_ends_at,
             ).where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
         )
     ).first()
@@ -925,6 +973,8 @@ async def get_miner_competition(
     if eval_starts_at is not None and eval_starts_at.tzinfo is None:
         eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
     eval_started = eval_starts_at is not None and datetime.now(timezone.utc) >= eval_starts_at
+    _latest_comp_id = await _get_latest_competition_id(db)
+    show_partial_scores = _should_show_partial_scores(comp_id, _latest_comp_id, comp_row.eval_ends_at)
 
     # Don't return data if evaluation hasn't started yet
     if not eval_started:
@@ -970,13 +1020,13 @@ async def get_miner_competition(
         name=f"{comp_row.competition_name} #{comp_id}",
         date=row.last_submit_at,
         score=float(row.total_score) if row.total_score is not None and eval_started else None,
-        partial_scores=_normalize_partial_scores(row.partial_scores) if eval_started else None,
+        partial_scores=_normalize_partial_scores(row.partial_scores) if eval_started and show_partial_scores else None,
         rank=int(row.rank) if row.rank is not None and eval_started else None,
     )
 
     await _cache.set(cache_key, response, ttl=15)
     logger.info(
-        f"[Frontend] Miner competition: comp_id={comp_id}, hotkey={hotkey}, "
+        f"[Frontend] Miner competition: comp_id={comp_id}, hotkey={hotkey}, ",
         f"total_score={row.total_score}, rank={row.rank}"
     )
 
