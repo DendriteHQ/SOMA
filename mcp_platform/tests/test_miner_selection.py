@@ -966,6 +966,115 @@ async def test_eval_top_fraction_ignores_banned_miners(
 
 
 @pytest.mark.asyncio
+async def test_eval_phase_selects_miner_with_unassigned_competition_backlog(
+    async_session: AsyncSession, setup_base_data
+):
+    """Test: Eval-phase miner with unassigned competition backlog remains selectable."""
+    competition, validator = setup_base_data
+
+    now = datetime.now(timezone.utc)
+    timeframe = await async_session.scalar(select(CompetitionTimeframe))
+    timeframe.upload_starts_at = now - timedelta(days=2)
+    timeframe.upload_ends_at = now - timedelta(days=1)
+    timeframe.eval_starts_at = now - timedelta(hours=1)
+    timeframe.eval_ends_at = now + timedelta(hours=1)
+    await async_session.commit()
+
+    original_top = settings.top_screener_scripts
+    settings.top_screener_scripts = 1.0
+
+    try:
+        miner = Miner(id=95, ss58="miner_unassigned_backlog")
+        async_session.add(miner)
+        await async_session.flush()
+
+        script = Script(
+            id=95,
+            miner_fk=miner.id,
+            script_uuid="95000000-0000-0000-0000-000000000018",
+            created_at=now - timedelta(hours=2),
+        )
+        async_session.add(script)
+        await async_session.flush()
+
+        async_session.add(
+            MinerUpload(
+                id=95,
+                script_fk=script.id,
+                competition_fk=competition.id,
+                created_at=now - timedelta(hours=2),
+            )
+        )
+        await async_session.flush()
+
+        screener_batch = ChallengeBatch(
+            id=950,
+            miner_fk=miner.id,
+            script_fk=script.id,
+            created_at=now - timedelta(hours=2),
+        )
+        async_session.add(screener_batch)
+        await async_session.flush()
+
+        for idx, challenge_fk in enumerate((1, 2, 3), start=1):
+            batch_challenge = BatchChallenge(
+                id=9500 + idx,
+                challenge_batch_fk=screener_batch.id,
+                challenge_fk=challenge_fk,
+                compression_ratio=0.5,
+            )
+            async_session.add(batch_challenge)
+            await async_session.flush()
+            async_session.add(
+                BatchChallengeScore(
+                    id=9500 + idx,
+                    batch_challenge_fk=batch_challenge.id,
+                    validator_fk=validator.id,
+                    score=0.9,
+                )
+            )
+
+        # Competition challenges are created with no assignment rows and no scores.
+        # This simulates timed-out/deleted assignments that must be reissued.
+        competition_batch = ChallengeBatch(
+            id=951,
+            miner_fk=miner.id,
+            script_fk=script.id,
+            created_at=now - timedelta(hours=1),
+        )
+        async_session.add(competition_batch)
+        await async_session.flush()
+
+        for idx, challenge_fk in enumerate((4, 5), start=1):
+            async_session.add(
+                BatchChallenge(
+                    id=9510 + idx,
+                    challenge_batch_fk=competition_batch.id,
+                    challenge_fk=challenge_fk,
+                    compression_ratio=0.5,
+                )
+            )
+
+        await async_session.commit()
+
+        request = Mock()
+        request.state = Mock()
+        request.state.request_id = "test-request-unassigned-backlog"
+
+        selected_miner, selected_script = await _select_miner_ss58(
+            request, async_session
+        )
+
+        assert selected_miner.ss58 == "miner_unassigned_backlog"
+        assert (
+            selected_script.script_uuid
+            == "95000000-0000-0000-0000-000000000018"
+        )
+    finally:
+        settings.top_screener_scripts = original_top
+
+
+@pytest.mark.asyncio
 async def test_no_miners_with_free_challenges_raises_error(
     async_session: AsyncSession, setup_base_data
 ):

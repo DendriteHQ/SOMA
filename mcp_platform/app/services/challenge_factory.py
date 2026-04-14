@@ -179,7 +179,7 @@ async def assign_challenges_to_batch(
     script_id: int,
     miner_ss58: str,
     session: AsyncSession,
-    limit: int = 4,
+    limit: int = 2,
 ) -> tuple[list[BatchChallenge], list[Challenge]]:
     competition_id, phase = await _resolve_competition_phase(
         session,

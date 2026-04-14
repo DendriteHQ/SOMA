@@ -5,7 +5,7 @@ from functools import lru_cache
 import tiktoken
 
 from fastapi import HTTPException, status, Request
-from sqlalchemy import func, select, literal, and_
+from sqlalchemy import func, select, literal, and_, exists, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 import ipaddress
 from soma_shared.db.models.batch_assignment import BatchAssignment
@@ -24,6 +24,8 @@ from soma_shared.db.models.competition_challenge import CompetitionChallenge
 from soma_shared.db.models.compression_competition_config import (
     CompressionCompetitionConfig,
 )
+from soma_shared.db.models.screener import Screener
+from soma_shared.db.models.screening_challenge import ScreeningChallenge
 from soma_shared.db.models.burn_request import BurnRequest
 from soma_shared.db.validator_log import log_validator_message
 from app.db.views import V_ACTIVE_COMPETITION, V_COMPETITION_CHALLENGES, V_MINER_SCREENER_ELIGIBLE_RANKED, V_MINER_STATUS
@@ -358,22 +360,56 @@ async def _select_miner_ss58(
     is_eval_phase = eval_starts_at and now >= eval_starts_at
     
     miner_ss58 = None
-    
+
+    # Screener challenge IDs for the active competition — used in both phases.
+    screener_challenge_ids_sq = (
+        select(ScreeningChallenge.challenge_fk)
+        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
+        .where(Screener.competition_fk == competition_id)
+        .where(Screener.is_active.is_(True))
+    )
+
+    # Correlated EXISTS: miner has screener batch_challenges that are unscored
+    # AND unassigned (covers expired/cleaned-up assignments that the view still
+    # counts as "pending" via screener_assigned - screener_scored).
+    unassigned_screener_work_exists = exists(
+        select(literal(1))
+        .select_from(ChallengeBatch)
+        .join(BatchChallenge, BatchChallenge.challenge_batch_fk == ChallengeBatch.id)
+        .outerjoin(
+            BatchChallengeScore,
+            BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
+        )
+        .outerjoin(
+            BatchAssignment,
+            BatchAssignment.challenge_batch_fk == ChallengeBatch.id,
+        )
+        .where(ChallengeBatch.miner_fk == Miner.id)
+        .where(BatchChallengeScore.id.is_(None))
+        .where(BatchAssignment.id.is_(None))
+        .where(BatchChallenge.challenge_fk.in_(screener_challenge_ids_sq))
+    )
+
+    # A miner has screener work remaining when the view shows a gap OR when the
+    # exists-check finds genuinely unassigned+unscored rows (expired assignments).
+    has_screener_work = or_(
+        (
+            func.coalesce(V_MINER_STATUS.c.scored_screened_challenges, 0)
+            + func.coalesce(V_MINER_STATUS.c.pending_assignments_screener, 0)
+        ) < func.coalesce(V_MINER_STATUS.c.screener_challenges, 0),
+        unassigned_screener_work_exists,
+    )
+
     if not is_eval_phase:
         # UPLOAD PHASE: only screener work
-        # Find: (scored_screened + pending_screener) < screener_challenges
         logger.info("_select_miner_ss58: Upload phase - assigning screener work")
         result = await db.execute(
             select(V_MINER_STATUS.c.ss58)
+            .join(Miner, Miner.ss58 == V_MINER_STATUS.c.ss58)
             .where(V_MINER_STATUS.c.competition_id == competition_id)
             .where(V_MINER_STATUS.c.is_banned.is_(False))
             .where(V_MINER_STATUS.c.has_script.is_(True))
-            .where(
-                (
-                    func.coalesce(V_MINER_STATUS.c.scored_screened_challenges, 0)
-                    + func.coalesce(V_MINER_STATUS.c.pending_assignments_screener, 0)
-                ) < func.coalesce(V_MINER_STATUS.c.screener_challenges, 0)
-            )
+            .where(has_screener_work)
             .order_by(V_MINER_STATUS.c.last_submit_at.asc())
             .limit(1)
         )
@@ -382,22 +418,18 @@ async def _select_miner_ss58(
             miner_ss58 = row.ss58
     else:
         # EVAL PHASE: first screener backlog, then competition work
-        
+
         # Check if screener backlog exists
         screener_backlog = await db.scalar(
             select(func.count())
             .select_from(V_MINER_STATUS)
+            .join(Miner, Miner.ss58 == V_MINER_STATUS.c.ss58)
             .where(V_MINER_STATUS.c.competition_id == competition_id)
             .where(V_MINER_STATUS.c.is_banned.is_(False))
             .where(V_MINER_STATUS.c.has_script.is_(True))
-            .where(
-                (
-                    func.coalesce(V_MINER_STATUS.c.scored_screened_challenges, 0)
-                    + func.coalesce(V_MINER_STATUS.c.pending_assignments_screener, 0)
-                ) < func.coalesce(V_MINER_STATUS.c.screener_challenges, 0)
-            )
+            .where(has_screener_work)
         )
-        
+
         if screener_backlog and screener_backlog > 0:
             # Still have screener backlog - continue screener work
             logger.info(
@@ -406,15 +438,11 @@ async def _select_miner_ss58(
             )
             result = await db.execute(
                 select(V_MINER_STATUS.c.ss58)
+                .join(Miner, Miner.ss58 == V_MINER_STATUS.c.ss58)
                 .where(V_MINER_STATUS.c.competition_id == competition_id)
                 .where(V_MINER_STATUS.c.is_banned.is_(False))
                 .where(V_MINER_STATUS.c.has_script.is_(True))
-                .where(
-                    (
-                        func.coalesce(V_MINER_STATUS.c.scored_screened_challenges, 0)
-                        + func.coalesce(V_MINER_STATUS.c.pending_assignments_screener, 0)
-                    ) < func.coalesce(V_MINER_STATUS.c.screener_challenges, 0)
-                )
+                .where(has_screener_work)
                 .order_by(V_MINER_STATUS.c.last_submit_at.asc())
                 .limit(1)
             )
@@ -471,7 +499,39 @@ async def _select_miner_ss58(
             
             top_miner_ids = [row.miner_id for row in top_miner_rows]
             logger.info(f"_select_miner_ss58: Found {len(top_miner_ids)} top screeners")
-            
+
+            unassigned_competition_work_exists = exists(
+                select(literal(1))
+                .select_from(ChallengeBatch)
+                .join(BatchChallenge, BatchChallenge.challenge_batch_fk == ChallengeBatch.id)
+                .outerjoin(
+                    BatchChallengeScore,
+                    BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
+                )
+                .outerjoin(
+                    BatchAssignment,
+                    BatchAssignment.challenge_batch_fk == ChallengeBatch.id,
+                )
+                .where(ChallengeBatch.miner_fk == Miner.id)
+                .where(BatchChallengeScore.id.is_(None))
+                .where(BatchAssignment.id.is_(None))
+                .where(
+                    BatchChallenge.challenge_fk.in_(
+                        select(CompetitionChallenge.challenge_fk)
+                        .where(CompetitionChallenge.competition_fk == competition_id)
+                        .where(CompetitionChallenge.is_active.is_(True))
+                    )
+                )
+                .where(~BatchChallenge.challenge_fk.in_(screener_challenge_ids_sq))
+            )
+            has_capacity_for_new_competition_work = (
+                (
+                    func.coalesce(V_MINER_STATUS.c.scored_competition_challenges, 0)
+                    + func.coalesce(V_MINER_STATUS.c.pending_assignments_competition, 0)
+                )
+                < func.coalesce(V_MINER_STATUS.c.competition_challenges, 0)
+            )
+
             # Find top screener with free competition work
             result = await db.execute(
                 select(V_MINER_STATUS.c.ss58)
@@ -480,10 +540,10 @@ async def _select_miner_ss58(
                 .where(Miner.id.in_(top_miner_ids))
                 .where(V_MINER_STATUS.c.is_banned.is_(False))
                 .where(
-                    (
-                        func.coalesce(V_MINER_STATUS.c.scored_competition_challenges, 0)
-                        + func.coalesce(V_MINER_STATUS.c.pending_assignments_competition, 0)
-                    ) < func.coalesce(V_MINER_STATUS.c.competition_challenges, 0)
+                    or_(
+                        has_capacity_for_new_competition_work,
+                        unassigned_competition_work_exists,
+                    )
                 )
                 .order_by(V_MINER_STATUS.c.last_submit_at.asc())
                 .limit(1)
