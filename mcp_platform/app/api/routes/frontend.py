@@ -39,6 +39,8 @@ from soma_shared.db.models.challenge import Challenge as ChallengeModel
 from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.competition_challenge import CompetitionChallenge
+from soma_shared.db.models.competition_config import CompetitionConfig
+from soma_shared.db.models.compression_competition_config import CompressionCompetitionConfig
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.question import Question
@@ -104,36 +106,20 @@ def _normalize_partial_scores(raw: object) -> list[PartialScore] | None:
     return partial_scores
 
 
-async def _get_latest_competition_id(db: AsyncSession) -> int | None:
-    """Return the competition_id with the latest eval_ends_at."""
-    row = await db.scalar(
-        select(V_ACTIVE_COMPETITION.c.competition_id)
-        .order_by(V_ACTIVE_COMPETITION.c.eval_ends_at.desc())
-        .limit(1)
-    )
-    return int(row) if row is not None else None
+async def _get_is_partial_winner(db: AsyncSession, comp_id: int) -> bool:
+    """Return True if partial_scores should be shown for this competition.
 
-
-def _should_show_partial_scores(
-    comp_id: int,
-    latest_comp_id: int | None,
-    eval_ends_at: object,
-) -> bool:
-    """Return True if partial_scores should be exposed for this competition.
-
-    Rules:
-    - Always show for the latest (current) competition.
-    - Hide for archived competitions where evaluation has already ended.
+    Determined by CompressionCompetitionConfig.is_partial_winner flag.
     """
-    if latest_comp_id is not None and comp_id == latest_comp_id:
-        return True
-    if eval_ends_at is None:
-        return False
-    from datetime import datetime, timezone as _tz  # local import to avoid shadowing
-    dt = eval_ends_at
-    if hasattr(dt, 'tzinfo') and dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_tz.utc)
-    return datetime.now(_tz.utc) <= dt
+    result = await db.scalar(
+        select(CompressionCompetitionConfig.is_partial_winner)
+        .join(
+            CompetitionConfig,
+            CompetitionConfig.id == CompressionCompetitionConfig.competition_config_fk,
+        )
+        .where(CompetitionConfig.competition_fk == comp_id)
+    )
+    return bool(result)
 
 
 async def _log_frontend_request_metrics(request: Request, status_code: int) -> None:
@@ -422,12 +408,7 @@ async def list_miners_by_competition(
             detail="Competition not found",
         )
 
-    latest_comp_id = await _get_latest_competition_id(db)
-    comp_eval_ends_at = await db.scalar(
-        select(V_ACTIVE_COMPETITION.c.eval_ends_at)
-        .where(V_ACTIVE_COMPETITION.c.competition_id == comp_id)
-    )
-    show_partial_scores = _should_show_partial_scores(comp_id, latest_comp_id, comp_eval_ends_at)
+    show_partial_scores = await _get_is_partial_winner(db, comp_id)
 
     total_value = int(
         await db.scalar(
@@ -584,8 +565,7 @@ async def get_miner_by_competition(
         if eval_starts_at and eval_starts_at.tzinfo is None
         else eval_starts_at is not None and datetime.now(timezone.utc) >= eval_starts_at
     )
-    _latest_comp_id = await _get_latest_competition_id(db)
-    show_partial_scores = _should_show_partial_scores(comp_id, _latest_comp_id, _comp_eval_ends_at)
+    show_partial_scores = await _get_is_partial_winner(db, comp_id)
 
     # Competition name
     comp_name = await db.scalar(
@@ -973,8 +953,7 @@ async def get_miner_competition(
     if eval_starts_at is not None and eval_starts_at.tzinfo is None:
         eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
     eval_started = eval_starts_at is not None and datetime.now(timezone.utc) >= eval_starts_at
-    _latest_comp_id = await _get_latest_competition_id(db)
-    show_partial_scores = _should_show_partial_scores(comp_id, _latest_comp_id, comp_row.eval_ends_at)
+    show_partial_scores = await _get_is_partial_winner(db, comp_id)
 
     # Don't return data if evaluation hasn't started yet
     if not eval_started:
