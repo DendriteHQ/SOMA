@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -64,6 +65,8 @@ class LLMClient:
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self._session = None
+        self._session_lock: asyncio.Lock | None = None
 
         token_status = "SET" if self.api_token else "NOT SET"
         token_length = len(self.api_token) if self.api_token else 0
@@ -97,31 +100,63 @@ class LLMClient:
 
         return await self._chat(self.url, headers, body)
 
-    async def _chat(self, url: str, headers: dict[str, str], body: dict) -> dict[str, Any]:
+    async def close(self) -> None:
+        session = self._session
+        self._session = None
+        if session is None:
+            return
+        if getattr(session, "closed", True):
+            return
+        await session.close()
+        logging.info("LLMClient session closed")
+
+    async def _get_session(self):
         try:
             import aiohttp
         except Exception as exc:
             raise RuntimeError("aiohttp is required for LLM HTTP calls") from exc
 
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        status_code = 0
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, json=body) as response:
-                status_code = response.status
-                if response.status != 200:
-                    error_body = await response.text()
-                    logging.error(
-                        f"LLM API Error: status={response.status}, "
-                        f"body={error_body[:500]}"
-                    )
-                    if is_insufficient_funds_error(response.status, error_body):
-                        raise LLMInsufficientFundsError(
-                            f"OpenRouter rejected request due to insufficient funds "
-                            f"(status={response.status})"
-                        )
-                response.raise_for_status()
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
 
-                payload = await response.json()
+        async with self._session_lock:
+            current_loop = asyncio.get_running_loop()
+            if self._session is not None and not self._session.closed:
+                session_loop = getattr(self._session, "_loop", None)
+                if session_loop is current_loop:
+                    return self._session
+                logging.warning(
+                    "LLMClient session was created on a different event loop; recreating session"
+                )
+                with contextlib.suppress(Exception):
+                    await self._session.close()
+                self._session = None
+
+            if self._session is None or self._session.closed:
+                timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+                self._session = aiohttp.ClientSession(timeout=timeout)
+
+            return self._session
+
+    async def _chat(self, url: str, headers: dict[str, str], body: dict) -> dict[str, Any]:
+        status_code = 0
+        session = await self._get_session()
+        async with session.post(url, headers=headers, json=body) as response:
+            status_code = response.status
+            if response.status != 200:
+                error_body = await response.text()
+                logging.error(
+                    f"LLM API Error: status={response.status}, "
+                    f"body={error_body[:500]}"
+                )
+                if is_insufficient_funds_error(response.status, error_body):
+                    raise LLMInsufficientFundsError(
+                        f"OpenRouter rejected request due to insufficient funds "
+                        f"(status={response.status})"
+                    )
+            response.raise_for_status()
+
+            payload = await response.json()
 
         text = ""
         if isinstance(payload, dict):
@@ -168,6 +203,9 @@ class Scoring:
         self._exact_weight = exact_weight
         self._f1_weight = f1_weight
         self._prompt_encoding = tiktoken.get_encoding("cl100k_base")
+
+    async def close(self) -> None:
+        await self._llm.close()
 
     async def _request_with_retry(self, func, retries: int = 3, delay: float = 1.0):
         attempts = max(1, retries)
