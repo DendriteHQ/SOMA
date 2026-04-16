@@ -298,12 +298,88 @@ class Scoring:
         text = self._strip_code_fences(text)
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                if "results" in parsed and isinstance(parsed["results"], list):
-                    return self._extract_answers_from_results(parsed["results"])
-            raise LLMOutputFormatError("LLM response does not contain a results array")
+            results = self._extract_results_list(parsed)
+            if results is not None:
+                return self._extract_answers_from_results(results)
         except json.JSONDecodeError as exc:
+            results = self._recover_results_list(text)
+            if results is not None:
+                logging.warning(
+                    "Recovered results array from malformed LLM JSON response: snippet=%r",
+                    self._log_snippet(text),
+                )
+                return self._extract_answers_from_results(results)
+            logging.error(
+                "Failed to parse and recover LLM JSON response: snippet=%r",
+                self._log_snippet(text),
+            )
             raise LLMOutputFormatError("LLM response is not valid JSON") from exc
+
+        results = self._recover_results_list(text)
+        if results is not None:
+            return self._extract_answers_from_results(results)
+        raise LLMOutputFormatError("LLM response does not contain a results array")
+
+    def _extract_results_list(self, payload: Any) -> list[Any] | None:
+        if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+            return payload["results"]
+        return None
+
+    def _recover_results_list(self, text: str) -> list[Any] | None:
+        match = re.search(r'"results"\s*:\s*\[', text)
+        if not match:
+            return None
+
+        array_start = text.find("[", match.start())
+        if array_start == -1:
+            return None
+
+        array_text = self._extract_balanced_json_array(text, array_start)
+        if array_text is None:
+            return None
+
+        try:
+            parsed = json.loads(array_text)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, list) else None
+
+    def _extract_balanced_json_array(self, text: str, start_idx: int) -> str | None:
+        if start_idx < 0 or start_idx >= len(text) or text[start_idx] != "[":
+            return None
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start_idx, len(text)):
+            char = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                continue
+            if char == "[":
+                depth += 1
+                continue
+            if char == "]":
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx : idx + 1]
+
+        return None
+
+    def _log_snippet(self, text: str, limit: int = 240) -> str:
+        collapsed = re.sub(r"\s+", " ", text).strip()
+        if len(collapsed) <= limit:
+            return collapsed
+        return collapsed[: limit - 3] + "..."
 
     def _extract_answers_from_results(self, results: list[Any]) -> list[str]:
         answers: list[str] = []
