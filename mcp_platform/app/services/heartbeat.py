@@ -210,7 +210,7 @@ def _send_heartbeat_request(
                 )
                 return ("failed", None, None, None)
             if not payload_obj.ok:
-                return ("failed", None, None)
+                return ("failed", None, None, None)
             try:
                 ok = verify_payload_model(
                     payload_obj,
