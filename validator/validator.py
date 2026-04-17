@@ -96,7 +96,13 @@ class Validator(AbstractValidator):
         )
 
         try:
-            probe_response = asyncio.run(llm_client.ask(prompt))
+            async def _probe_and_close():
+                try:
+                    return await llm_client.ask(prompt)
+                finally:
+                    await llm_client.close()
+
+            probe_response = asyncio.run(_probe_and_close())
             status_code = (
                 probe_response.get("status_code")
                 if isinstance(probe_response, dict)
@@ -772,6 +778,13 @@ def create_app() -> FastAPI:
             task.cancel()
         validator = getattr(app.state, "validator", None)
         if validator is not None:
+            evaluator = getattr(validator, "evaluator", None)
+            if evaluator is not None:
+                try:
+                    await evaluator.close()
+                    logging.info("Evaluator resources closed")
+                except Exception:
+                    logging.exception("Failed to close evaluator resources")
             client = getattr(validator, "client", None)
             if client is not None:
                 try:

@@ -121,6 +121,56 @@ class SandboxExecutor:
                 logger.debug(log['stream'].strip())
         
         logger.info("Successfully built sandbox image: %s", self.image)
+
+    @staticmethod
+    def _coerce_execution_time(value: object) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _build_error_result(
+        task_count: int,
+        error_text: str,
+    ) -> tuple[List[str], List[str | None], List[float | None]]:
+        return (
+            [""] * task_count,
+            [error_text] * task_count,
+            [None] * task_count,
+        )
+
+    @staticmethod
+    def _validate_result_shape(
+        result: tuple[List[str], List[str | None], List[float | None]],
+        *,
+        expected_len: int,
+    ) -> None:
+        if not isinstance(result, tuple) or len(result) != 3:
+            raise ValueError("sandbox result must be a 3-tuple")
+
+        responses, task_errors, execution_times = result
+        if not isinstance(responses, list):
+            raise ValueError("sandbox responses must be a list")
+        if not isinstance(task_errors, list):
+            raise ValueError("sandbox task_errors must be a list")
+        if not isinstance(execution_times, list):
+            raise ValueError("sandbox execution_times must be a list")
+
+        if len(responses) != expected_len:
+            raise ValueError(
+                f"sandbox responses length mismatch: got={len(responses)} expected={expected_len}"
+            )
+        if len(task_errors) != expected_len:
+            raise ValueError(
+                f"sandbox task_errors length mismatch: got={len(task_errors)} expected={expected_len}"
+            )
+        if len(execution_times) != expected_len:
+            raise ValueError(
+                "sandbox execution_times length mismatch: "
+                f"got={len(execution_times)} expected={expected_len}"
+            )
     
     async def execute_batch(
         self,
@@ -140,12 +190,12 @@ class SandboxExecutor:
             container_timeout: Global timeout for entire execution
             
         Returns:
-            Tuple of (compressed_texts, task_errors). task_errors has one entry per
-            challenge_text: None if the task succeeded, error string if it failed.
+            Tuple of (compressed_texts, task_errors, execution_times). Each list
+            has one entry per challenge_text.
         """
         import asyncio
         
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             self._execute_batch_sync,
             challenge_code,
             challenge_texts,
@@ -153,6 +203,8 @@ class SandboxExecutor:
             timeout_per_task,
             container_timeout,
         )
+        self._validate_result_shape(result, expected_len=len(challenge_texts))
+        return result
     
     def _execute_batch_sync(
         self,
@@ -172,10 +224,9 @@ class SandboxExecutor:
             container_timeout: Global timeout for entire execution
             
         Returns:
-            Tuple of (compressed_texts, task_errors). task_errors has one entry per
-            challenge_text: None if the task succeeded, error string if it failed.
+            Tuple of (compressed_texts, task_errors, execution_times). Each list
+            has one entry per challenge_text.
         """
-        import asyncio
         try:
             client = self._get_docker_client()
         except Exception as exc:
@@ -184,7 +235,12 @@ class SandboxExecutor:
                 exc,
                 exc_info=True,
             )
-            return [""] * len(challenge_texts), [str(exc)] * len(challenge_texts)
+            error_result = self._build_error_result(
+                len(challenge_texts),
+                str(exc),
+            )
+            self._validate_result_shape(error_result, expected_len=len(challenge_texts))
+            return error_result
         
         sandbox_id = f"sandbox-{uuid.uuid4().hex}"
         
@@ -278,73 +334,92 @@ class SandboxExecutor:
                     raise SandboxExecutionError(container_error)
                 # Read output
                 output_path = output_dir / "output.json"
-                responses: List[str] = []
-                task_errors: List[str | None] = []
-                execution_times: List[float | None] = []
+                task_count = len(challenge_texts)
+                responses: List[str] = [""] * task_count
+                task_errors: List[str | None] = ["ERROR: no output"] * task_count
+                execution_times: List[float | None] = [None] * task_count
 
                 if output_path.exists():
                     try:
                         payload = json.loads(output_path.read_text())
                         compressed = payload.get("compressed", [])
+                        if not isinstance(compressed, list):
+                            raise ValueError("output.json 'compressed' must be a list")
 
-                        if isinstance(compressed, list):
-                            for idx, item in enumerate(compressed):
-                                if isinstance(item, list):
-                                    item = tuple(item)
-                                if isinstance(item, tuple) and len(item) >= 1:
+                        if len(compressed) != task_count:
+                            logger.warning(
+                                "Sandbox output length mismatch: got=%d expected=%d",
+                                len(compressed),
+                                task_count,
+                            )
+
+                        for idx in range(min(task_count, len(compressed))):
+                            item = compressed[idx]
+                            if isinstance(item, list):
+                                item = tuple(item)
+
+                            text_raw: object = ""
+                            task_logs: str = ""
+                            execution_time_raw: object = None
+                            if isinstance(item, tuple):
+                                if len(item) >= 1:
                                     text_raw = item[0]
-                                    task_logs = item[1] if len(item) >= 2 else ""
-                                    execution_time = item[2] if len(item) >= 3 else None    
-                                    if isinstance(text_raw, list):
-                                        text = text_raw[0] if text_raw else ""
-                                    else:
-                                        text = str(text_raw or "")
-                                    responses.append(text)
-                                    execution_times.append(execution_time)
-                                    if text:
-                                        task_errors.append(None)
-                                        execution_times.append(execution_time)
-                                        logger.info("Output %d: %d bytes", idx, len(text))
-                                    else:
-                                        err = task_logs if task_logs else "ERROR: empty result"
-                                        task_errors.append(err)
-                                        execution_times.append(None)
-                                        logger.warning(
-                                            "Output %d: empty result. Task logs:\n%s",
-                                            idx,
-                                            task_logs or "(no logs)",
-                                        )
-                                        execution_times.append(None)
-                                else:
-                                    responses.append(str(item or ""))
-                                    task_errors.append(None if item else "ERROR: empty result")
-                                    execution_times.append(None)
+                                if len(item) >= 2:
+                                    task_logs = str(item[1] or "")
+                                if len(item) >= 3:
+                                    execution_time_raw = item[2]
+                            else:
+                                text_raw = item
+
+                            if isinstance(text_raw, list):
+                                text = str(text_raw[0]) if text_raw else ""
+                            else:
+                                text = str(text_raw or "")
+                            responses[idx] = text
+
+                            if text:
+                                task_errors[idx] = None
+                                execution_times[idx] = self._coerce_execution_time(
+                                    execution_time_raw
+                                )
+                                logger.info("Output %d: %d bytes", idx, len(text))
+                            else:
+                                task_errors[idx] = (
+                                    task_logs if task_logs else "ERROR: empty result"
+                                )
+                                execution_times[idx] = None
+                                logger.warning(
+                                    "Output %d: empty result. Task logs:\n%s",
+                                    idx,
+                                    task_logs or "(no logs)",
+                                )
                     except Exception as exc:
                         logger.error(
                             "Failed to parse output.json: %s",
                             exc,
                             exc_info=True,
                         )
-                        responses = []
-                        task_errors = []
-                        execution_times = []
+                        responses, task_errors, execution_times = self._build_error_result(
+                            task_count,
+                            f"ERROR: invalid sandbox output: {exc}",
+                        )
                 else:
                     logger.warning("output.json does not exist at %s", output_path)
-                    task_errors = ["ERROR: no output"] * len(challenge_texts)
-                    execution_times = [None] * len(challenge_texts)
-                # Normalize result length
-                if len(responses) < len(challenge_texts):
-                    responses.extend([""] * (len(challenge_texts) - len(responses)))
-                elif len(responses) > len(challenge_texts):
-                    responses = responses[:len(challenge_texts)]
-
-                # Normalize task_errors length to match challenge_texts
-                if len(task_errors) < len(challenge_texts):
-                    task_errors.extend(["ERROR: no output"] * (len(challenge_texts) - len(task_errors)))
-                elif len(task_errors) > len(challenge_texts):
-                    task_errors = task_errors[:len(challenge_texts)]
-
-                return responses, task_errors, execution_times
+                result = (responses, task_errors, execution_times)
+                try:
+                    self._validate_result_shape(result, expected_len=task_count)
+                except ValueError as exc:
+                    logger.error(
+                        "Invalid sandbox result shape for batch %s: %s",
+                        sandbox_id,
+                        exc,
+                    )
+                    result = self._build_error_result(
+                        task_count,
+                        f"ERROR: invalid sandbox result shape: {exc}",
+                    )
+                    self._validate_result_shape(result, expected_len=task_count)
+                return result
             finally:
                 self._cleanup_limited_fs(fs_img, output_dir)
 
