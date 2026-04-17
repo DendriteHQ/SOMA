@@ -68,3 +68,62 @@ DOCUMENT>>>
 {questions}
 QUESTIONS>>>
 """)
+
+ANSWER_SCORING_PROMPT = textwrap.dedent("""
+You are grading candidate answers against reference answers.
+
+You will be given a JSON array named ITEMS. Each item contains:
+- id
+- question
+- reference_answer
+- candidate_answer
+
+Your job is to score how well candidate_answer matches reference_answer for the given question.
+
+Rules:
+- Use the question to interpret the expected meaning.
+- Compare candidate_answer only to reference_answer.
+- Do not use outside knowledge.
+    - You must use only one of these scores: 0.0, 0.5, 0.75, 1.0.
+    - Do not invent intermediate values such as 0.2, 0.6, 0.8, or 0.9.
+    - An answer that merely restates the question, echoes its wording, gives only the topic, or gives a vague paraphrase without the key resolving fact must score 0.0.
+    - To receive any positive score, candidate_answer must contain the core fact that makes the answer actually correct rather than just related.
+    - If candidate_answer is empty, missing, irrelevant, contradicted, materially false, or missing the core resolving fact, score it 0.0.
+    - If candidate_answer is fully correct and semantically equivalent to the reference answer, score it 1.0.
+    - Use 0.5 only when the core resolving fact is present, but a major required detail is missing.
+    - Use 0.75 only when the core resolving fact and the main required detail are present, but a qualifier, condition, exception, or precise scope is missing.
+- Be strict about missing qualifiers, dates, counts, names, negations, and conditions.
+    - High lexical overlap is not enough for credit.
+    - If candidate_answer introduces a material contradiction to the reference answer, score it 0.0 even if some parts overlap.
+    - First reason using these checks:
+        - core_fact_present: does the answer include the central fact needed to resolve the question?
+        - major_detail_present: does it include the main required supporting detail?
+        - qualifiers_preserved: are important qualifiers, conditions, exceptions, counts, and negations preserved?
+        - no_material_error: does it avoid materially false or contradictory claims?
+    - Then assign score deterministically:
+        - 0.0 = no core fact, empty, irrelevant, contradicted, or materially false
+        - 0.5 = core fact present, but a major required detail is missing
+        - 0.75 = core fact and major detail present, but an important qualifier/condition/scope is missing
+        - 1.0 = fully correct and semantically equivalent
+    - Verdict mapping:
+        - 0.0 -> NO_ANSWER or INCORRECT
+        - 0.5 or 0.75 -> PARTIAL
+        - 1.0 -> CORRECT
+- Output valid JSON only.
+
+Output format:
+
+{{
+  "results": [
+    {{
+      "id": "Q1",
+      "score": 0.0,
+      "verdict": "CORRECT | PARTIAL | INCORRECT | NO_ANSWER",
+      "reasoning": "Short justification"
+    }}
+  ]
+}}
+
+ITEMS:
+{items}
+""")

@@ -24,6 +24,19 @@ def build_results_payload(*items: tuple[str, str | None]) -> dict[str, str]:
     return {"text": json.dumps({"results": results})}
 
 
+def build_scoring_payload(*items: tuple[float, str, str]) -> dict[str, str]:
+    results: list[dict[str, str | float]] = []
+    for score, verdict, reasoning in items:
+        results.append(
+            {
+                "score": score,
+                "verdict": verdict,
+                "reasoning": reasoning,
+            }
+        )
+    return {"text": json.dumps({"results": results})}
+
+
 class TestOpenRouterFunds:
     def test_detects_insufficient_funds_error(self):
         assert is_insufficient_funds_error(402, "Payment required")
@@ -136,6 +149,19 @@ class TestScoring:
         assert "1. What is the capital?" in prompt
         assert "2. What is the population?" in prompt
         assert text in prompt
+
+    def test_build_scoring_prompt(self):
+        scoring = Scoring()
+
+        prompt = scoring.build_scoring_prompt(
+            questions=["What is the capital?"],
+            expected_answers=["Paris"],
+            candidate_answers=["Paris"],
+        )
+
+        assert '"question": "What is the capital?"' in prompt
+        assert '"reference_answer": "Paris"' in prompt
+        assert '"candidate_answer": "Paris"' in prompt
 
     def test_get_answer_format_hint_handles_unicode_letters(self):
         scoring = Scoring()
@@ -271,6 +297,49 @@ class TestScoring:
         )
         result = scoring._extract_answers(raw)
         assert result == ["answer1", "answer2"]
+
+    def test_extract_scores_from_string(self):
+        scoring = Scoring()
+
+        raw = json.dumps(
+            {
+                "results": [
+                    {
+                        "score": 1.0,
+                        "verdict": "CORRECT",
+                        "reasoning": "Exact match.",
+                    },
+                    {
+                        "score": 0.5,
+                        "verdict": "PARTIAL",
+                        "reasoning": "Core fact present.",
+                    },
+                ]
+            }
+        )
+        result = scoring._extract_scores(raw)
+        assert result == [
+            {"score": 1.0, "verdict": "CORRECT", "reasoning": "Exact match."},
+            {"score": 0.5, "verdict": "PARTIAL", "reasoning": "Core fact present."},
+        ]
+
+    def test_extract_scores_rejects_unsupported_score(self):
+        scoring = Scoring()
+
+        with pytest.raises(LLMOutputFormatError, match="unsupported score"):
+            scoring._extract_scores(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "score": 0.6,
+                                "verdict": "PARTIAL",
+                                "reasoning": "Invalid bucket.",
+                            }
+                        ]
+                    }
+                )
+            )
 
     def test_parse_text_answers_results_object(self):
         scoring = Scoring()
@@ -433,10 +502,16 @@ class TestScoring:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = build_results_payload(
-            ("ANSWERABLE", "Paris"),
-            ("ANSWERABLE", "France"),
-        )
+        mock_llm.ask.side_effect = [
+            build_results_payload(
+                ("ANSWERABLE", "Paris"),
+                ("ANSWERABLE", "France"),
+            ),
+            build_scoring_payload(
+                (1.0, "CORRECT", "Matches the reference answer."),
+                (1.0, "CORRECT", "Matches the reference answer."),
+            ),
+        ]
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -446,7 +521,7 @@ class TestScoring:
         )
 
         assert isinstance(result, ScoringResult)
-        assert result.score >= 0.9  # Should be very high for exact matches
+        assert result.score == 1.0
         assert len(result.model_answers) == 2
         assert len(result.details) == 2
 
@@ -455,10 +530,16 @@ class TestScoring:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = build_results_payload(
-            ("ANSWERABLE", "London"),
-            ("ANSWERABLE", "Germany"),
-        )
+        mock_llm.ask.side_effect = [
+            build_results_payload(
+                ("ANSWERABLE", "London"),
+                ("ANSWERABLE", "Germany"),
+            ),
+            build_scoring_payload(
+                (0.0, "INCORRECT", "Wrong capital."),
+                (0.0, "INCORRECT", "Wrong country."),
+            ),
+        ]
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -468,7 +549,7 @@ class TestScoring:
         )
 
         assert isinstance(result, ScoringResult)
-        assert result.score < 1.0
+        assert result.score == 0.0
         assert len(result.model_answers) == 2
         assert len(result.details) == 2
 
@@ -516,10 +597,16 @@ class TestScoring:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = build_results_payload(
-            ("ANSWERABLE", "Paris"),
-            ("ANSWERABLE", "Germany"),
-        )
+        mock_llm.ask.side_effect = [
+            build_results_payload(
+                ("ANSWERABLE", "Paris"),
+                ("ANSWERABLE", "Germany"),
+            ),
+            build_scoring_payload(
+                (1.0, "CORRECT", "Exact match."),
+                (0.0, "INCORRECT", "Contradicts the reference answer."),
+            ),
+        ]
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -534,14 +621,23 @@ class TestScoring:
         assert result.model_answers == ["Paris", "Germany"]
         assert result.scores[0] == 1.0
         assert result.scores[1] == 0.0
-        assert result.details == [{"reason": "Answered"}, {"reason": "Answered"}]
+        assert result.details == [
+            {"verdict": "CORRECT", "reasoning": "Exact match."},
+            {
+                "verdict": "INCORRECT",
+                "reasoning": "Contradicts the reference answer.",
+            },
+        ]
 
     @pytest.mark.asyncio
     async def test_score_async_with_mock(self):
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = build_results_payload(("ANSWERABLE", "Paris"))
+        mock_llm.ask.side_effect = [
+            build_results_payload(("ANSWERABLE", "Paris")),
+            build_scoring_payload((1.0, "CORRECT", "Exact match.")),
+        ]
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -555,7 +651,10 @@ class TestScoring:
     async def test_score_async_basic(self):
         scoring = Scoring()
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = build_results_payload(("ANSWERABLE", "answer1"))
+        mock_llm.ask.side_effect = [
+            build_results_payload(("ANSWERABLE", "answer1")),
+            build_scoring_payload((0.5, "PARTIAL", "Main fact is present.")),
+        ]
         scoring._llm = mock_llm
 
         result = await scoring.score_async("text", ["q"], ["a"])
@@ -566,7 +665,15 @@ class TestScoring:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {"text": ""}
+        mock_llm.ask.side_effect = [
+            {"text": ""},
+            {"text": ""},
+            {"text": ""},
+            build_scoring_payload(
+                (0.0, "NO_ANSWER", "Candidate answer is empty."),
+                (0.0, "NO_ANSWER", "Candidate answer is empty."),
+            ),
+        ]
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -583,7 +690,10 @@ class TestScoring:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = build_results_payload(("ANSWERABLE", "test answer"))
+        mock_llm.ask.side_effect = [
+            build_results_payload(("ANSWERABLE", "test answer")),
+            build_scoring_payload((1.0, "CORRECT", "Semantically equivalent.")),
+        ]
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -592,7 +702,10 @@ class TestScoring:
 
         assert len(result.details) == 1
         detail = result.details[0]
-        assert detail == {"reason": "Answered"}
+        assert detail == {
+            "verdict": "CORRECT",
+            "reasoning": "Semantically equivalent.",
+        }
 
 
 class TestScoringIntegration:
@@ -602,11 +715,18 @@ class TestScoringIntegration:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = build_results_payload(
-            ("ANSWERABLE", "1812"),
-            ("ANSWERABLE", "Fire destroyed docks in 1879"),
-            ("ANSWERABLE", "Fog Festival in October"),
-        )
+        mock_llm.ask.side_effect = [
+            build_results_payload(
+                ("ANSWERABLE", "1812"),
+                ("ANSWERABLE", "Fire destroyed docks in 1879"),
+                ("ANSWERABLE", "Fog Festival in October"),
+            ),
+            build_scoring_payload(
+                (1.0, "CORRECT", "Matches exactly."),
+                (1.0, "CORRECT", "Semantically equivalent."),
+                (0.75, "PARTIAL", "Missing the qualifier about frequency."),
+            ),
+        ]
         scoring._llm = mock_llm
 
         compressed_text = "Rivergate: port city est. 1812. 1879: dock fire."
@@ -630,7 +750,7 @@ class TestScoringIntegration:
 
         # Check that all detail objects have required fields
         for detail in result.details:
-            assert detail == {"reason": "Answered"}
+            assert set(detail.keys()) == {"verdict", "reasoning"}
 
     @pytest.mark.asyncio
     async def test_custom_weights(self):
@@ -639,7 +759,10 @@ class TestScoringIntegration:
         scoring_exact = Scoring(exact_weight=0.8, f1_weight=0.2)
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = build_results_payload(("ANSWERABLE", "exact match"))
+        mock_llm.ask.side_effect = [
+            build_results_payload(("ANSWERABLE", "exact match")),
+            build_scoring_payload((1.0, "CORRECT", "Exact match.")),
+        ]
         scoring_exact._llm = mock_llm
 
         result = await scoring_exact.score_async(
@@ -647,7 +770,7 @@ class TestScoringIntegration:
         )
 
         # Should score very high with exact match and high exact_weight
-        assert result.score >= 0.8
+        assert result.score == 1.0
 
 
 if __name__ == "__main__":
