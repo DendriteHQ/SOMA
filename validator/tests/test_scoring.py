@@ -336,6 +336,35 @@ class TestScoring:
         assert "Failed to parse and recover LLM JSON response" in caplog.text
         assert "missing results" in caplog.text
 
+    def test_parse_text_answers_sanitizes_invalid_backslash_escape(self):
+        scoring = Scoring()
+        text = json.dumps(
+            {
+                "results": [
+                    {
+                        "status": "NOT_ANSWERABLE_FROM_DOCUMENT",
+                        "notes": "placeholder",
+                    }
+                ]
+            }
+        ).replace("placeholder", "The document never mentions an '\\ell-deep sister family case'.")
+
+        result = scoring._parse_text_answers(text)
+
+        assert result == [""]
+
+    def test_parse_text_answers_raises_quote_error_code_for_repairable_json(self):
+        scoring = Scoring()
+        text = (
+            '{"results":[{"id":"Q1","status":"ANSWERABLE","answer":"94"},'
+            '{"id":"Q2", status": ANSWERABLE", "answer":"120 days"}]}'
+        )
+
+        with pytest.raises(LLMOutputFormatError) as exc_info:
+            scoring._parse_text_answers(text)
+
+        assert exc_info.value.error_code == "invalid_json_quote"
+
     def test_parse_text_answers_empty(self):
         scoring = Scoring()
 
@@ -416,6 +445,27 @@ class TestScoring:
         assert result.score < 1.0
         assert len(result.model_answers) == 2
         assert len(result.details) == 2
+
+    @pytest.mark.asyncio
+    async def test_ask_and_extract_answers_retries_with_json_repair_prompt(self):
+        scoring = Scoring()
+
+        malformed = (
+            '{"results":[{"id":"Q1", status": ANSWERABLE", "answer":"Paris"}]}'
+        )
+        repaired = build_results_payload(("ANSWERABLE", "Paris"))
+
+        mock_llm = AsyncMock()
+        mock_llm.ask.side_effect = [{"text": malformed}, repaired]
+        scoring._llm = mock_llm
+
+        answers = await scoring._ask_and_extract_answers("base prompt", 1)
+
+        assert answers == ["Paris"]
+        assert mock_llm.ask.await_count == 2
+        repair_prompt = mock_llm.ask.await_args_list[1].args[0]
+        assert "Repair only the JSON formatting" in repair_prompt
+        assert malformed in repair_prompt
 
     @pytest.mark.asyncio
     async def test_score_async_partial_match(self):
