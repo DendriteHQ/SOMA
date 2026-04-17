@@ -287,7 +287,7 @@ class Scoring:
         try:
             model_answers = self._extract_answers(raw)
         except LLMOutputFormatError as exc:
-            if exc.error_code != "invalid_json_quote":
+            if not self._should_retry_json_repair(exc):
                 raise
 
             previous_response = self._extract_response_text(raw)
@@ -452,15 +452,24 @@ class Scoring:
     ) -> str:
         return (
             "Your previous response was intended to be valid JSON but was malformed. "
-            "Repair only the JSON formatting, especially missing or misplaced double quotes "
-            "around keys and string values. Preserve the same semantic content and do not "
-            "change any answers unless needed to make the JSON valid. Return JSON only.\n\n"
+            "Repair only the JSON formatting. Fix issues such as missing or misplaced "
+            "double quotes, broken keys, trailing commas, malformed string boundaries, "
+            "or a missing top-level results wrapper if needed. Preserve the same semantic "
+            "content and do not change any answers unless needed to make the JSON valid. "
+            "Return JSON only.\n\n"
             f"Parser error: {error_message}\n\n"
             "Original instruction:\n"
             f"<<<ORIGINAL_PROMPT\n{original_prompt}\nORIGINAL_PROMPT>>>\n\n"
             "Your malformed response:\n"
             f"<<<MALFORMED_RESPONSE\n{malformed_response}\nMALFORMED_RESPONSE>>>"
         )
+
+    def _should_retry_json_repair(self, exc: LLMOutputFormatError) -> bool:
+        return exc.error_code in {
+            "invalid_json",
+            "invalid_json_structure",
+            "missing_results",
+        }
 
     def _sanitize_invalid_json_escapes(self, text: str) -> str:
         result: list[str] = []
@@ -505,22 +514,26 @@ class Scoring:
         message = exc.msg.lower()
         if "invalid \\escape" in message:
             return "invalid_json_escape"
-        if self._looks_like_quote_issue(text, message):
-            return "invalid_json_quote"
+        if self._looks_like_json_structure_issue(text, message):
+            return "invalid_json_structure"
         return "invalid_json"
 
-    def _looks_like_quote_issue(self, text: str, error_message: str) -> bool:
+    def _looks_like_json_structure_issue(self, text: str, error_message: str) -> bool:
         structural_errors = (
             "expecting property name enclosed in double quotes",
             "unterminated string",
             "expecting ':' delimiter",
             "expecting ',' delimiter",
+            "expecting value",
+            "extra data",
         )
         if any(fragment in error_message for fragment in structural_errors):
             return '"results"' in text
         if re.search(r'(^|[,\[{]\s*)([A-Za-z_][A-Za-z0-9_]*)"\s*:', text):
             return True
         if re.search(r':\s*([A-Z_]+)"', text):
+            return True
+        if re.search(r',\s*[}\]]', text):
             return True
         return False
 
