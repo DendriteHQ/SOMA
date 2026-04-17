@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from math import ceil
 
 from aiocache import Cache
@@ -44,6 +46,7 @@ from soma_shared.db.models.compression_competition_config import CompressionComp
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.question import Question
+from soma_shared.db.models.soma_api_key import SomaApiKey
 from soma_shared.db.models.script import Script
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
@@ -57,14 +60,183 @@ from app.db.views import (
     MV_MINER_STATUS,
     V_ACTIVE_COMPETITION,
 )
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.api.routes.utils import (
-    _require_private_network,
     _get_current_burn_state,
+    _require_private_network,
 )
 
 
 logger = get_logger(__name__)
+_cache = Cache(Cache.MEMORY)
+_rate_limit_cache = Cache(Cache.MEMORY, namespace="frontend_api_key_rate_limit")
+TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
+API_KEY_HEADER = "x-api-key"
+
+
+@dataclass(slots=True)
+class FrontendApiKeyContext:
+    key_id: int
+    prefix: str
+    rate_limit_rpm: int | None
+    rate_limit_rpd: int | None
+
+
+def _invalid_api_key_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid API key",
+    )
+
+
+def _extract_api_key(request: Request) -> str:
+    header_key = request.headers.get(API_KEY_HEADER)
+    if header_key:
+        return header_key.strip()
+
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            return token
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Missing API key",
+    )
+
+
+def _parse_api_key(raw_key: str) -> tuple[str, str]:
+    key = raw_key.strip()
+    if key.startswith("soma_"):
+        suffix = key[len("soma_") :]
+    else:
+        raise _invalid_api_key_error()
+
+    prefix, sep, secret = suffix.partition(".")
+    if not sep or not prefix or not secret:
+        raise _invalid_api_key_error()
+    if len(prefix) > 16:
+        raise _invalid_api_key_error()
+    return prefix, secret
+
+
+def _hash_api_key_secret(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+async def _increment_rate_bucket(key: str, ttl_seconds: int) -> int:
+    current = await _rate_limit_cache.get(key)
+    next_value = int(current or 0) + 1
+    await _rate_limit_cache.set(key, next_value, ttl=ttl_seconds)
+    return next_value
+
+
+def _seconds_until_next_utc_day(now: datetime) -> int:
+    next_day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(
+        days=1
+    )
+    return max(1, int((next_day - now).total_seconds()))
+
+
+async def _apply_rate_limits(
+    request: Request,
+    key_ctx: FrontendApiKeyContext,
+) -> None:
+    now = datetime.now(timezone.utc)
+    minute_limit = key_ctx.rate_limit_rpm
+    day_limit = key_ctx.rate_limit_rpd
+
+    minute_count: int | None = None
+    day_count: int | None = None
+    retry_after_seconds: int | None = None
+
+    if minute_limit is not None and minute_limit > 0:
+        minute_bucket = now.strftime("%Y%m%d%H%M")
+        minute_key = f"{key_ctx.key_id}:m:{minute_bucket}"
+        minute_count = await _increment_rate_bucket(minute_key, ttl_seconds=65)
+        if minute_count > minute_limit:
+            retry_after_seconds = max(1, 60 - now.second)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Per-minute API key rate limit exceeded",
+                headers={"Retry-After": str(retry_after_seconds)},
+            )
+
+    if day_limit is not None and day_limit > 0:
+        day_bucket = now.strftime("%Y%m%d")
+        day_key = f"{key_ctx.key_id}:d:{day_bucket}"
+        day_count = await _increment_rate_bucket(
+            day_key,
+            ttl_seconds=_seconds_until_next_utc_day(now) + 5,
+        )
+        if day_count > day_limit:
+            retry_after_seconds = _seconds_until_next_utc_day(now)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Per-day API key rate limit exceeded",
+                headers={"Retry-After": str(retry_after_seconds)},
+            )
+
+    headers: dict[str, str] = {}
+    if minute_limit is not None and minute_limit > 0 and minute_count is not None:
+        headers["X-RateLimit-Limit-Minute"] = str(minute_limit)
+        headers["X-RateLimit-Remaining-Minute"] = str(
+            max(0, minute_limit - minute_count)
+        )
+    if day_limit is not None and day_limit > 0 and day_count is not None:
+        headers["X-RateLimit-Limit-Day"] = str(day_limit)
+        headers["X-RateLimit-Remaining-Day"] = str(max(0, day_limit - day_count))
+    if headers:
+        request.state.frontend_rate_limit_headers = headers
+
+
+async def _resolve_frontend_api_key(
+    db: AsyncSession,
+    raw_key: str,
+) -> FrontendApiKeyContext:
+    prefix, secret = _parse_api_key(raw_key)
+    key_hash = _hash_api_key_secret(secret)
+    key_row = await db.scalar(
+        select(SomaApiKey)
+        .where(SomaApiKey.prefix == prefix)
+        .where(SomaApiKey.is_active.is_(True))
+        .limit(1)
+    )
+    if key_row is None:
+        raise _invalid_api_key_error()
+    if key_row.key_hash != key_hash:
+        raise _invalid_api_key_error()
+
+    key_ctx = FrontendApiKeyContext(
+        key_id=int(key_row.id),
+        prefix=key_row.prefix,
+        rate_limit_rpm=(
+            key_row.rate_limit_rpm
+            if key_row.rate_limit_rpm is not None
+            else settings.frontend_api_key_default_rpm
+        ),
+        rate_limit_rpd=(
+            key_row.rate_limit_rpd
+            if key_row.rate_limit_rpd is not None
+            else settings.frontend_api_key_default_rpd
+        ),
+    )
+    return key_ctx
+
+
+async def _require_frontend_api_key(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> FrontendApiKeyContext:
+    raw_key = _extract_api_key(request)
+    key_ctx = await _resolve_frontend_api_key(db, raw_key)
+    await _apply_rate_limits(request, key_ctx)
+    request.state.frontend_access_mode = "api_key"
+    request.state.frontend_api_key_id = key_ctx.key_id
+    request.state.frontend_api_key_prefix = key_ctx.prefix
+    return key_ctx
 
 
 def _normalize_partial_scores(raw: object) -> list[PartialScore] | None:
@@ -129,6 +301,15 @@ async def _log_frontend_request_metrics(request: Request, status_code: int) -> N
 
     try:
         payload = {"query": dict(request.query_params)}
+        access_mode = getattr(request.state, "frontend_access_mode", None)
+        if access_mode:
+            payload["access_mode"] = access_mode
+        api_key_id = getattr(request.state, "frontend_api_key_id", None)
+        if api_key_id is not None:
+            payload["frontend_api_key_id"] = api_key_id
+        api_key_prefix = getattr(request.state, "frontend_api_key_prefix", None)
+        if api_key_prefix:
+            payload["frontend_api_key_prefix"] = api_key_prefix
         metrics_snapshot = get_current_db_request_metrics_snapshot()
 
         async for session in get_db_session():
@@ -181,31 +362,33 @@ class FrontendMetricsRoute(APIRoute):
                 )
                 raise
 
+            rate_limit_headers = getattr(
+                request.state,
+                "frontend_rate_limit_headers",
+                None,
+            )
+            if isinstance(rate_limit_headers, dict):
+                for key, value in rate_limit_headers.items():
+                    response.headers[key] = str(value)
+
             await _log_frontend_request_metrics(request, response.status_code)
             return response
 
         return custom_route_handler
 
 
-router = APIRouter(
-    prefix="/api/private/frontend",
+frontend_router = APIRouter(
     tags=["frontend"],
     route_class=FrontendMetricsRoute,
 )
-TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
 
-_cache = Cache(Cache.MEMORY)
-
-TEXT_HIDDEN_PLACEHOLDER = "Will be available after upload window"
-
-@router.get(
+@frontend_router.get(
     "/competition/timeframe/current",
     response_model=CurrentCompetitionTimeframeResponse,
 )
 async def get_current_competition_timeframe(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> CurrentCompetitionTimeframeResponse:
     _cached = await _cache.get("competition_timeframe")
     if _cached is not None:
@@ -256,14 +439,13 @@ async def get_current_competition_timeframe(
     return response
 
 
-@router.get(
+@frontend_router.get(
     "/competitions-list",
     response_model=list[MinerCompetitionItem],
 )
 async def get_active_competitions(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> list[MinerCompetitionItem]:
     # Temporary endpoint for competition list - needs to be changed in the future
     rows = (
@@ -284,11 +466,10 @@ async def get_active_competitions(
     ]
 
 
-@router.get("/summary", response_model=FrontendSummaryResponse)
+@frontend_router.get("/summary", response_model=FrontendSummaryResponse)
 async def frontend_summary(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> FrontendSummaryResponse:
     _cached = await _cache.get("summary")
     if _cached is not None:
@@ -381,7 +562,7 @@ async def frontend_summary(
     return response
 
 
-@router.get(
+@frontend_router.get(
     "/miners/{comp_id}",
     response_model=MinersListResponse,
     description="Return paginated miners who participated in a specific competition.",
@@ -390,7 +571,6 @@ async def list_miners_by_competition(
     comp_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=20, ge=1, le=400),
 ) -> MinersListResponse:
@@ -503,13 +683,12 @@ async def list_miners_by_competition(
     return response
 
 
-@router.get("/miners/{comp_id}/{hotkey}", response_model=MinerDetailResponse)
+@frontend_router.get("/miners/{comp_id}/{hotkey}", response_model=MinerDetailResponse)
 async def get_miner_by_competition(
     comp_id: int,
     hotkey: str,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> MinerDetailResponse:
     cache_key = f"miner_{comp_id}_{hotkey}"
     _cached = await _cache.get(cache_key)
@@ -616,7 +795,7 @@ async def get_miner_by_competition(
     return response
 
 
-@router.get(
+@frontend_router.get(
     "/miners/{hotkey}/competition/challenges/{batch_challenge_id}",
     response_model=ChallengeDetailResponse,
 )
@@ -625,7 +804,6 @@ async def get_miner_contest_challenge_detail(
     batch_challenge_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> ChallengeDetailResponse:
     """Return full detail for a single batch challenge owned by the miner.
 
@@ -799,7 +977,7 @@ async def get_miner_contest_challenge_detail(
     return response
 
 
-@router.get(
+@frontend_router.get(
     "/miners/{comp_id}/{hotkey}/competition/challenges",
     response_model=MinerChallengesResponse,
 )
@@ -808,7 +986,6 @@ async def get_miner_competition_challenges(
     hotkey: str,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> MinerChallengesResponse:
     cache_key = f"miner_challenges_{comp_id}_{hotkey}"
     _cached = await _cache.get(cache_key)
@@ -917,7 +1094,7 @@ async def get_miner_competition_challenges(
 
     return response
 
-@router.get(
+@frontend_router.get(
     "/miners/{comp_id}/{hotkey}/competition",
     response_model=ContestSummary,
 )
@@ -926,7 +1103,6 @@ async def get_miner_competition(
     hotkey: str,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> ContestSummary:
     cache_key = f"miner_contest_{comp_id}_{hotkey}"
     _cached = await _cache.get(cache_key)
@@ -1012,7 +1188,7 @@ async def get_miner_competition(
     return response
 
 
-@router.get(
+@frontend_router.get(
     "/miners/{comp_id}/{hotkey}/screener",
     response_model=ContestSummary,
 )
@@ -1021,7 +1197,6 @@ async def get_miner_screener(
     hotkey: str,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> ContestSummary:
     cache_key = f"miner_screener_{comp_id}_{hotkey}"
     _cached = await _cache.get(cache_key)
@@ -1073,7 +1248,7 @@ async def get_miner_screener(
     return response
 
 
-@router.get(
+@frontend_router.get(
     "/miners/{comp_id}/{hotkey}/screener/challenges",
     response_model=MinerChallengesResponse,
 )
@@ -1082,7 +1257,6 @@ async def get_miner_screener_challenges(
     hotkey: str,
     request: Request,
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> MinerChallengesResponse:
     cache_key = f"miner_screener_challenges_{comp_id}_{hotkey}"
     _cached = await _cache.get(cache_key)
@@ -1200,10 +1374,9 @@ async def get_miner_screener_challenges(
 
 
 
-@router.get("/validators", response_model=ValidatorsListResponse)
+@frontend_router.get("/validators", response_model=ValidatorsListResponse)
 async def list_validators(
     db: AsyncSession = Depends(get_db_session),
-    _: None = Depends(_require_private_network),
 ) -> ValidatorsListResponse:
     _cached = await _cache.get("validators")
     if _cached is not None:
@@ -1233,3 +1406,18 @@ async def list_validators(
     )
 
     return response
+
+
+router = APIRouter(
+    prefix="/api/private/frontend",
+    tags=["frontend"],
+    dependencies=[Depends(_require_private_network)],
+)
+router.include_router(frontend_router)
+
+api_key_router = APIRouter(
+    prefix="/api/public/frontend-key",
+    tags=["frontend"],
+    dependencies=[Depends(_require_frontend_api_key)],
+)
+api_key_router.include_router(frontend_router)

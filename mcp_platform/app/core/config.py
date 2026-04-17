@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     trusted_proxy_cidrs: list[str] = Field(
         alias="TRUSTED_PROXY_CIDRS",
     )
+    frontend_api_key_default_rpm: int = Field(
+        default=120,
+        alias="FRONTEND_API_KEY_DEFAULT_RPM",
+    )
+    frontend_api_key_default_rpd: int = Field(
+        default=5000,
+        alias="FRONTEND_API_KEY_DEFAULT_RPD",
+    )
 
     # Batch cleanup
     batch_cleanup_interval_secs: int = Field(
