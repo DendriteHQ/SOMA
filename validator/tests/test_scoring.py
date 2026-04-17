@@ -308,7 +308,7 @@ class TestScoring:
     def test_parse_text_answers_logs_when_recovery_succeeds(self, caplog):
         scoring = Scoring()
         text = (
-            '{"meta":"ok","results":[{"status":"ANSWERABLE","answer":"answer1"}],' 
+            '{"meta":"ok","results":[{"status":"ANSWERABLE","answer":"answer1"}],'
             '"notes":}'
         )
 
