@@ -353,7 +353,7 @@ class TestScoring:
 
         assert result == [""]
 
-    def test_parse_text_answers_raises_quote_error_code_for_repairable_json(self):
+    def test_parse_text_answers_raises_structure_error_code_for_repairable_json(self):
         scoring = Scoring()
         text = (
             '{"results":[{"id":"Q1","status":"ANSWERABLE","answer":"94"},'
@@ -363,7 +363,19 @@ class TestScoring:
         with pytest.raises(LLMOutputFormatError) as exc_info:
             scoring._parse_text_answers(text)
 
-        assert exc_info.value.error_code == "invalid_json_quote"
+        assert exc_info.value.error_code == "invalid_json_structure"
+
+    def test_parse_text_answers_raises_structure_error_code_for_trailing_comma(self):
+        scoring = Scoring()
+        text = (
+            '{"results":[{"id":"Q1","status":"ANSWERABLE","answer":"16K steps",'
+            '"notes":"warmup",}]}'
+        )
+
+        with pytest.raises(LLMOutputFormatError) as exc_info:
+            scoring._parse_text_answers(text)
+
+        assert exc_info.value.error_code == "invalid_json_structure"
 
     def test_parse_text_answers_saves_full_unrecoverable_raw_text(
         self, tmp_path, monkeypatch
@@ -480,6 +492,24 @@ class TestScoring:
         repair_prompt = mock_llm.ask.await_args_list[1].args[0]
         assert "Repair only the JSON formatting" in repair_prompt
         assert malformed in repair_prompt
+
+    @pytest.mark.asyncio
+    async def test_ask_and_extract_answers_retries_for_missing_results_wrapper(self):
+        scoring = Scoring()
+
+        malformed = '{"status":"ANSWERABLE","answer":"Paris"}'
+        repaired = build_results_payload(("ANSWERABLE", "Paris"))
+
+        mock_llm = AsyncMock()
+        mock_llm.ask.side_effect = [{"text": malformed}, repaired]
+        scoring._llm = mock_llm
+
+        answers = await scoring._ask_and_extract_answers("base prompt", 1)
+
+        assert answers == ["Paris"]
+        assert mock_llm.ask.await_count == 2
+        repair_prompt = mock_llm.ask.await_args_list[1].args[0]
+        assert "missing top-level results wrapper" in repair_prompt
 
     @pytest.mark.asyncio
     async def test_score_async_partial_match(self):
