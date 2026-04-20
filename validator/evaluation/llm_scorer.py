@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import datetime, timezone
 import json
 import logging
 import os
+from pathlib import Path
 import re
 from pydantic import BaseModel
 from typing import Any
 import tiktoken
+import uuid
 from validator.evaluation.prompts import ANSWERS_GENERATION_PROMPT
 
 
@@ -214,6 +217,35 @@ class Scoring:
         self._f1_weight = f1_weight
         self._prompt_encoding = tiktoken.get_encoding("cl100k_base")
 
+    def _parse_failure_dump_dir(self) -> Path:
+        configured = (os.getenv("LLM_PARSE_FAILURE_DIR") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        # Keep parse-failure artifacts under validator/logs by default.
+        return Path(__file__).resolve().parents[1] / "logs" / "llm_parse_failures"
+
+    def _persist_unrecoverable_parse_payload(self, raw_text: str) -> None:
+        dump_dir = self._parse_failure_dump_dir()
+        timestamp = datetime.now(timezone.utc)
+        filename = (
+            f"parse_failure_{timestamp.strftime('%Y%m%dT%H%M%S_%fZ')}_"
+            f"{uuid.uuid4().hex}.txt"
+        )
+        file_path = dump_dir / filename
+        try:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(raw_text, encoding="utf-8")
+            logging.error(
+                "Saved unrecoverable LLM parse raw text to %s",
+                file_path,
+            )
+        except Exception as exc:
+            logging.error(
+                "Failed to persist unrecoverable LLM parse payload: %s",
+                exc,
+                exc_info=True,
+            )
+
     async def close(self) -> None:
         await self._llm.close()
 
@@ -391,6 +423,7 @@ class Scoring:
                     self._log_snippet(text),
                 )
                 return self._extract_answers_from_results(results)
+            self._persist_unrecoverable_parse_payload(text)
             logging.error(
                 "Failed to parse and recover LLM JSON response: snippet=%r",
                 self._log_snippet(text),

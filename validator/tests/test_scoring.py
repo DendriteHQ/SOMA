@@ -377,6 +377,20 @@ class TestScoring:
 
         assert exc_info.value.error_code == "invalid_json_structure"
 
+    def test_parse_text_answers_saves_full_unrecoverable_raw_text(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("LLM_PARSE_FAILURE_DIR", str(tmp_path))
+        scoring = Scoring()
+        text = '{"status":"ANSWERABLE","answer":"missing results"'
+
+        with pytest.raises(LLMOutputFormatError, match="not valid JSON"):
+            scoring._parse_text_answers(text)
+
+        files = list(tmp_path.glob("parse_failure_*.txt"))
+        assert len(files) == 1
+        assert files[0].read_text(encoding="utf-8") == text
+
     def test_parse_text_answers_empty(self):
         scoring = Scoring()
 
