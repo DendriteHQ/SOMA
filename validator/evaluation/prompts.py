@@ -52,8 +52,8 @@ Output JSON only:
     {{
       "id": "Q1",
       "status": "ANSWERABLE | NOT_ANSWERABLE_FROM_DOCUMENT",
-      "answer": "...",              // present only if ANSWERABLE
-      "supporting_quote": "...",    // exact verbatim quote from DOCUMENT; present only if ANSWERABLE
+      "answer": "...",
+      "supporting_quote": "...",
       "notes": "Brief justification (1–2 sentences)"
     }}
   ]

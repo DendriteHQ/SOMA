@@ -87,7 +87,7 @@ The inaugural MCP challenge focuses on **context compression** - a critical prob
 
 ## Incentive Mechanism
 
-The subnet operates on a **recurring weekly competition cycle** using a winner-takes-all incentive model.
+The subnet operates on a **recurring weekly competition cycle**, where validation mechanism incentivise the top algorithm by compression ratio and one overall winner.
 
 The platform aggregates validator assessments into final rankings, and validators set on-chain weights based on platform-calculated scores.
 

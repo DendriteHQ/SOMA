@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from datetime import datetime, timezone
 import json
 import logging
 import os
+from pathlib import Path
 import re
 from pydantic import BaseModel
 from typing import Any
 import tiktoken
+import uuid
 from validator.evaluation.prompts import ANSWERS_GENERATION_PROMPT
 
 
@@ -19,7 +23,16 @@ class ScoringResult(BaseModel):
 
 
 class LLMOutputFormatError(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str | None = None,
+        response_text: str | None = None,
+    ):
+        super().__init__(message)
+        self.error_code = error_code
+        self.response_text = response_text
 
 
 class LLMInsufficientFundsError(RuntimeError):
@@ -27,6 +40,7 @@ class LLMInsufficientFundsError(RuntimeError):
 
 
 ANSWER_FORMAT_TOKEN_RE = re.compile(r"[^\W\d_]+|\d+", re.UNICODE)
+VALID_JSON_ESCAPE_CHARS = {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}
 
 
 def is_insufficient_funds_error(status_code: int, error_body: str | None) -> bool:
@@ -64,6 +78,8 @@ class LLMClient:
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self._session = None
+        self._session_lock: asyncio.Lock | None = None
 
         token_status = "SET" if self.api_token else "NOT SET"
         token_length = len(self.api_token) if self.api_token else 0
@@ -97,31 +113,63 @@ class LLMClient:
 
         return await self._chat(self.url, headers, body)
 
-    async def _chat(self, url: str, headers: dict[str, str], body: dict) -> dict[str, Any]:
+    async def close(self) -> None:
+        session = self._session
+        self._session = None
+        if session is None:
+            return
+        if getattr(session, "closed", True):
+            return
+        await session.close()
+        logging.info("LLMClient session closed")
+
+    async def _get_session(self):
         try:
             import aiohttp
         except Exception as exc:
             raise RuntimeError("aiohttp is required for LLM HTTP calls") from exc
 
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        status_code = 0
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, json=body) as response:
-                status_code = response.status
-                if response.status != 200:
-                    error_body = await response.text()
-                    logging.error(
-                        f"LLM API Error: status={response.status}, "
-                        f"body={error_body[:500]}"
-                    )
-                    if is_insufficient_funds_error(response.status, error_body):
-                        raise LLMInsufficientFundsError(
-                            f"OpenRouter rejected request due to insufficient funds "
-                            f"(status={response.status})"
-                        )
-                response.raise_for_status()
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
 
-                payload = await response.json()
+        async with self._session_lock:
+            current_loop = asyncio.get_running_loop()
+            if self._session is not None and not self._session.closed:
+                session_loop = getattr(self._session, "_loop", None)
+                if session_loop is current_loop:
+                    return self._session
+                logging.warning(
+                    "LLMClient session was created on a different event loop; recreating session"
+                )
+                with contextlib.suppress(Exception):
+                    await self._session.close()
+                self._session = None
+
+            if self._session is None or self._session.closed:
+                timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+                self._session = aiohttp.ClientSession(timeout=timeout)
+
+            return self._session
+
+    async def _chat(self, url: str, headers: dict[str, str], body: dict) -> dict[str, Any]:
+        status_code = 0
+        session = await self._get_session()
+        async with session.post(url, headers=headers, json=body) as response:
+            status_code = response.status
+            if response.status != 200:
+                error_body = await response.text()
+                logging.error(
+                    f"LLM API Error: status={response.status}, "
+                    f"body={error_body[:500]}"
+                )
+                if is_insufficient_funds_error(response.status, error_body):
+                    raise LLMInsufficientFundsError(
+                        f"OpenRouter rejected request due to insufficient funds "
+                        f"(status={response.status})"
+                    )
+            response.raise_for_status()
+
+            payload = await response.json()
 
         text = ""
         if isinstance(payload, dict):
@@ -168,6 +216,38 @@ class Scoring:
         self._exact_weight = exact_weight
         self._f1_weight = f1_weight
         self._prompt_encoding = tiktoken.get_encoding("cl100k_base")
+
+    def _parse_failure_dump_dir(self) -> Path:
+        configured = (os.getenv("LLM_PARSE_FAILURE_DIR") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        # Keep parse-failure artifacts under validator/logs by default.
+        return Path(__file__).resolve().parents[1] / "logs" / "llm_parse_failures"
+
+    def _persist_unrecoverable_parse_payload(self, raw_text: str) -> None:
+        dump_dir = self._parse_failure_dump_dir()
+        timestamp = datetime.now(timezone.utc)
+        filename = (
+            f"parse_failure_{timestamp.strftime('%Y%m%dT%H%M%S_%fZ')}_"
+            f"{uuid.uuid4().hex}.txt"
+        )
+        file_path = dump_dir / filename
+        try:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(raw_text, encoding="utf-8")
+            logging.error(
+                "Saved unrecoverable LLM parse raw text to %s",
+                file_path,
+            )
+        except Exception as exc:
+            logging.error(
+                "Failed to persist unrecoverable LLM parse payload: %s",
+                exc,
+                exc_info=True,
+            )
+
+    async def close(self) -> None:
+        await self._llm.close()
 
     async def _request_with_retry(self, func, retries: int = 3, delay: float = 1.0):
         attempts = max(1, retries)
@@ -274,7 +354,27 @@ class Scoring:
         expected_len: int,
     ) -> list[str]:
         raw = await self._llm.ask(prompt)
-        model_answers = self._extract_answers(raw)
+        try:
+            model_answers = self._extract_answers(raw)
+        except LLMOutputFormatError as exc:
+            if not self._should_retry_json_repair(exc):
+                raise
+
+            previous_response = self._extract_response_text(raw)
+            if not previous_response:
+                raise
+
+            logging.warning(
+                "Retrying malformed JSON response repair via LLM: snippet=%r",
+                self._log_snippet(previous_response),
+            )
+            repair_prompt = self._build_json_repair_prompt(
+                original_prompt=prompt,
+                malformed_response=previous_response,
+                error_message=str(exc),
+            )
+            repaired_raw = await self._llm.ask(repair_prompt)
+            model_answers = self._extract_answers(repaired_raw)
         return self._normalize_len(model_answers, expected_len)
 
     def _round_score(self, value: float) -> float:
@@ -294,16 +394,219 @@ class Scoring:
     def _parse_text_answers(self, text: str) -> list[str]:
         text = text.strip()
         if not text:
-            raise LLMOutputFormatError("Empty LLM response")
+            raise LLMOutputFormatError("Empty LLM response", error_code="empty_response")
         text = self._strip_code_fences(text)
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                if "results" in parsed and isinstance(parsed["results"], list):
-                    return self._extract_answers_from_results(parsed["results"])
-            raise LLMOutputFormatError("LLM response does not contain a results array")
+            results = self._extract_results_list(parsed)
+            if results is not None:
+                return self._extract_answers_from_results(results)
         except json.JSONDecodeError as exc:
-            raise LLMOutputFormatError("LLM response is not valid JSON") from exc
+            sanitized_text = self._sanitize_invalid_json_escapes(text)
+            if sanitized_text != text:
+                logging.warning(
+                    "Sanitized invalid JSON escape sequences in LLM response: snippet=%r",
+                    self._log_snippet(text),
+                )
+                try:
+                    parsed = json.loads(sanitized_text)
+                    results = self._extract_results_list(parsed)
+                    if results is not None:
+                        return self._extract_answers_from_results(results)
+                except json.JSONDecodeError:
+                    text = sanitized_text
+
+            results = self._recover_results_list(text)
+            if results is not None:
+                logging.warning(
+                    "Recovered results array from malformed LLM JSON response: snippet=%r",
+                    self._log_snippet(text),
+                )
+                return self._extract_answers_from_results(results)
+            self._persist_unrecoverable_parse_payload(text)
+            logging.error(
+                "Failed to parse and recover LLM JSON response: snippet=%r",
+                self._log_snippet(text),
+            )
+            raise LLMOutputFormatError(
+                "LLM response is not valid JSON",
+                error_code=self._classify_json_error(text, exc),
+                response_text=text,
+            ) from exc
+
+        results = self._recover_results_list(text)
+        if results is not None:
+            return self._extract_answers_from_results(results)
+        raise LLMOutputFormatError(
+            "LLM response does not contain a results array",
+            error_code="missing_results",
+            response_text=text,
+        )
+
+    def _extract_results_list(self, payload: Any) -> list[Any] | None:
+        if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+            return payload["results"]
+        return None
+
+    def _recover_results_list(self, text: str) -> list[Any] | None:
+        match = re.search(r'"results"\s*:\s*\[', text)
+        if not match:
+            return None
+
+        array_start = text.find("[", match.start())
+        if array_start == -1:
+            return None
+
+        array_text = self._extract_balanced_json_array(text, array_start)
+        if array_text is None:
+            return None
+
+        try:
+            parsed = json.loads(array_text)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, list) else None
+
+    def _extract_balanced_json_array(self, text: str, start_idx: int) -> str | None:
+        if start_idx < 0 or start_idx >= len(text) or text[start_idx] != "[":
+            return None
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start_idx, len(text)):
+            char = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                continue
+            if char == "[":
+                depth += 1
+                continue
+            if char == "]":
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx : idx + 1]
+
+        return None
+
+    def _log_snippet(self, text: str, limit: int = 240) -> str:
+        collapsed = re.sub(r"\s+", " ", text).strip()
+        if len(collapsed) <= limit:
+            return collapsed
+        return collapsed[: limit - 3] + "..."
+
+    def _extract_response_text(self, raw: Any) -> str | None:
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, dict):
+            for key in ("text", "response", "answer", "content"):
+                value = raw.get(key)
+                if isinstance(value, str):
+                    return value
+        return None
+
+    def _build_json_repair_prompt(
+        self,
+        *,
+        original_prompt: str,
+        malformed_response: str,
+        error_message: str,
+    ) -> str:
+        return (
+            "Your previous response was intended to be valid JSON but was malformed. "
+            "Repair only the JSON formatting. Fix issues such as missing or misplaced "
+            "double quotes, broken keys, trailing commas, malformed string boundaries, "
+            "or a missing top-level results wrapper if needed. Preserve the same semantic "
+            "content and do not change any answers unless needed to make the JSON valid. "
+            "Return JSON only.\n\n"
+            f"Parser error: {error_message}\n\n"
+            "Original instruction:\n"
+            f"<<<ORIGINAL_PROMPT\n{original_prompt}\nORIGINAL_PROMPT>>>\n\n"
+            "Your malformed response:\n"
+            f"<<<MALFORMED_RESPONSE\n{malformed_response}\nMALFORMED_RESPONSE>>>"
+        )
+
+    def _should_retry_json_repair(self, exc: LLMOutputFormatError) -> bool:
+        return exc.error_code in {
+            "invalid_json",
+            "invalid_json_structure",
+            "missing_results",
+        }
+
+    def _sanitize_invalid_json_escapes(self, text: str) -> str:
+        result: list[str] = []
+        in_string = False
+        escaped = False
+        index = 0
+
+        while index < len(text):
+            char = text[index]
+
+            if not in_string:
+                result.append(char)
+                if char == '"':
+                    in_string = True
+                index += 1
+                continue
+
+            if escaped:
+                result.append(char)
+                escaped = False
+                index += 1
+                continue
+
+            if char == "\\":
+                next_char = text[index + 1] if index + 1 < len(text) else ""
+                if next_char and next_char in VALID_JSON_ESCAPE_CHARS:
+                    result.append(char)
+                    escaped = True
+                else:
+                    result.append("\\\\")
+                index += 1
+                continue
+
+            result.append(char)
+            if char == '"':
+                in_string = False
+            index += 1
+
+        return "".join(result)
+
+    def _classify_json_error(self, text: str, exc: json.JSONDecodeError) -> str:
+        message = exc.msg.lower()
+        if "invalid \\escape" in message:
+            return "invalid_json_escape"
+        if self._looks_like_json_structure_issue(text, message):
+            return "invalid_json_structure"
+        return "invalid_json"
+
+    def _looks_like_json_structure_issue(self, text: str, error_message: str) -> bool:
+        structural_errors = (
+            "expecting property name enclosed in double quotes",
+            "unterminated string",
+            "expecting ':' delimiter",
+            "expecting ',' delimiter",
+            "expecting value",
+            "extra data",
+        )
+        if any(fragment in error_message for fragment in structural_errors):
+            return '"results"' in text
+        if re.search(r'(^|[,\[{]\s*)([A-Za-z_][A-Za-z0-9_]*)"\s*:', text):
+            return True
+        if re.search(r':\s*([A-Z_]+)"', text):
+            return True
+        if re.search(r',\s*[}\]]', text):
+            return True
+        return False
 
     def _extract_answers_from_results(self, results: list[Any]) -> list[str]:
         answers: list[str] = []

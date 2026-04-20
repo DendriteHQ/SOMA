@@ -8,9 +8,20 @@ from validator.evaluation.llm_scorer import (
     Scoring,
     LLMClient,
     ScoringResult,
+    LLMOutputFormatError,
     LLMInsufficientFundsError,
     is_insufficient_funds_error,
 )
+
+
+def build_results_payload(*items: tuple[str, str | None]) -> dict[str, str]:
+    results: list[dict[str, str]] = []
+    for status, answer in items:
+        item = {"status": status}
+        if answer is not None:
+            item["answer"] = answer
+        results.append(item)
+    return {"text": json.dumps({"results": results})}
 
 
 class TestOpenRouterFunds:
@@ -218,63 +229,173 @@ class TestScoring:
         assert len(result) == 3
         assert result == ["a", "b", "c"]
 
-    def test_extract_answers_from_list(self):
+    def test_extract_answers_from_dict_with_results_key(self):
         scoring = Scoring()
 
-        raw = ["answer1", "answer2"]
+        raw = {
+            "results": [
+                {"status": "ANSWERABLE", "answer": "answer1"},
+                {"status": "NOT_ANSWERABLE_FROM_DOCUMENT"},
+                {"status": "ANSWERABLE", "answer": "answer3"},
+            ]
+        }
         result = scoring._extract_answers(raw)
-        assert result == ["answer1", "answer2"]
-
-    def test_extract_answers_from_dict_with_answers_key(self):
-        scoring = Scoring()
-
-        raw = {"answers": ["answer1", "answer2"]}
-        result = scoring._extract_answers(raw)
-        assert result == ["answer1", "answer2"]
+        assert result == ["answer1", "", "answer3"]
 
     def test_extract_answers_from_dict_with_text_key(self):
         scoring = Scoring()
 
-        raw = {"text": '["answer1", "answer2"]'}
+        raw = {
+            "text": json.dumps(
+                {
+                    "results": [
+                        {"status": "ANSWERABLE", "answer": "answer1"},
+                        {"status": "ANSWERABLE", "answer": "answer2"},
+                    ]
+                }
+            )
+        }
         result = scoring._extract_answers(raw)
         assert result == ["answer1", "answer2"]
 
     def test_extract_answers_from_string(self):
         scoring = Scoring()
 
-        raw = '["answer1", "answer2"]'
+        raw = json.dumps(
+            {
+                "results": [
+                    {"status": "ANSWERABLE", "answer": "answer1"},
+                    {"status": "ANSWERABLE", "answer": "answer2"},
+                ]
+            }
+        )
         result = scoring._extract_answers(raw)
         assert result == ["answer1", "answer2"]
 
-    def test_parse_text_answers_json_array(self):
+    def test_parse_text_answers_results_object(self):
         scoring = Scoring()
 
-        text = '["answer1", "answer2", "answer3"]'
+        text = json.dumps(
+            {
+                "results": [
+                    {"status": "ANSWERABLE", "answer": "answer1"},
+                    {"status": "ANSWERABLE", "answer": "answer2"},
+                    {"status": "ANSWERABLE", "answer": "answer3"},
+                ]
+            }
+        )
         result = scoring._parse_text_answers(text)
         assert result == ["answer1", "answer2", "answer3"]
 
     def test_parse_text_answers_with_code_fences(self):
         scoring = Scoring()
 
-        text = '```json\n["answer1", "answer2"]\n```'
+        text = '```json\n{"results":[{"status":"ANSWERABLE","answer":"answer1"},{"status":"ANSWERABLE","answer":"answer2"}]}\n```'
         result = scoring._parse_text_answers(text)
         assert result == ["answer1", "answer2"]
 
-    def test_parse_text_answers_numbered_list(self):
+    def test_parse_text_answers_recovers_results_from_malformed_json(self):
         scoring = Scoring()
 
-        text = "1. answer1\n2. answer2\n3. answer3"
+        text = (
+            '{"meta":"ok","results":[{"status":"ANSWERABLE","answer":"answer1"},'
+            '{"status":"NOT_ANSWERABLE_FROM_DOCUMENT"},'
+            '{"status":"ANSWERABLE","answer":"answer3"}],"notes":}'
+        )
         result = scoring._parse_text_answers(text)
-        assert len(result) == 3
-        assert "answer1" in result[0]
-        assert "answer2" in result[1]
-        assert "answer3" in result[2]
+        assert result == ["answer1", "", "answer3"]
+
+    def test_parse_text_answers_logs_when_recovery_succeeds(self, caplog):
+        scoring = Scoring()
+        text = (
+            '{"meta":"ok","results":[{"status":"ANSWERABLE","answer":"answer1"}],'
+            '"notes":}'
+        )
+
+        with caplog.at_level("WARNING"):
+            result = scoring._parse_text_answers(text)
+
+        assert result == ["answer1"]
+        assert "Recovered results array from malformed LLM JSON response" in caplog.text
+        assert '"results"' in caplog.text
+
+    def test_parse_text_answers_raises_when_results_not_recoverable(self):
+        scoring = Scoring()
+
+        with pytest.raises(LLMOutputFormatError, match="not valid JSON"):
+            scoring._parse_text_answers('{"status":"ANSWERABLE","answer":"missing results"')
+
+    def test_parse_text_answers_logs_when_recovery_fails(self, caplog):
+        scoring = Scoring()
+        text = '{"status":"ANSWERABLE","answer":"missing results"'
+
+        with caplog.at_level("ERROR"):
+            with pytest.raises(LLMOutputFormatError, match="not valid JSON"):
+                scoring._parse_text_answers(text)
+
+        assert "Failed to parse and recover LLM JSON response" in caplog.text
+        assert "missing results" in caplog.text
+
+    def test_parse_text_answers_sanitizes_invalid_backslash_escape(self):
+        scoring = Scoring()
+        text = json.dumps(
+            {
+                "results": [
+                    {
+                        "status": "NOT_ANSWERABLE_FROM_DOCUMENT",
+                        "notes": "placeholder",
+                    }
+                ]
+            }
+        ).replace("placeholder", "The document never mentions an '\\ell-deep sister family case'.")
+
+        result = scoring._parse_text_answers(text)
+
+        assert result == [""]
+
+    def test_parse_text_answers_raises_structure_error_code_for_repairable_json(self):
+        scoring = Scoring()
+        text = (
+            '{"results":[{"id":"Q1","status":"ANSWERABLE","answer":"94"},'
+            '{"id":"Q2", status": ANSWERABLE", "answer":"120 days"}]}'
+        )
+
+        with pytest.raises(LLMOutputFormatError) as exc_info:
+            scoring._parse_text_answers(text)
+
+        assert exc_info.value.error_code == "invalid_json_structure"
+
+    def test_parse_text_answers_raises_structure_error_code_for_trailing_comma(self):
+        scoring = Scoring()
+        text = (
+            '{"results":[{"id":"Q1","status":"ANSWERABLE","answer":"16K steps",'
+            '"notes":"warmup",}]}'
+        )
+
+        with pytest.raises(LLMOutputFormatError) as exc_info:
+            scoring._parse_text_answers(text)
+
+        assert exc_info.value.error_code == "invalid_json_structure"
+
+    def test_parse_text_answers_saves_full_unrecoverable_raw_text(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("LLM_PARSE_FAILURE_DIR", str(tmp_path))
+        scoring = Scoring()
+        text = '{"status":"ANSWERABLE","answer":"missing results"'
+
+        with pytest.raises(LLMOutputFormatError, match="not valid JSON"):
+            scoring._parse_text_answers(text)
+
+        files = list(tmp_path.glob("parse_failure_*.txt"))
+        assert len(files) == 1
+        assert files[0].read_text(encoding="utf-8") == text
 
     def test_parse_text_answers_empty(self):
         scoring = Scoring()
 
-        result = scoring._parse_text_answers("")
-        assert result == []
+        with pytest.raises(LLMOutputFormatError, match="Empty LLM response"):
+            scoring._parse_text_answers("")
 
     def test_strip_code_fences(self):
         scoring = Scoring()
@@ -312,7 +433,10 @@ class TestScoring:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {"text": '["Paris", "France"]'}
+        mock_llm.ask.return_value = build_results_payload(
+            ("ANSWERABLE", "Paris"),
+            ("ANSWERABLE", "France"),
+        )
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -331,7 +455,10 @@ class TestScoring:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {"text": '["London", "Germany"]'}
+        mock_llm.ask.return_value = build_results_payload(
+            ("ANSWERABLE", "London"),
+            ("ANSWERABLE", "Germany"),
+        )
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -346,11 +473,53 @@ class TestScoring:
         assert len(result.details) == 2
 
     @pytest.mark.asyncio
+    async def test_ask_and_extract_answers_retries_with_json_repair_prompt(self):
+        scoring = Scoring()
+
+        malformed = (
+            '{"results":[{"id":"Q1", status": ANSWERABLE", "answer":"Paris"}]}'
+        )
+        repaired = build_results_payload(("ANSWERABLE", "Paris"))
+
+        mock_llm = AsyncMock()
+        mock_llm.ask.side_effect = [{"text": malformed}, repaired]
+        scoring._llm = mock_llm
+
+        answers = await scoring._ask_and_extract_answers("base prompt", 1)
+
+        assert answers == ["Paris"]
+        assert mock_llm.ask.await_count == 2
+        repair_prompt = mock_llm.ask.await_args_list[1].args[0]
+        assert "Repair only the JSON formatting" in repair_prompt
+        assert malformed in repair_prompt
+
+    @pytest.mark.asyncio
+    async def test_ask_and_extract_answers_retries_for_missing_results_wrapper(self):
+        scoring = Scoring()
+
+        malformed = '{"status":"ANSWERABLE","answer":"Paris"}'
+        repaired = build_results_payload(("ANSWERABLE", "Paris"))
+
+        mock_llm = AsyncMock()
+        mock_llm.ask.side_effect = [{"text": malformed}, repaired]
+        scoring._llm = mock_llm
+
+        answers = await scoring._ask_and_extract_answers("base prompt", 1)
+
+        assert answers == ["Paris"]
+        assert mock_llm.ask.await_count == 2
+        repair_prompt = mock_llm.ask.await_args_list[1].args[0]
+        assert "missing top-level results wrapper" in repair_prompt
+
+    @pytest.mark.asyncio
     async def test_score_async_partial_match(self):
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {"text": '["Paris", "Germany"]'}
+        mock_llm.ask.return_value = build_results_payload(
+            ("ANSWERABLE", "Paris"),
+            ("ANSWERABLE", "Germany"),
+        )
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -362,16 +531,17 @@ class TestScoring:
         assert isinstance(result, ScoringResult)
         assert 0.0 < result.score < 1.0
         assert len(result.details) == 2
-        # First answer matches, second doesn't
-        assert result.details[0]["exact_match"] == 1.0
-        assert result.details[1]["exact_match"] == 0.0
+        assert result.model_answers == ["Paris", "Germany"]
+        assert result.scores[0] == 1.0
+        assert result.scores[1] == 0.0
+        assert result.details == [{"reason": "Answered"}, {"reason": "Answered"}]
 
     @pytest.mark.asyncio
     async def test_score_async_with_mock(self):
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {"text": '["Paris"]'}
+        mock_llm.ask.return_value = build_results_payload(("ANSWERABLE", "Paris"))
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -385,7 +555,7 @@ class TestScoring:
     async def test_score_async_basic(self):
         scoring = Scoring()
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {"text": '["answer1"]'}
+        mock_llm.ask.return_value = build_results_payload(("ANSWERABLE", "answer1"))
         scoring._llm = mock_llm
 
         result = await scoring.score_async("text", ["q"], ["a"])
@@ -413,7 +583,7 @@ class TestScoring:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {"text": '["test answer"]'}
+        mock_llm.ask.return_value = build_results_payload(("ANSWERABLE", "test answer"))
         scoring._llm = mock_llm
 
         result = await scoring.score_async(
@@ -422,16 +592,7 @@ class TestScoring:
 
         assert len(result.details) == 1
         detail = result.details[0]
-        assert "index" in detail
-        assert "question" in detail
-        assert "expected" in detail
-        assert "actual" in detail
-        assert "exact_match" in detail
-        assert "f1" in detail
-        assert "score" in detail
-        assert detail["index"] == 0
-        assert detail["question"] == "Test question"
-        assert detail["expected"] == "test answer"
+        assert detail == {"reason": "Answered"}
 
 
 class TestScoringIntegration:
@@ -441,9 +602,11 @@ class TestScoringIntegration:
         scoring = Scoring()
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {
-            "text": '["1812", "Fire destroyed docks in 1879", "Fog Festival in October"]'
-        }
+        mock_llm.ask.return_value = build_results_payload(
+            ("ANSWERABLE", "1812"),
+            ("ANSWERABLE", "Fire destroyed docks in 1879"),
+            ("ANSWERABLE", "Fog Festival in October"),
+        )
         scoring._llm = mock_llm
 
         compressed_text = "Rivergate: port city est. 1812. 1879: dock fire."
@@ -467,10 +630,7 @@ class TestScoringIntegration:
 
         # Check that all detail objects have required fields
         for detail in result.details:
-            assert "score" in detail
-            assert "f1" in detail
-            assert "exact_match" in detail
-            assert 0.0 <= detail["score"] <= 1.0
+            assert detail == {"reason": "Answered"}
 
     @pytest.mark.asyncio
     async def test_custom_weights(self):
@@ -479,7 +639,7 @@ class TestScoringIntegration:
         scoring_exact = Scoring(exact_weight=0.8, f1_weight=0.2)
 
         mock_llm = AsyncMock()
-        mock_llm.ask.return_value = {"text": '["exact match"]'}
+        mock_llm.ask.return_value = build_results_payload(("ANSWERABLE", "exact match"))
         scoring_exact._llm = mock_llm
 
         result = await scoring_exact.score_async(
