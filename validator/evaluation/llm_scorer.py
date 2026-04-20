@@ -41,7 +41,6 @@ class LLMInsufficientFundsError(RuntimeError):
 
 ANSWER_FORMAT_TOKEN_RE = re.compile(r"[^\W\d_]+|\d+", re.UNICODE)
 VALID_JSON_ESCAPE_CHARS = {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}
-LLM_SCORING_MODEL = "gpt-4.1-mini"
 LLM_SCORING_ALLOWED_SCORES = {0.0, 0.5, 0.75, 1.0}
 
 
@@ -432,7 +431,7 @@ class Scoring:
             expected_answers=expected_answers,
             candidate_answers=candidate_answers,
         )
-        raw = await self._llm.ask(prompt, model_override=LLM_SCORING_MODEL)
+        raw = await self._llm.ask(prompt)
         scoring_results = self._extract_scores(raw)
         return self._normalize_scoring_len(scoring_results, expected_len, candidate_answers)
 
