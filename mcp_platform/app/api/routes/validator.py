@@ -37,6 +37,8 @@ from soma_shared.db.models.batch_question_answer import BatchQuestionAnswer
 from soma_shared.db.models.batch_question_score import BatchQuestionScore
 from soma_shared.db.models.challenge import Challenge
 from soma_shared.db.models.challenge_batch import ChallengeBatch
+from soma_shared.db.models.competition_config import CompetitionConfig
+from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.question import Question
 from soma_shared.db.models.validator import Validator
@@ -1680,12 +1682,26 @@ async def get_best_miners(
                 miners = [MinerWeight(uid=0, weight=1.0)]
                 response_payload = GetBestMinersUidResponse(miners=miners)
             else:
-                # Get top miners from screener ranking.
-                top_screener_miners = []
+                # Get top screener miners from current competition and, for a short
+                # grace window after a new competition starts, from the previous
+                # competition as well.
+                top_screener_miners: list[int] = []
+                current_top_screener_miners: list[int] = []
+                previous_top_screener_miners: list[int] = []
                 try:
-                    active_competition_id = current_competition_id
+                    active_competition_id = int(current_competition_id)
                     top_screener_scripts = float(
                         getattr(settings, "top_screener_scripts", 0.2)
+                    )
+                    previous_competition_grace_hours = max(
+                        0.0,
+                        float(
+                            getattr(
+                                settings,
+                                "previous_competition_screeners_grace_hours",
+                                4.0,
+                            )
+                        ),
                     )
                     logger.info(
                         "get_best_miners_screener_context",
@@ -1693,16 +1709,26 @@ async def get_best_miners(
                             "request_id": request_id,
                             "active_competition_id": active_competition_id,
                             "top_screener_scripts": top_screener_scripts,
+                            "previous_competition_grace_hours": (
+                                previous_competition_grace_hours
+                            ),
                         },
                     )
 
-                    if top_screener_scripts > 0:
+                    async def _load_top_screener_uids_for_competition(
+                        competition_id: int,
+                        *,
+                        source: str,
+                    ) -> list[int]:
+                        if top_screener_scripts <= 0:
+                            return []
+
                         eligible_row = (
                             await db.execute(
                                 select(V_MINER_SCREENER_ELIGIBLE_RANKED.c.total_eligible)
                                 .where(
                                     V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id
-                                    == active_competition_id
+                                    == competition_id
                                 )
                                 .limit(1)
                             )
@@ -1717,39 +1743,211 @@ async def get_best_miners(
                             if total_eligible > 0
                             else 0
                         )
-
-                        if top_limit > 0:
-                            qualified_miners_result = await db.execute(
-                                select(Miner.ss58)
-                                .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
-                                .join(
-                                    Miner,
-                                    Miner.id == V_MINER_SCREENER_ELIGIBLE_RANKED.c.miner_id,
-                                )
-                                .where(
-                                    V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id
-                                    == active_competition_id
-                                )
-                                .where(
-                                    V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank <= top_limit
-                                )
-                                .where(Miner.miner_banned_status.is_(False))
-                                .order_by(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank.asc())
-                            )
-                            for row in qualified_miners_result:
-                                uid = hotkey_to_uid.get(str(row.ss58))
-                                if uid is not None:
-                                    top_screener_miners.append(uid)
+                        if top_limit <= 0:
                             logger.info(
-                                "get_best_miners_screener_selected",
+                                "get_best_miners_screener_selected_for_competition",
                                 extra={
                                     "request_id": request_id,
+                                    "competition_id": competition_id,
+                                    "source": source,
                                     "total_eligible": total_eligible,
                                     "top_limit": top_limit,
-                                    "top_screener_miners": top_screener_miners,
-                                    "selected_count": len(top_screener_miners),
+                                    "selected_count": 0,
                                 },
                             )
+                            return []
+
+                        selected_uids: list[int] = []
+                        qualified_miners_result = await db.execute(
+                            select(Miner.ss58)
+                            .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
+                            .join(
+                                Miner,
+                                Miner.id == V_MINER_SCREENER_ELIGIBLE_RANKED.c.miner_id,
+                            )
+                            .where(
+                                V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id
+                                == competition_id
+                            )
+                            .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank <= top_limit)
+                            .where(Miner.miner_banned_status.is_(False))
+                            .order_by(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank.asc())
+                        )
+                        for row in qualified_miners_result:
+                            uid = hotkey_to_uid.get(str(row.ss58))
+                            if uid is not None:
+                                selected_uids.append(uid)
+
+                        logger.info(
+                            "get_best_miners_screener_selected_for_competition",
+                            extra={
+                                "request_id": request_id,
+                                "competition_id": competition_id,
+                                "source": source,
+                                "total_eligible": total_eligible,
+                                "top_limit": top_limit,
+                                "selected_count": len(selected_uids),
+                                "selected_uids": selected_uids,
+                            },
+                        )
+                        return selected_uids
+
+                    current_top_screener_miners = (
+                        await _load_top_screener_uids_for_competition(
+                            active_competition_id,
+                            source="current_competition",
+                        )
+                    )
+                    top_screener_miners.extend(current_top_screener_miners)
+
+                    current_timeframe_row = (
+                        await db.execute(
+                            select(CompetitionTimeframe.upload_starts_at)
+                            .select_from(CompetitionConfig)
+                            .join(
+                                CompetitionTimeframe,
+                                CompetitionTimeframe.competition_config_fk
+                                == CompetitionConfig.id,
+                            )
+                            .where(CompetitionConfig.competition_fk == active_competition_id)
+                            .limit(1)
+                        )
+                    ).first()
+                    current_upload_starts_at = (
+                        current_timeframe_row.upload_starts_at
+                        if current_timeframe_row is not None
+                        else None
+                    )
+                    if (
+                        current_upload_starts_at is not None
+                        and current_upload_starts_at.tzinfo is None
+                    ):
+                        current_upload_starts_at = current_upload_starts_at.replace(
+                            tzinfo=timezone.utc
+                        )
+
+                    within_previous_competition_grace = False
+                    grace_deadline = None
+                    if (
+                        current_upload_starts_at is not None
+                        and previous_competition_grace_hours > 0
+                    ):
+                        grace_deadline = current_upload_starts_at + timedelta(
+                            hours=previous_competition_grace_hours
+                        )
+                        within_previous_competition_grace = now <= grace_deadline
+
+                    logger.info(
+                        "get_best_miners_previous_competition_grace_context",
+                        extra={
+                            "request_id": request_id,
+                            "active_competition_id": active_competition_id,
+                            "current_upload_starts_at": (
+                                current_upload_starts_at.isoformat()
+                                if current_upload_starts_at is not None
+                                else None
+                            ),
+                            "grace_deadline": (
+                                grace_deadline.isoformat()
+                                if grace_deadline is not None
+                                else None
+                            ),
+                            "within_previous_competition_grace": (
+                                within_previous_competition_grace
+                            ),
+                            "previous_competition_grace_hours": (
+                                previous_competition_grace_hours
+                            ),
+                        },
+                    )
+
+                    if (
+                        within_previous_competition_grace
+                        and current_upload_starts_at is not None
+                    ):
+                        previous_competition_row = (
+                            await db.execute(
+                                select(
+                                    CompetitionConfig.competition_fk.label(
+                                        "competition_id"
+                                    ),
+                                    CompetitionTimeframe.upload_starts_at.label(
+                                        "upload_starts_at"
+                                    ),
+                                )
+                                .select_from(CompetitionConfig)
+                                .join(
+                                    CompetitionTimeframe,
+                                    CompetitionTimeframe.competition_config_fk
+                                    == CompetitionConfig.id,
+                                )
+                                .where(
+                                    CompetitionConfig.competition_fk
+                                    != active_competition_id
+                                )
+                                .where(
+                                    CompetitionTimeframe.upload_starts_at
+                                    < current_upload_starts_at
+                                )
+                                .order_by(CompetitionTimeframe.upload_starts_at.desc())
+                                .limit(1)
+                            )
+                        ).first()
+                        if (
+                            previous_competition_row is not None
+                            and previous_competition_row.competition_id is not None
+                        ):
+                            previous_competition_id = int(
+                                previous_competition_row.competition_id
+                            )
+                            previous_top_screener_miners = (
+                                await _load_top_screener_uids_for_competition(
+                                    previous_competition_id,
+                                    source="previous_competition",
+                                )
+                            )
+                            top_screener_miners.extend(previous_top_screener_miners)
+                            logger.info(
+                                "get_best_miners_previous_competition_selected",
+                                extra={
+                                    "request_id": request_id,
+                                    "active_competition_id": active_competition_id,
+                                    "previous_competition_id": previous_competition_id,
+                                    "previous_upload_starts_at": (
+                                        previous_competition_row.upload_starts_at.isoformat()
+                                        if previous_competition_row.upload_starts_at
+                                        else None
+                                    ),
+                                    "selected_count": len(
+                                        previous_top_screener_miners
+                                    ),
+                                },
+                            )
+                        else:
+                            logger.info(
+                                "get_best_miners_previous_competition_not_found",
+                                extra={
+                                    "request_id": request_id,
+                                    "active_competition_id": active_competition_id,
+                                },
+                            )
+
+                    # Ensure a unique miner list before converting to fixed per-miner
+                    # screener weights.
+                    if top_screener_miners:
+                        top_screener_miners = list(dict.fromkeys(top_screener_miners))
+
+                    logger.info(
+                        "get_best_miners_screener_selected",
+                        extra={
+                            "request_id": request_id,
+                            "active_competition_id": active_competition_id,
+                            "current_top_screener_miners": current_top_screener_miners,
+                            "previous_top_screener_miners": previous_top_screener_miners,
+                            "top_screener_miners": top_screener_miners,
+                            "selected_count": len(top_screener_miners),
+                        },
+                    )
                 except Exception as exc:
                     logger.warning(
                         "get_best_miners_screener_calculation_failed",
