@@ -1606,6 +1606,450 @@ async def score_challenges(
     return response
 
 
+def _miners_log(miners_list: list[MinerWeight]) -> list[dict[str, float | int]]:
+    return [{"uid": miner.uid, "weight": float(miner.weight)} for miner in miners_list]
+
+
+def _burn_only_payload() -> GetBestMinersUidResponse:
+    return GetBestMinersUidResponse(miners=[MinerWeight(uid=0, weight=1.0)])
+
+
+def _log_get_best_miners_fallback(
+    request_id: str | None,
+    reason: str,
+    **extra: object,
+) -> None:
+    payload: dict[str, object] = {
+        "request_id": request_id,
+        "reason": reason,
+    }
+    payload.update(extra)
+    logger.info("get_best_miners_fallback", extra=payload)
+
+
+async def _load_top_screener_uids_for_competition(
+    db: AsyncSession,
+    *,
+    request_id: str | None,
+    competition_id: int,
+    source: str,
+    top_screener_scripts: float,
+    hotkey_to_uid: dict[str, int],
+) -> list[int]:
+    if top_screener_scripts <= 0:
+        return []
+
+    eligible_row = (
+        await db.execute(
+            select(V_MINER_SCREENER_ELIGIBLE_RANKED.c.total_eligible)
+            .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
+            .limit(1)
+        )
+    ).first()
+    total_eligible = (
+        int(eligible_row.total_eligible)
+        if eligible_row and eligible_row.total_eligible
+        else 0
+    )
+    top_limit = (
+        int(math.ceil(total_eligible * top_screener_scripts))
+        if total_eligible > 0
+        else 0
+    )
+    if top_limit <= 0:
+        logger.info(
+            "get_best_miners_screener_selected_for_competition",
+            extra={
+                "request_id": request_id,
+                "competition_id": competition_id,
+                "source": source,
+                "total_eligible": total_eligible,
+                "top_limit": top_limit,
+                "selected_count": 0,
+            },
+        )
+        return []
+
+    selected_uids: list[int] = []
+    qualified_miners_result = await db.execute(
+        select(Miner.ss58)
+        .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
+        .join(
+            Miner,
+            Miner.id == V_MINER_SCREENER_ELIGIBLE_RANKED.c.miner_id,
+        )
+        .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
+        .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank <= top_limit)
+        .where(Miner.miner_banned_status.is_(False))
+        .order_by(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank.asc())
+    )
+    for row in qualified_miners_result:
+        uid = hotkey_to_uid.get(str(row.ss58))
+        if uid is not None:
+            selected_uids.append(uid)
+
+    logger.info(
+        "get_best_miners_screener_selected_for_competition",
+        extra={
+            "request_id": request_id,
+            "competition_id": competition_id,
+            "source": source,
+            "total_eligible": total_eligible,
+            "top_limit": top_limit,
+            "selected_count": len(selected_uids),
+            "selected_uids": selected_uids,
+        },
+    )
+    return selected_uids
+
+
+async def _load_competition_upload_starts_at(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> datetime | None:
+    row = (
+        await db.execute(
+            select(CompetitionTimeframe.upload_starts_at)
+            .select_from(CompetitionConfig)
+            .join(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+            )
+            .where(CompetitionConfig.competition_fk == competition_id)
+            .limit(1)
+        )
+    ).first()
+    upload_starts_at = row.upload_starts_at if row is not None else None
+    if upload_starts_at is not None and upload_starts_at.tzinfo is None:
+        upload_starts_at = upload_starts_at.replace(tzinfo=timezone.utc)
+    return upload_starts_at
+
+
+async def _load_previous_competition_context(
+    db: AsyncSession,
+    *,
+    active_competition_id: int,
+    current_upload_starts_at: datetime,
+) -> tuple[int | None, datetime | None]:
+    row = (
+        await db.execute(
+            select(
+                CompetitionConfig.competition_fk.label("competition_id"),
+                CompetitionTimeframe.upload_starts_at.label("upload_starts_at"),
+            )
+            .select_from(CompetitionConfig)
+            .join(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+            )
+            .where(CompetitionConfig.competition_fk != active_competition_id)
+            .where(CompetitionTimeframe.upload_starts_at < current_upload_starts_at)
+            .order_by(CompetitionTimeframe.upload_starts_at.desc())
+            .limit(1)
+        )
+    ).first()
+    if row is None or row.competition_id is None:
+        return None, None
+    upload_starts_at = row.upload_starts_at
+    if upload_starts_at is not None and upload_starts_at.tzinfo is None:
+        upload_starts_at = upload_starts_at.replace(tzinfo=timezone.utc)
+    return int(row.competition_id), upload_starts_at
+
+
+async def _collect_top_screener_uids(
+    db: AsyncSession,
+    *,
+    request_id: str | None,
+    now: datetime,
+    active_competition_id: int,
+    hotkey_to_uid: dict[str, int],
+) -> tuple[list[int], list[int], list[int]]:
+    top_screener_scripts = float(getattr(settings, "top_screener_scripts", 0.2))
+    previous_competition_grace_hours = max(
+        0.0,
+        float(
+            getattr(
+                settings,
+                "previous_competition_screeners_grace_hours",
+                4.0,
+            )
+        ),
+    )
+    logger.info(
+        "get_best_miners_screener_context",
+        extra={
+            "request_id": request_id,
+            "active_competition_id": active_competition_id,
+            "top_screener_scripts": top_screener_scripts,
+            "previous_competition_grace_hours": previous_competition_grace_hours,
+        },
+    )
+
+    current_top_screener_miners = await _load_top_screener_uids_for_competition(
+        db,
+        request_id=request_id,
+        competition_id=active_competition_id,
+        source="current_competition",
+        top_screener_scripts=top_screener_scripts,
+        hotkey_to_uid=hotkey_to_uid,
+    )
+    previous_top_screener_miners: list[int] = []
+
+    current_upload_starts_at = await _load_competition_upload_starts_at(
+        db,
+        competition_id=active_competition_id,
+    )
+    within_previous_competition_grace = False
+    grace_deadline = None
+    if current_upload_starts_at is not None and previous_competition_grace_hours > 0:
+        grace_deadline = current_upload_starts_at + timedelta(
+            hours=previous_competition_grace_hours
+        )
+        within_previous_competition_grace = now <= grace_deadline
+    logger.info(
+        "get_best_miners_previous_competition_grace_context",
+        extra={
+            "request_id": request_id,
+            "active_competition_id": active_competition_id,
+            "current_upload_starts_at": (
+                current_upload_starts_at.isoformat()
+                if current_upload_starts_at is not None
+                else None
+            ),
+            "grace_deadline": (
+                grace_deadline.isoformat() if grace_deadline is not None else None
+            ),
+            "within_previous_competition_grace": within_previous_competition_grace,
+            "previous_competition_grace_hours": previous_competition_grace_hours,
+        },
+    )
+
+    if within_previous_competition_grace and current_upload_starts_at is not None:
+        previous_competition_id, previous_upload_starts_at = (
+            await _load_previous_competition_context(
+                db,
+                active_competition_id=active_competition_id,
+                current_upload_starts_at=current_upload_starts_at,
+            )
+        )
+        if previous_competition_id is not None:
+            previous_top_screener_miners = (
+                await _load_top_screener_uids_for_competition(
+                    db,
+                    request_id=request_id,
+                    competition_id=previous_competition_id,
+                    source="previous_competition",
+                    top_screener_scripts=top_screener_scripts,
+                    hotkey_to_uid=hotkey_to_uid,
+                )
+            )
+            logger.info(
+                "get_best_miners_previous_competition_selected",
+                extra={
+                    "request_id": request_id,
+                    "active_competition_id": active_competition_id,
+                    "previous_competition_id": previous_competition_id,
+                    "previous_upload_starts_at": (
+                        previous_upload_starts_at.isoformat()
+                        if previous_upload_starts_at is not None
+                        else None
+                    ),
+                    "selected_count": len(previous_top_screener_miners),
+                },
+            )
+        else:
+            logger.info(
+                "get_best_miners_previous_competition_not_found",
+                extra={
+                    "request_id": request_id,
+                    "active_competition_id": active_competition_id,
+                },
+            )
+
+    combined_screener_uids = current_top_screener_miners + previous_top_screener_miners
+    if combined_screener_uids:
+        combined_screener_uids = list(dict.fromkeys(combined_screener_uids))
+
+    logger.info(
+        "get_best_miners_screener_selected",
+        extra={
+            "request_id": request_id,
+            "active_competition_id": active_competition_id,
+            "current_top_screener_miners": current_top_screener_miners,
+            "previous_top_screener_miners": previous_top_screener_miners,
+            "top_screener_miners": combined_screener_uids,
+            "selected_count": len(combined_screener_uids),
+        },
+    )
+    return (
+        combined_screener_uids,
+        current_top_screener_miners,
+        previous_top_screener_miners,
+    )
+
+
+def _build_screener_weights_by_uid(
+    *,
+    request_id: str | None,
+    top_screener_miners: list[int],
+) -> tuple[dict[int, float], float, float]:
+    per_miner_setting = max(0.0, float(getattr(settings, "screener_weight_per_miner", 0.0)))
+    screener_miners_count = len(top_screener_miners)
+    screener_weight_total = per_miner_setting * screener_miners_count
+    screener_weight_per_miner = (
+        screener_weight_total / screener_miners_count
+        if screener_miners_count > 0 and screener_weight_total > 0.0
+        else 0.0
+    )
+    logger.info(
+        "get_best_miners_screener_weight",
+        extra={
+            "request_id": request_id,
+            "screener_weight_total": screener_weight_total,
+            "screener_weight_per_miner": screener_weight_per_miner,
+            "screener_weight_per_miner_setting": per_miner_setting,
+            "screener_miners_count": screener_miners_count,
+        },
+    )
+    screener_weights_by_uid: dict[int, float] = {}
+    if screener_weight_per_miner > 0.0:
+        for screener_uid in top_screener_miners:
+            screener_weights_by_uid[screener_uid] = (
+                screener_weights_by_uid.get(screener_uid, 0.0)
+                + screener_weight_per_miner
+            )
+    return screener_weights_by_uid, screener_weight_total, screener_weight_per_miner
+
+
+async def _load_top_miner_ss58_weights(
+    db: AsyncSession,
+    *,
+    request_id: str | None,
+    now: datetime,
+) -> dict[str, float]:
+    top_miner_ss58_weights: dict[str, float] = {}
+    try:
+        tm_rows = (
+            await db.execute(
+                select(TopMiner.ss58, TopMiner.weight)
+                .where(TopMiner.starts_at <= now)
+                .where(TopMiner.ends_at >= now)
+            )
+        ).all()
+        for row in tm_rows:
+            ss58 = str(row.ss58).strip()
+            if ss58:
+                top_miner_ss58_weights[ss58] = (
+                    top_miner_ss58_weights.get(ss58, 0.0)
+                    + (float(row.weight) if row.weight else 0.0)
+                )
+    except Exception as exc:
+        logger.warning(
+            "get_best_miners_top_miners_query_failed",
+            extra={"request_id": request_id, "error": str(exc)},
+            exc_info=exc,
+        )
+    return top_miner_ss58_weights
+
+
+async def _build_best_miners_payload(
+    db: AsyncSession,
+    *,
+    request_id: str | None,
+    now: datetime,
+    active_competition_id: int,
+    hotkey_to_uid: dict[str, int],
+) -> GetBestMinersUidResponse:
+    try:
+        top_screener_miners, _, _ = await _collect_top_screener_uids(
+            db,
+            request_id=request_id,
+            now=now,
+            active_competition_id=active_competition_id,
+            hotkey_to_uid=hotkey_to_uid,
+        )
+    except Exception as exc:
+        logger.warning(
+            "get_best_miners_screener_calculation_failed",
+            extra={
+                "request_id": request_id,
+                "error": str(exc),
+            },
+            exc_info=exc,
+        )
+        top_screener_miners = []
+
+    (
+        screener_weights_by_uid,
+        screener_weight_total,
+        screener_weight_per_miner,
+    ) = _build_screener_weights_by_uid(
+        request_id=request_id,
+        top_screener_miners=top_screener_miners,
+    )
+    miners_by_uid = dict(screener_weights_by_uid)
+
+    # Distribute remaining weight by TopMiner.weight, redirecting unknown miners
+    # and unclaimed remainder to burn uid 0.
+    top_miner_ss58_weights = await _load_top_miner_ss58_weights(
+        db,
+        request_id=request_id,
+        now=now,
+    )
+
+    top_miner_weight_total = sum(w for w in top_miner_ss58_weights.values() if w > 0.0)
+    combined_weight = screener_weight_total + top_miner_weight_total
+    if combined_weight > 1.0 + 1e-6:
+        logger.warning(
+            "get_best_miners_combined_weight_exceeds_1",
+            extra={
+                "request_id": request_id,
+                "screener_weight_total": screener_weight_total,
+                "top_miner_weight_total": top_miner_weight_total,
+                "combined_weight": combined_weight,
+            },
+        )
+        return _burn_only_payload()
+
+    screener_used = sum(screener_weights_by_uid.values())
+    top_miners_assigned = 0.0
+    for ss58, weight in top_miner_ss58_weights.items():
+        if weight <= 0.0:
+            continue
+        uid = hotkey_to_uid.get(ss58)
+        if uid is None:
+            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + weight
+        else:
+            miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + weight
+        top_miners_assigned += weight
+    burn = max(0.0, 1.0 - screener_used - top_miners_assigned)
+    if burn > 0.0:
+        miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn
+
+    miners = [MinerWeight(uid=uid, weight=weight) for uid, weight in miners_by_uid.items()]
+    if not miners:
+        miners = [MinerWeight(uid=0, weight=1.0)]
+
+    logger.info(
+        "get_best_miners_weights",
+        extra={
+            "request_id": request_id,
+            "top_miners": [
+                {"ss58": ss58, "weight": weight}
+                for ss58, weight in top_miner_ss58_weights.items()
+            ],
+            "top_screener_miners": top_screener_miners,
+            "screener_weight_total": screener_weight_total,
+            "screener_weight_per_miner": screener_weight_per_miner,
+            "top_miners_assigned": top_miners_assigned,
+            "burn": burn,
+            "miners": _miners_log(miners),
+        },
+    )
+    return GetBestMinersUidResponse(miners=miners)
+
+
 @router.post(
     "/validator/get_best_miners",
     response_model=SignedEnvelope[GetBestMinersUidResponse],
@@ -1630,58 +2074,40 @@ async def get_best_miners(
         },
     )
 
-    def _miners_log(miners_list: list[MinerWeight]) -> list[dict[str, float | int]]:
-        return [
-            {"uid": miner.uid, "weight": float(miner.weight)} for miner in miners_list
-        ]
-
-    # Get metagraph from app state
     metagraph_service = getattr(request.app.state, "metagraph_service", None)
-    snapshot = None
-    if metagraph_service:
-        snapshot = getattr(metagraph_service, "latest_snapshot", None)
-
-    # If metagraph snapshot is missing or invalid, burn to uid 0
+    snapshot = (
+        getattr(metagraph_service, "latest_snapshot", None)
+        if metagraph_service is not None
+        else None
+    )
     if not snapshot or not isinstance(snapshot, dict):
-        logger.info(
-            "get_best_miners_fallback",
-            extra={
-                "request_id": request_id,
-                "reason": "missing_or_invalid_metagraph_snapshot",
-            },
+        _log_get_best_miners_fallback(
+            request_id,
+            "missing_or_invalid_metagraph_snapshot",
         )
-        miners = [MinerWeight(uid=0, weight=1.0)]
-        response_payload = GetBestMinersUidResponse(miners=miners)
+        response_payload = _burn_only_payload()
     else:
         hotkeys = snapshot.get("hotkeys", [])
         uids = snapshot.get("uids", [])
         if not hotkeys or not uids or len(hotkeys) != len(uids):
-            logger.info(
-                "get_best_miners_fallback",
-                extra={
-                    "request_id": request_id,
-                    "reason": "metagraph_hotkeys_uids_invalid",
-                    "hotkeys_count": len(hotkeys),
-                    "uids_count": len(uids),
-                },
+            _log_get_best_miners_fallback(
+                request_id,
+                "metagraph_hotkeys_uids_invalid",
+                hotkeys_count=len(hotkeys),
+                uids_count=len(uids),
             )
-            miners = [MinerWeight(uid=0, weight=1.0)]
-            response_payload = GetBestMinersUidResponse(miners=miners)
+            response_payload = _burn_only_payload()
         else:
-            # Build hotkey to uid mapping
             hotkey_to_uid = {str(hk): int(uid) for hk, uid in zip(hotkeys, uids)}
             current_competition_id = await _get_active_competition_id(db)
             if current_competition_id is None:
-                logger.info(
-                    "get_best_miners_fallback",
-                    extra={
-                        "request_id": request_id,
-                        "reason": "no_active_competition_timeframe",
-                    },
+                _log_get_best_miners_fallback(
+                    request_id,
+                    "no_active_competition_timeframe",
                 )
-                miners = [MinerWeight(uid=0, weight=1.0)]
-                response_payload = GetBestMinersUidResponse(miners=miners)
+                response_payload = _burn_only_payload()
             else:
+<<<<<<< HEAD
                 # Get top screener miners from current competition and, for a short
                 # grace window after a new competition starts, from the previous
                 # competition as well.
@@ -1968,120 +2394,15 @@ async def get_best_miners(
 
                 per_miner_setting = float(
                     getattr(settings, "screener_weight_per_miner", 0.0)
+=======
+                response_payload = await _build_best_miners_payload(
+                    db,
+                    request_id=request_id,
+                    now=now,
+                    active_competition_id=int(current_competition_id),
+                    hotkey_to_uid=hotkey_to_uid,
+>>>>>>> 6851b5e (refactor(api): split get_best_miners into focused helper functions)
                 )
-                per_miner_setting = max(0.0, per_miner_setting)
-                screener_miners_count = len(top_screener_miners)
-                screener_weight_total = per_miner_setting * screener_miners_count
-                screener_weight_per_miner = (
-                    screener_weight_total / screener_miners_count
-                    if screener_miners_count > 0 and screener_weight_total > 0.0
-                    else 0.0
-                )
-                logger.info(
-                    "get_best_miners_screener_weight",
-                    extra={
-                        "request_id": request_id,
-                        "screener_weight_total": screener_weight_total,
-                        "screener_weight_per_miner": screener_weight_per_miner,
-                        "screener_weight_per_miner_setting": per_miner_setting,
-                        "screener_miners_count": screener_miners_count,
-                    },
-                )
-                screener_weights_by_uid: dict[int, float] = {}
-                if screener_weight_per_miner > 0.0:
-                    for screener_uid in top_screener_miners:
-                        screener_weights_by_uid[screener_uid] = (
-                            screener_weights_by_uid.get(screener_uid, 0.0)
-                            + screener_weight_per_miner
-                        )
-
-                miners_by_uid = dict(screener_weights_by_uid)
-
-                # Distribute remaining weight proportionally by top_miner.weight.
-                # Miners not in the metagraph snapshot and any leftover go to uid 0.
-                top_miner_ss58_weights: dict[str, float] = {}
-                try:
-                    tm_rows = (
-                        await db.execute(
-                            select(TopMiner.ss58, TopMiner.weight)
-                            .where(TopMiner.starts_at <= now)
-                            .where(TopMiner.ends_at >= now)
-                        )
-                    ).all()
-                    for row in tm_rows:
-                        ss58 = str(row.ss58).strip()
-                        if ss58:
-                            top_miner_ss58_weights[ss58] = (
-                                top_miner_ss58_weights.get(ss58, 0.0)
-                                + (float(row.weight) if row.weight else 0.0)
-                            )
-                except Exception as exc:
-                    logger.warning(
-                        "get_best_miners_top_miners_query_failed",
-                        extra={"request_id": request_id, "error": str(exc)},
-                        exc_info=exc,
-                    )
-
-                # Assign each top miner their absolute weight directly.
-                # Miners not in the metagraph snapshot get their share redirected to uid 0.
-                # Whatever is not claimed by screeners or top miners goes to uid 0 (burn).
-                top_miner_weight_total = sum(
-                    w for w in top_miner_ss58_weights.values() if w > 0.0
-                )
-                combined_weight = screener_weight_total + top_miner_weight_total
-                if combined_weight > 1.0 + 1e-6:
-                    logger.warning(
-                        "get_best_miners_combined_weight_exceeds_1",
-                        extra={
-                            "request_id": request_id,
-                            "screener_weight_total": screener_weight_total,
-                            "top_miner_weight_total": top_miner_weight_total,
-                            "combined_weight": combined_weight,
-                        },
-                    )
-                    miners = [MinerWeight(uid=0, weight=1.0)]
-                    response_payload = GetBestMinersUidResponse(miners=miners)
-                else:
-                    screener_used = sum(screener_weights_by_uid.values())
-                    top_miners_assigned = 0.0
-                    for ss58, w in top_miner_ss58_weights.items():
-                        if w <= 0.0:
-                            continue
-                        uid = hotkey_to_uid.get(ss58)
-                        if uid is None:
-                            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + w
-                        else:
-                            miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + w
-                        top_miners_assigned += w
-                    burn = max(0.0, 1.0 - screener_used - top_miners_assigned)
-                    if burn > 0.0:
-                        miners_by_uid[0] = miners_by_uid.get(0, 0.0) + burn
-
-                    miners = [
-                        MinerWeight(uid=uid, weight=weight)
-                        for uid, weight in miners_by_uid.items()
-                    ]
-                    if not miners:
-                        miners = [MinerWeight(uid=0, weight=1.0)]
-
-                    logger.info(
-                        "get_best_miners_weights",
-                        extra={
-                            "request_id": request_id,
-                            "top_miners": [
-                                {"ss58": ss58, "weight": w}
-                                for ss58, w in top_miner_ss58_weights.items()
-                            ],
-                            "top_screener_miners": top_screener_miners,
-                            "screener_weight_total": screener_weight_total,
-                            "screener_weight_per_miner": screener_weight_per_miner,
-                            "top_miners_assigned": top_miners_assigned,
-                            "burn": burn,
-                            "miners": _miners_log(miners),
-                        },
-                    )
-
-                    response_payload = GetBestMinersUidResponse(miners=miners)
 
     response_nonce = generate_nonce()
     response_sig = sign_payload_model(response_payload, nonce=response_nonce, wallet=settings.wallet)
