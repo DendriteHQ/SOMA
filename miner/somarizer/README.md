@@ -1,6 +1,6 @@
-# SOMArizer Miner API Guide
+# SOMARIZER Miner API Guide
 
-This guide is synced to the live SOMArizer docs (`https://somarizer.thesoma.ai/docs#/`) and OpenAPI spec (`https://somarizer.thesoma.ai/openapi.json`).
+This guide is synced to the live SOMARIZER docs (`https://somarizer.thesoma.ai/docs#/`) and OpenAPI spec (`https://somarizer.thesoma.ai/openapi.json`).
 
 Base URL: `https://somarizer.thesoma.ai`
 
