@@ -8,7 +8,7 @@ The hotkey can be:
   - a path to a Bittensor keyfile  (e.g. ~/.bittensor/wallets/mywallet/hotkeys/myhotkey)
   - a raw 0x… hex secret seed      (for testing only)
 
-The script signs `payload:{ss58}::nonce:{nonce}`
+The script signs `payload:somarizer:issue_miner_key:{public_key_ss58}::nonce:{nonce}`
 and posts to POST /auth/miner-key. On success it prints the raw API key.
 """
 from __future__ import annotations
@@ -55,7 +55,7 @@ def load_keypair(hotkey_path: str):
 
 def sign_payload(keypair, public_key_ss58: str, nonce: str) -> str:
     """Sign the canonical payload and return a base64-encoded signature."""
-    message = f"payload:{public_key_ss58}::nonce:{nonce}"
+    message = f"payload:somarizer:issue_miner_key:{public_key_ss58}::nonce:{nonce}"
     sig_bytes: bytes = keypair.sign(message.encode("utf-8"))
     return base64.b64encode(sig_bytes).decode()
 
