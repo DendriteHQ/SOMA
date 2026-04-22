@@ -64,7 +64,7 @@ python3 somarizer_test.py \
 `POST /auth/miner-key` expects:
 - `public_key`: your hotkey SS58 address
 - `nonce`: format `YYYYMMDDTHHMMSSffffffZ.hex32`
-- `signature`: base64 signature of `payload:{public_key}::nonce:{nonce}`
+- `signature`: base64 signature of `payload:somarizer:issue_miner_key:{public_key_ss58}::nonce:{nonce}`
 
 Example signing snippet:
 
@@ -74,12 +74,12 @@ import bittensor as bt
 from soma_shared.utils.signer import generate_nonce
 
 wallet = bt.Wallet(name="your_wallet_name", hotkey="your_hotkey_name")
-public_key = wallet.hotkey.ss58_address
+public_key_ss58 = wallet.hotkey.ss58_address
 nonce = generate_nonce()
-message = f"payload:{public_key}::nonce:{nonce}".encode("utf-8")
+message = f"payload:somarizer:issue_miner_key:{public_key_ss58}::nonce:{nonce}".encode("utf-8")
 signature = base64.b64encode(wallet.hotkey.sign(message)).decode("utf-8")
 
-print(public_key)
+print(public_key_ss58)
 print(nonce)
 print(signature)
 ```
