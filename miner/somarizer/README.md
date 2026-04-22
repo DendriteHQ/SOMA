@@ -16,6 +16,7 @@ Base URL: `https://somarizer.thesoma.ai`
 Notes:
 - `/auth/miner-key` issues a fresh key per call and revokes the previous key for the same hotkey.
 - `/summarize` expects `multipart/form-data`.
+- Miner API keys are rate-limited per key: `5` requests per minute and `50` requests per day.
 
 ---
 
