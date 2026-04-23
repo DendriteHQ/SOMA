@@ -73,6 +73,7 @@ from app.api.routes.utils import (
     get_script_s3_key,
 )
 from app.db.views import (
+    V_ACTIVE_COMPETITION,
     V_MINER_SCREENER_ELIGIBLE_RANKED,
 )
 from app.core.logging import get_logger
@@ -1710,13 +1711,8 @@ async def _load_competition_upload_starts_at(
 ) -> datetime | None:
     row = (
         await db.execute(
-            select(CompetitionTimeframe.upload_starts_at)
-            .select_from(CompetitionConfig)
-            .join(
-                CompetitionTimeframe,
-                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
-            )
-            .where(CompetitionConfig.competition_fk == competition_id)
+            select(V_ACTIVE_COMPETITION.c.upload_starts_at)
+            .where(V_ACTIVE_COMPETITION.c.competition_id == competition_id)
             .limit(1)
         )
     ).first()
@@ -1732,6 +1728,8 @@ async def _load_previous_competition_context(
     active_competition_id: int,
     current_upload_starts_at: datetime,
 ) -> tuple[int | None, datetime | None]:
+    # Do not use V_ACTIVE_COMPETITION here: it only includes active configs,
+    # while this lookup intentionally targets the latest previous competition.
     row = (
         await db.execute(
             select(
