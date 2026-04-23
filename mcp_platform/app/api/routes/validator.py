@@ -327,7 +327,10 @@ async def register(
     ),
     db: AsyncSession = Depends(get_db_session),
     _stake_check: None = Depends(
-        verify_validator_stake_dep(min_validator_stake=settings.min_validator_stake)
+        verify_validator_stake_dep(
+            min_total_weight=settings.min_validator_total_weight,
+            min_alpha_weight=settings.min_validator_alpha_weight,
+        )
     ),
 ) -> SignedEnvelope[ValidatorRegisterResponse]:
     payload = _req.payload
@@ -484,7 +487,10 @@ async def request_challenge(
     ),
     db: AsyncSession = Depends(get_db_session),
     _stake_check: None = Depends(
-        verify_validator_stake_dep(min_validator_stake=settings.min_validator_stake)
+        verify_validator_stake_dep(
+            min_total_weight=settings.min_validator_total_weight,
+            min_alpha_weight=settings.min_validator_alpha_weight,
+        )
     ),
 ) -> SignedEnvelope[GetChallengesResponse]:
     request_id = getattr(request.state, "request_id", None)
@@ -1055,7 +1061,10 @@ async def score_challenges(
     ),
     db: AsyncSession = Depends(get_db_session),
     _stake_check: None = Depends(
-        verify_validator_stake_dep(min_validator_stake=settings.min_validator_stake)
+        verify_validator_stake_dep(
+            min_total_weight=settings.min_validator_total_weight,
+            min_alpha_weight=settings.min_validator_alpha_weight,
+        )
     ),
 ) -> SignedEnvelope[PostChallengeScoresResponse]:
     request_id = getattr(request.state, "request_id", None)
