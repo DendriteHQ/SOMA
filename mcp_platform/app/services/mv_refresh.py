@@ -43,20 +43,9 @@ async def stop_mv_refresh_task(app) -> None:
     logger.info("mv_refresh_stopped")
 
 
-# Views refreshed on the fast cadence (e.g. miner status / screener stats
-# that are queried on every page load and change frequently).
-_FAST_MV_NAMES: frozenset[str] = frozenset(
-    {
-        "mv_miner_status",
-        "mv_miner_screener_stats",
-        "mv_miner_competition_stats"
-    }
-)
-
 
 async def _run_refresh_loop() -> None:
-    fast_interval = settings.mv_refresh_fast_interval_secs
-    slow_interval = settings.mv_refresh_interval_secs
+    interval = settings.mv_refresh_interval_secs
 
     # Track last refresh time per view (name → seconds since epoch float).
     import time
@@ -67,7 +56,6 @@ async def _run_refresh_loop() -> None:
         while True:
             now = time.monotonic()
             for mv in MV_DEFINITIONS:
-                interval = fast_interval if mv.name in _FAST_MV_NAMES else slow_interval
                 if now - last_refresh[mv.name] >= interval:
                     try:
                         async for conn in _get_raw_connection():
@@ -104,7 +92,7 @@ async def _run_refresh_loop() -> None:
 
             # Sleep for the smallest interval so we can wake up in time
             # for the next fast view refresh.
-            await asyncio.sleep(min(fast_interval, slow_interval))
+            await asyncio.sleep(interval)
     except asyncio.CancelledError:
         logger.info("mv_refresh_cancelled")
         raise
