@@ -86,7 +86,8 @@ class LLMClient:
         token_length = len(self.api_token) if self.api_token else 0
         logging.info(
             f"LLMClient initialized: token={token_status} (len={token_length}), "
-            f"url={self.url}, model={self.model}, timeout={self.timeout_seconds}s"
+            f"url={self.url}, model={self.model}, timeout={self.timeout_seconds}s, "
+            f"max_tokens={self.max_tokens}, temperature={self.temperature}"
         )
 
     async def ask(self, prompt: str, model_override: str | None = None) -> Any:
