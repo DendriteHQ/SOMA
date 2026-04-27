@@ -92,6 +92,10 @@ class Settings(BaseSettings):
         default=0.00002,
         alias="SCREENER_WEIGHT_PER_MINER",
     )
+    previous_competition_screeners_grace_hours: float = Field(
+        default=4.0,
+        alias="PREVIOUS_COMPETITION_SCREENERS_GRACE_HOURS",
+    )
     # Absolute weight per compression-ratio (partial) winner category.
     # Each layer gets exactly this weight; the overall winner receives whatever
     # remains after burn and partial allocations.
@@ -285,6 +289,21 @@ class Settings(BaseSettings):
             numeric = 0.0
         if numeric > 1:
             numeric = 1.0
+        return numeric
+
+    @field_validator("previous_competition_screeners_grace_hours", mode="before")
+    @classmethod
+    def _parse_previous_competition_screeners_grace_hours(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 4.0
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "PREVIOUS_COMPETITION_SCREENERS_GRACE_HOURS must be a number"
+            ) from exc
+        if numeric < 0:
+            numeric = 0.0
         return numeric
 
     @field_validator("partial_winners_weight_fraction", mode="before")
