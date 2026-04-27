@@ -1697,20 +1697,18 @@ async def get_best_miners(
                     )
 
                     if top_screener_scripts > 0:
-                        eligible_row = (
-                            await db.execute(
-                                select(V_MINER_SCREENER_ELIGIBLE_RANKED.c.total_eligible)
-                                .where(
-                                    V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id
-                                    == active_competition_id
-                                )
-                                .limit(1)
+                        # Avoid selecting window-function column `total_eligible`
+                        # directly; COUNT(*) is equivalent and consistently fast.
+                        total_eligible_raw = await db.scalar(
+                            select(func.count())
+                            .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
+                            .where(
+                                V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id
+                                == active_competition_id
                             )
-                        ).first()
+                        )
                         total_eligible = (
-                            int(eligible_row.total_eligible)
-                            if eligible_row and eligible_row.total_eligible
-                            else 0
+                            int(total_eligible_raw) if total_eligible_raw else 0
                         )
                         top_limit = (
                             int(math.ceil(total_eligible * top_screener_scripts))

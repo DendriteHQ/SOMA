@@ -461,27 +461,27 @@ async def _select_miner_ss58(
                 logger.info("_select_miner_ss58: Top screener fraction is 0")
                 return None, None
             
-            # Get total eligible count from V_MINER_SCREENER_ELIGIBLE_RANKED
-            top_limit_row = (
-                await db.execute(
-                    select(V_MINER_SCREENER_ELIGIBLE_RANKED.c.total_eligible)
-                    .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
-                    .limit(1)
-                )
-            ).first()
+            # Avoid selecting window-function column `total_eligible` directly;
+            # COUNT(*) is equivalent and avoids expensive window evaluation.
+            total_eligible_raw = await db.scalar(
+                select(func.count())
+                .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
+                .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
+            )
+            total_eligible = int(total_eligible_raw) if total_eligible_raw else 0
             
-            if not top_limit_row or not top_limit_row.total_eligible:
+            if total_eligible <= 0:
                 logger.info("_select_miner_ss58: No eligible screeners found")
                 return None, None
             
-            top_limit = int(math.ceil(int(top_limit_row.total_eligible) * top_fraction))
+            top_limit = int(math.ceil(total_eligible * top_fraction))
             if top_limit <= 0:
                 logger.info("_select_miner_ss58: Top limit is 0")
                 return None, None
             
             logger.info(
                 f"_select_miner_ss58: Top screener limit: {top_limit} "
-                f"(fraction={top_fraction}, total_eligible={top_limit_row.total_eligible})"
+                f"(fraction={top_fraction}, total_eligible={total_eligible})"
             )
             
             # Get miner IDs of top screeners
