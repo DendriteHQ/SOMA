@@ -1640,18 +1640,14 @@ async def _load_top_screener_uids_for_competition(
     if top_screener_scripts <= 0:
         return []
 
-    eligible_row = (
-        await db.execute(
-            select(V_MINER_SCREENER_ELIGIBLE_RANKED.c.total_eligible)
-            .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
-            .limit(1)
-        )
-    ).first()
-    total_eligible = (
-        int(eligible_row.total_eligible)
-        if eligible_row and eligible_row.total_eligible
-        else 0
+    total_eligible_raw = await db.scalar(
+        select(func.count())
+        .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
+        .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
     )
+
+
+    total_eligible = int(total_eligible_raw or 0)
     top_limit = (
         int(math.ceil(total_eligible * top_screener_scripts))
         if total_eligible > 0
