@@ -7,11 +7,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, PrivateAttr, field_validator
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(Path(__file__).resolve().parents[2] / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     _wallet: Any = PrivateAttr(default=None)
 
     # App
