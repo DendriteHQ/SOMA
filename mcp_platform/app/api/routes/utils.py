@@ -35,7 +35,7 @@ from app.core.logging import get_logger
 import math
 
 logger = get_logger(__name__)
-TOKENIZER_CHEATING_CHARS_PER_TOKEN_THRESHOLD = 1.3
+TOKENIZER_CHEATING_CHARS_PER_TOKEN_THRESHOLD = 1.8
 
 
 @lru_cache(maxsize=1)

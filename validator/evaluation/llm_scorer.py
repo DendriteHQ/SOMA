@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from typing import Any
 import tiktoken
 import uuid
-from validator.evaluation.prompts import ANSWERS_GENERATION_PROMPT
+from validator.evaluation.prompts import ANSWERS_GENERATION_PROMPT, ANSWER_SCORING_PROMPT
 
 
 class ScoringResult(BaseModel):
@@ -41,6 +41,7 @@ class LLMInsufficientFundsError(RuntimeError):
 
 ANSWER_FORMAT_TOKEN_RE = re.compile(r"[^\W\d_]+|\d+", re.UNICODE)
 VALID_JSON_ESCAPE_CHARS = {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}
+LLM_SCORING_ALLOWED_SCORES = {0.0, 0.5, 0.75, 1.0}
 
 
 def is_insufficient_funds_error(status_code: int, error_body: str | None) -> bool:
@@ -85,16 +86,17 @@ class LLMClient:
         token_length = len(self.api_token) if self.api_token else 0
         logging.info(
             f"LLMClient initialized: token={token_status} (len={token_length}), "
-            f"url={self.url}, model={self.model}, timeout={self.timeout_seconds}s"
+            f"url={self.url}, model={self.model}, timeout={self.timeout_seconds}s, "
+            f"max_tokens={self.max_tokens}, temperature={self.temperature}"
         )
 
-    async def ask(self, prompt: str) -> Any:
+    async def ask(self, prompt: str, model_override: str | None = None) -> Any:
         if not self.api_token:
             raise RuntimeError("OPENROUTER_API_TOKEN is not set")
         if not self.url:
             raise RuntimeError("OPENROUTER_API_URL is not set")
         body = {
-            "model": self.model,
+            "model": model_override or self.model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "max_tokens": self.max_tokens,
@@ -308,6 +310,27 @@ class Scoring:
             questions=question_lines,
         )
 
+    def build_scoring_prompt(
+        self,
+        questions: list[str],
+        expected_answers: list[str],
+        candidate_answers: list[str],
+    ) -> str:
+        items = [
+            {
+                "id": f"Q{i + 1}",
+                "question": question,
+                "reference_answer": expected_answer,
+                "candidate_answer": candidate_answer,
+            }
+            for i, (question, expected_answer, candidate_answer) in enumerate(
+                zip(questions, expected_answers, candidate_answers)
+            )
+        ]
+        return ANSWER_SCORING_PROMPT.format(
+            items=json.dumps(items, ensure_ascii=False, indent=2)
+        )
+
     async def score_async(
         self,
         text: str,
@@ -327,20 +350,40 @@ class Scoring:
             logging.error("LLM returned invalid output format after retries: %s", exc)
             model_answers = [""] * len(expected_answers)
 
+        try:
+            scoring_results = await self._request_with_retry(
+                lambda: self._ask_and_extract_scores(
+                    questions=questions,
+                    expected_answers=expected_answers,
+                    candidate_answers=model_answers,
+                    expected_len=len(expected_answers),
+                )
+            )
+        except LLMOutputFormatError as exc:
+            logging.error(
+                "LLM returned invalid scoring format after retries: %s", exc
+            )
+            scoring_results = [
+                {
+                    "score": 0.0,
+                    "verdict": "NO_ANSWER" if answer == "" else "INCORRECT",
+                    "reasoning": "LLM scoring response was invalid.",
+                }
+                for answer in model_answers
+            ]
+
         details: list[dict[str, Any]] = []
         scores: list[float] = []
-        for idx, (expected, actual) in enumerate(zip(expected_answers, model_answers)):
-            exact_raw = (
-                1.0
-                if self._normalize_text(expected) == self._normalize_text(actual)
-                else 0.0
+        for idx, item in enumerate(scoring_results):
+            score = self._round_score(float(item.get("score", 0.0)))
+            verdict = str(item.get("verdict", "")).strip().upper()
+            reasoning = str(item.get("reasoning", "")).strip()
+            details.append(
+                {
+                    "verdict": verdict,
+                    "reasoning": reasoning,
+                }
             )
-            f1_raw = self._token_f1(expected, actual)
-            score_raw = self._exact_weight * exact_raw + self._f1_weight * f1_raw
-            exact = self._round_score(exact_raw)
-            f1 = self._round_score(f1_raw)
-            score = self._round_score(score_raw)
-            details.append({"reason": "No answer provided"} if model_answers[idx] == "" else {"reason": "Answered"})
             scores.append(score)
 
         overall = self._round_score(sum(scores) / len(scores) if scores else 0.0)
@@ -376,6 +419,22 @@ class Scoring:
             repaired_raw = await self._llm.ask(repair_prompt)
             model_answers = self._extract_answers(repaired_raw)
         return self._normalize_len(model_answers, expected_len)
+
+    async def _ask_and_extract_scores(
+        self,
+        questions: list[str],
+        expected_answers: list[str],
+        candidate_answers: list[str],
+        expected_len: int,
+    ) -> list[dict[str, Any]]:
+        prompt = self.build_scoring_prompt(
+            questions=questions,
+            expected_answers=expected_answers,
+            candidate_answers=candidate_answers,
+        )
+        raw = await self._llm.ask(prompt)
+        scoring_results = self._extract_scores(raw)
+        return self._normalize_scoring_len(scoring_results, expected_len, candidate_answers)
 
     def _round_score(self, value: float) -> float:
         return round(value, 2)
@@ -447,6 +506,96 @@ class Scoring:
         if isinstance(payload, dict) and isinstance(payload.get("results"), list):
             return payload["results"]
         return None
+
+    def _extract_scores(self, raw: Any) -> list[dict[str, Any]]:
+        if isinstance(raw, dict):
+            if "results" in raw and isinstance(raw["results"], list):
+                return self._extract_scores_from_results(raw["results"])
+            for key in ("text", "response", "answer", "content"):
+                if key in raw and isinstance(raw[key], str):
+                    return self._parse_text_scores(raw[key])
+        if isinstance(raw, str):
+            return self._parse_text_scores(raw)
+        raise LLMOutputFormatError("Unsupported LLM scoring output type")
+
+    def _parse_text_scores(self, text: str) -> list[dict[str, Any]]:
+        text = text.strip()
+        if not text:
+            raise LLMOutputFormatError("Empty LLM scoring response")
+        text = self._strip_code_fences(text)
+        try:
+            parsed = json.loads(text)
+            results = self._extract_results_list(parsed)
+            if results is not None:
+                return self._extract_scores_from_results(results)
+        except json.JSONDecodeError as exc:
+            results = self._recover_results_list(text)
+            if results is not None:
+                logging.warning(
+                    "Recovered scoring results array from malformed LLM JSON response: snippet=%r",
+                    self._log_snippet(text),
+                )
+                return self._extract_scores_from_results(results)
+            logging.error(
+                "Failed to parse and recover LLM scoring JSON response: snippet=%r",
+                self._log_snippet(text),
+            )
+            raise LLMOutputFormatError(
+                "LLM scoring response is not valid JSON"
+            ) from exc
+
+        results = self._recover_results_list(text)
+        if results is not None:
+            return self._extract_scores_from_results(results)
+        raise LLMOutputFormatError(
+            "LLM scoring response does not contain a results array"
+        )
+
+    def _extract_scores_from_results(self, results: list[Any]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in results:
+            if not isinstance(item, dict):
+                raise LLMOutputFormatError("Scoring result item must be an object")
+
+            raw_score = item.get("score")
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError) as exc:
+                raise LLMOutputFormatError("Scoring result must contain a numeric score") from exc
+
+            if score not in LLM_SCORING_ALLOWED_SCORES:
+                raise LLMOutputFormatError(
+                    f"Scoring result contains unsupported score: {score}"
+                )
+
+            verdict = str(item.get("verdict", "")).strip().upper()
+            reasoning = str(item.get("reasoning", "")).strip()
+
+            if not verdict:
+                verdict = self._default_verdict_for_score(score)
+
+            if score == 0.0 and verdict not in {"NO_ANSWER", "INCORRECT"}:
+                raise LLMOutputFormatError(
+                    f"Scoring result has invalid verdict for zero score: {verdict}"
+                )
+            if score in {0.5, 0.75} and verdict != "PARTIAL":
+                raise LLMOutputFormatError(
+                    f"Scoring result has invalid verdict for partial score: {verdict}"
+                )
+            if score == 1.0 and verdict != "CORRECT":
+                raise LLMOutputFormatError(
+                    f"Scoring result has invalid verdict for perfect score: {verdict}"
+                )
+
+            normalized.append(
+                {
+                    "score": score,
+                    "verdict": verdict,
+                    "reasoning": reasoning,
+                }
+            )
+
+        return normalized
 
     def _recover_results_list(self, text: str) -> list[Any] | None:
         match = re.search(r'"results"\s*:\s*\[', text)
@@ -620,6 +769,33 @@ class Scoring:
             else:
                 answers.append("")
         return answers
+
+    def _normalize_scoring_len(
+        self,
+        results: list[dict[str, Any]],
+        target_len: int,
+        candidate_answers: list[str],
+    ) -> list[dict[str, Any]]:
+        if len(results) < target_len:
+            for idx in range(len(results), target_len):
+                answer = candidate_answers[idx] if idx < len(candidate_answers) else ""
+                results.append(
+                    {
+                        "score": 0.0,
+                        "verdict": "NO_ANSWER" if answer == "" else "INCORRECT",
+                        "reasoning": "Missing scoring result.",
+                    }
+                )
+        if len(results) > target_len:
+            results = results[:target_len]
+        return results
+
+    def _default_verdict_for_score(self, score: float) -> str:
+        if score == 1.0:
+            return "CORRECT"
+        if score in {0.5, 0.75}:
+            return "PARTIAL"
+        return "INCORRECT"
 
     def _normalize_len(self, answers: list[str], target_len: int) -> list[str]:
         if len(answers) < target_len:
