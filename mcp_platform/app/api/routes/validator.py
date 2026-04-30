@@ -8,8 +8,6 @@ import uuid
 import bittensor as bt
 
 from fastapi import APIRouter, HTTPException, status, Depends, Request
-from sqlalchemy import delete, func, select, update, literal, or_, case
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 import traceback
@@ -36,14 +34,8 @@ from soma_shared.db.models.batch_compressed_text import BatchCompressedText
 from soma_shared.db.models.batch_question_answer import BatchQuestionAnswer
 from soma_shared.db.models.batch_question_score import BatchQuestionScore
 from soma_shared.db.models.challenge import Challenge
-from soma_shared.db.models.challenge_batch import ChallengeBatch
-from soma_shared.db.models.competition_config import CompetitionConfig
-from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
-from soma_shared.db.models.miner import Miner
-from soma_shared.db.models.question import Question
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
-from soma_shared.db.models.top_miner import TopMiner
 from soma_shared.db.session import get_db_session
 from soma_shared.db.validator_log import log_validator_message
 from app.services.challenge_factory import (
@@ -72,9 +64,40 @@ from app.api.routes.utils import (
     _is_compressed_enough,
     get_script_s3_key,
 )
-from app.db.views import (
-    V_ACTIVE_COMPETITION,
-    V_MINER_SCREENER_ELIGIBLE_RANKED,
+from app.db.interfaces import fetch_top_screener_ss58_for_competition
+from app.db.interfaces.batch_assignment_queries import (
+    delete_batch_compressed_text_for_batch_challenge_ids,
+    delete_challenge_batch,
+    delete_open_batch_assignment,
+    get_any_open_batch_assignment_id,
+    get_batch_challenge_ids_for_batch,
+    get_batch_challenges_for_batch,
+    get_challenge_batch_by_id,
+    get_challenges_by_ids,
+    get_existing_unassigned_challenge_batch_for_miner_script,
+    get_miner_banned_status_for_batch,
+    get_miner_banned_status_for_update,
+    get_open_batch_assignment_for_validator,
+    mark_batch_assignment_done,
+)
+from app.db.interfaces.burn_weight_queries import (
+    get_active_top_miner_rows,
+)
+from app.db.interfaces.competition_queries import (
+    get_active_competition_upload_starts_at,
+    get_previous_competition_context_row,
+)
+from app.db.interfaces.scoring_queries import (
+    get_pre_scored_batch_challenge_ids_for_validator,
+    get_questions_by_challenge_ids,
+    get_questions_by_ids,
+    upsert_batch_challenge_scores,
+    upsert_batch_question_answers,
+    upsert_batch_question_scores,
+)
+from app.db.interfaces.validator_identity_queries import (
+    deactivate_validator_registrations,
+    get_validator_by_ss58_any,
 )
 from app.core.logging import get_logger
 
@@ -215,15 +238,10 @@ async def _upsert_batch_scoring_rows(
             ],
             ("batch_challenge_fk", "question_fk"),
         )
-        answer_stmt = pg_insert(BatchQuestionAnswer).values(answer_values)
-        answer_stmt = answer_stmt.on_conflict_do_update(
-            constraint="uq_batch_question_answers_batch_challenge_question",
-            set_={
-                "produced_answer": answer_stmt.excluded.produced_answer,
-                "uploaded_at": answer_stmt.excluded.uploaded_at,
-            },
+        await upsert_batch_question_answers(
+            db,
+            answer_values=answer_values,
         )
-        await db.execute(answer_stmt)
 
     if score_rows:
         score_values = _dedupe_row_dicts(
@@ -240,16 +258,10 @@ async def _upsert_batch_scoring_rows(
             ],
             ("batch_challenge_fk", "question_fk", "validator_fk"),
         )
-        score_stmt = pg_insert(BatchQuestionScore).values(score_values)
-        score_stmt = score_stmt.on_conflict_do_update(
-            constraint="uq_batch_question_scores_batch_challenge_question_validator",
-            set_={
-                "score": score_stmt.excluded.score,
-                "details": score_stmt.excluded.details,
-                "uploaded_at": score_stmt.excluded.uploaded_at,
-            },
+        await upsert_batch_question_scores(
+            db,
+            score_values=score_values,
         )
-        await db.execute(score_stmt)
 
     if rollup_rows:
         rollup_values = _dedupe_row_dicts(
@@ -264,12 +276,10 @@ async def _upsert_batch_scoring_rows(
             ],
             ("batch_challenge_fk", "validator_fk"),
         )
-        rollup_stmt = pg_insert(BatchChallengeScore).values(rollup_values)
-        rollup_stmt = rollup_stmt.on_conflict_do_update(
-            constraint="uq_batch_challenge_scores_item_validator",
-            set_={"score": rollup_stmt.excluded.score},
+        await upsert_batch_challenge_scores(
+            db,
+            rollup_values=rollup_values,
         )
-        await db.execute(rollup_stmt)
 
 
 async def _release_batch_assignment_for_retry(
@@ -283,34 +293,23 @@ async def _release_batch_assignment_for_retry(
     Returns:
         tuple: (deleted_assignment_count, deleted_compressed_text_count)
     """
-    batch_challenge_ids = list(
-        (
-            await db.execute(
-                select(BatchChallenge.id).where(
-                    BatchChallenge.challenge_batch_fk == batch_id
-                )
-            )
-        )
-        .scalars()
-        .all()
+    batch_challenge_ids = await get_batch_challenge_ids_for_batch(
+        db,
+        batch_id=batch_id,
     )
 
     deleted_compressed_count = 0
     if batch_challenge_ids:
-        compressed_delete_result = await db.execute(
-            delete(BatchCompressedText).where(
-                BatchCompressedText.batch_challenge_fk.in_(batch_challenge_ids)
-            )
+        deleted_compressed_count = await delete_batch_compressed_text_for_batch_challenge_ids(
+            db,
+            batch_challenge_ids=batch_challenge_ids,
         )
-        deleted_compressed_count = compressed_delete_result.rowcount or 0
 
-    assignment_delete_result = await db.execute(
-        delete(BatchAssignment)
-        .where(BatchAssignment.challenge_batch_fk == batch_id)
-        .where(BatchAssignment.validator_fk == validator_id)
-        .where(BatchAssignment.done_at.is_(None))
+    deleted_assignment_count = await delete_open_batch_assignment(
+        db,
+        batch_id=batch_id,
+        validator_id=validator_id,
     )
-    deleted_assignment_count = assignment_delete_result.rowcount or 0
 
     return deleted_assignment_count, deleted_compressed_count
 
@@ -375,10 +374,10 @@ async def register(
         )
 
     # Create new validator or update existing one
-    result = await db.execute(
-        select(Validator).where(Validator.ss58 == payload.validator_hotkey)
+    validator = await get_validator_by_ss58_any(
+        db,
+        validator_hotkey=payload.validator_hotkey,
     )
-    validator = result.scalars().first()
     if validator is not None and validator.is_archive:
         await _log_error_response(
             request,
@@ -410,10 +409,9 @@ async def register(
         validator.current_status = "working"
         await db.flush()
 
-    await db.execute(
-        update(ValidatorRegistration)
-        .where(ValidatorRegistration.validator_fk == validator.id)
-        .values(is_active=False)
+    await deactivate_validator_registrations(
+        db,
+        validator_id=validator.id,
     )
     registration = ValidatorRegistration(
         validator_fk=validator.id,
@@ -544,10 +542,9 @@ async def request_challenge(
                         detail="No tasks available - all miners are scored or no free challenges exist",
                     )
 
-                miner_is_banned = await db.scalar(
-                    select(Miner.miner_banned_status)
-                    .where(Miner.id == miner.id)
-                    .with_for_update()
+                miner_is_banned = await get_miner_banned_status_for_update(
+                    db,
+                    miner_id=miner.id,
                 )
                 if miner_is_banned:
                     logger.info(
@@ -556,20 +553,11 @@ async def request_challenge(
                     )
                     continue
 
-                existing_batch_result = await db.execute(
-                    select(ChallengeBatch)
-                    .outerjoin(
-                        BatchAssignment,
-                        BatchAssignment.challenge_batch_fk == ChallengeBatch.id,
-                    )
-                    .where(ChallengeBatch.miner_fk == miner.id)
-                    .where(ChallengeBatch.script_fk == script.id)
-                    .where(BatchAssignment.id.is_(None))
-                    .order_by(ChallengeBatch.created_at.asc())
-                    .limit(1)
-                    .with_for_update(of=ChallengeBatch, skip_locked=True)
+                existing_batch = await get_existing_unassigned_challenge_batch_for_miner_script(
+                    db,
+                    miner_id=miner.id,
+                    script_id=script.id,
                 )
-                existing_batch = existing_batch_result.scalars().first()
 
                 if existing_batch is not None:
                     logger.info(
@@ -578,25 +566,26 @@ async def request_challenge(
                         f"script_id={script.id} request_id={request_id}"
                     )
                     challenge_batch = existing_batch
-                    batch_challenges_result = await db.execute(
-                        select(BatchChallenge)
-                        .where(BatchChallenge.challenge_batch_fk == challenge_batch.id)
-                        .order_by(BatchChallenge.id.asc())
+                    batch_challenges = await get_batch_challenges_for_batch(
+                        db,
+                        batch_id=challenge_batch.id,
                     )
-                    batch_challenges = batch_challenges_result.scalars().all()
                     if not batch_challenges:
                         # Retry because concurrent requests can consume the last remaining tasks.
-                        await db.delete(challenge_batch)
-                        await db.flush()
+                        await delete_challenge_batch(
+                            db,
+                            challenge_batch_id=challenge_batch.id,
+                            flush=True,
+                        )
                         continue
                     challenge_ids = {
                         batch_challenge.challenge_fk
                         for batch_challenge in batch_challenges
                     }
-                    challenge_result = await db.execute(
-                        select(Challenge).where(Challenge.id.in_(challenge_ids))
+                    challenge_list = await get_challenges_by_ids(
+                        db,
+                        challenge_ids=list(challenge_ids),
                     )
-                    challenge_list = challenge_result.scalars().all()
                     qa_pairs = await get_qa_pairs_for_challenge(
                         challenge_list, session=db
                     )
@@ -619,8 +608,11 @@ async def request_challenge(
                         )
                         if not batch_challenges:
                             # Retry because concurrent requests can consume the last remaining tasks.
-                            await db.delete(challenge_batch)
-                            await db.flush()
+                            await delete_challenge_batch(
+                                db,
+                                challenge_batch_id=challenge_batch.id,
+                                flush=True,
+                            )
                             continue
                         qa_pairs = await get_qa_pairs_for_challenge(
                             challenge_list, session=db
@@ -628,7 +620,11 @@ async def request_challenge(
                     except Exception as e:
                         # Clean up challenge_batch from database on failure
                         try:
-                            await db.delete(challenge_batch)
+                            await delete_challenge_batch(
+                                db,
+                                challenge_batch_id=challenge_batch.id,
+                                flush=False,
+                            )
                         except Exception:
                             pass
                         raise HTTPException(
@@ -957,10 +953,10 @@ async def request_challenge(
                 rollup_rows=zero_score_rollups,
             )
             # Mark BatchAssignment as done since all challenges auto-scored as 0
-            await db.execute(
-                update(BatchAssignment)
-                .where(BatchAssignment.challenge_batch_fk == batch_id)
-                .values(done_at=datetime.now(timezone.utc))
+            await mark_batch_assignment_done(
+                db,
+                batch_id=batch_id,
+                validator_id=None,
             )
             await db.commit()
             logger.info(
@@ -1076,10 +1072,10 @@ async def score_challenges(
             detail="Invalid batch_id",
         ) from exc
 
-    batch_result = await db.execute(
-        select(ChallengeBatch).where(ChallengeBatch.id == batch_id)
+    batch_entry = await get_challenge_batch_by_id(
+        db,
+        batch_id=batch_id,
     )
-    batch_entry = batch_result.scalars().first()
     if batch_entry is None:
         await _log_error_response(
             request,
@@ -1092,12 +1088,10 @@ async def score_challenges(
             detail="Unknown batch_id",
         )
 
-    challenges_result = await db.execute(
-        select(BatchChallenge)
-        .where(BatchChallenge.challenge_batch_fk == batch_entry.id)
-        .order_by(BatchChallenge.id.asc())
+    batch_challenges = await get_batch_challenges_for_batch(
+        db,
+        batch_id=batch_entry.id,
     )
-    batch_challenges = challenges_result.scalars().all()
     if not batch_challenges:
         await _log_error_response(
             request,
@@ -1118,13 +1112,11 @@ async def score_challenges(
         db,
         ss58=_req.sig.signer_ss58,
     )
-    assignment_result = await db.execute(
-        select(BatchAssignment)
-        .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
-        .where(BatchAssignment.validator_fk == validator.id)
-        .where(BatchAssignment.done_at.is_(None))
+    assignment = await get_open_batch_assignment_for_validator(
+        db,
+        batch_id=batch_entry.id,
+        validator_id=validator.id,
     )
-    assignment = assignment_result.scalars().first()
 
     if payload.submission_type == ScoreSubmissionType.ERROR:
         if payload.question_scores:
@@ -1180,11 +1172,9 @@ async def score_challenges(
             )
 
         if assignment is None:
-            other_open_assignment = await db.scalar(
-                select(BatchAssignment.id)
-                .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
-                .where(BatchAssignment.done_at.is_(None))
-                .limit(1)
+            other_open_assignment = await get_any_open_batch_assignment_id(
+                db,
+                batch_id=batch_entry.id,
             )
             if other_open_assignment is not None:
                 await _log_error_response(
@@ -1234,12 +1224,10 @@ async def score_challenges(
                         },
                     )
                 else:
-                    await db.execute(
-                        update(BatchAssignment)
-                        .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
-                        .where(BatchAssignment.validator_fk == validator.id)
-                        .where(BatchAssignment.done_at.is_(None))
-                        .values(done_at=datetime.now(timezone.utc))
+                    await mark_batch_assignment_done(
+                        db,
+                        batch_id=batch_entry.id,
+                        validator_id=validator.id,
                     )
                     logger.warning(
                         "score_challenges_non_retryable_error_completed",
@@ -1318,15 +1306,11 @@ async def score_challenges(
         )
 
     pre_scored_batch_challenge_ids = set(
-        (
-            await db.execute(
-                select(BatchChallengeScore.batch_challenge_fk)
-                .where(BatchChallengeScore.validator_fk == validator.id)
-                .where(BatchChallengeScore.batch_challenge_fk.in_(all_batch_challenge_ids))
-            )
+        await get_pre_scored_batch_challenge_ids_for_validator(
+            db,
+            validator_id=validator.id,
+            batch_challenge_ids=list(all_batch_challenge_ids),
         )
-        .scalars()
-        .all()
     )
     required_batch_challenge_ids = all_batch_challenge_ids - pre_scored_batch_challenge_ids
 
@@ -1400,10 +1384,11 @@ async def score_challenges(
             detail="Not all unscored challenges were scored for batch",
         )
 
-    questions_result = await db.execute(
-        select(Question).where(Question.id.in_(question_ids))
+    question_rows = await get_questions_by_ids(
+        db,
+        question_ids=list(question_ids),
     )
-    questions = {question.id: question for question in questions_result.scalars()}
+    questions = {question.id: question for question in question_rows}
     missing_questions = question_ids - set(questions.keys())
     if missing_questions:
         await _log_error_response(
@@ -1420,13 +1405,14 @@ async def score_challenges(
     challenge_fks = {
         batch_challenge.challenge_fk for batch_challenge in batch_challenges
     }
-    expected_questions_result = await db.execute(
-        select(Question).where(Question.challenge_fk.in_(challenge_fks))
+    expected_question_rows = await get_questions_by_challenge_ids(
+        db,
+        challenge_ids=list(challenge_fks),
     )
     questions_by_challenge: dict[int, set[int]] = {
         challenge_fk: set() for challenge_fk in challenge_fks
     }
-    for question in expected_questions_result.scalars():
+    for question in expected_question_rows:
         questions_by_challenge[question.challenge_fk].add(question.id)
 
     invalid_batch_challenge_ids: list[int] = []
@@ -1468,20 +1454,15 @@ async def score_challenges(
             detail="Batch is not assigned to this validator",
         )
 
-    miner_is_banned = await db.scalar(
-        select(Miner.miner_banned_status)
-        .select_from(ChallengeBatch)
-        .join(Miner, Miner.id == ChallengeBatch.miner_fk)
-        .where(ChallengeBatch.id == batch_entry.id)
-        .limit(1)
+    miner_is_banned = await get_miner_banned_status_for_batch(
+        db,
+        batch_id=batch_entry.id,
     )
     if miner_is_banned:
-        await db.execute(
-            update(BatchAssignment)
-            .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
-            .where(BatchAssignment.validator_fk == validator.id)
-            .where(BatchAssignment.done_at.is_(None))
-            .values(done_at=datetime.now(timezone.utc))
+        await mark_batch_assignment_done(
+            db,
+            batch_id=batch_entry.id,
+            validator_id=validator.id,
         )
         await db.commit()
         await _log_error_response(
@@ -1551,10 +1532,10 @@ async def score_challenges(
             rollup_rows=rollup_rows,
         )
         validator.current_status = "working"
-        await db.execute(
-            update(BatchAssignment)
-            .where(BatchAssignment.challenge_batch_fk == batch_entry.id)
-            .values(done_at=datetime.now(timezone.utc))
+        await mark_batch_assignment_done(
+            db,
+            batch_id=batch_entry.id,
+            validator_id=None,
         )
         await db.commit()
     except Exception as exc:
@@ -1640,18 +1621,10 @@ async def _load_top_screener_uids_for_competition(
     if top_screener_scripts <= 0:
         return []
 
-    total_eligible_raw = await db.scalar(
-        select(func.count())
-        .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
-        .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
-    )
-
-
-    total_eligible = int(total_eligible_raw or 0)
-    top_limit = (
-        int(math.ceil(total_eligible * top_screener_scripts))
-        if total_eligible > 0
-        else 0
+    top_hotkeys, total_eligible, top_limit = await fetch_top_screener_ss58_for_competition(
+        db,
+        competition_id=competition_id,
+        top_screener_scripts=top_screener_scripts,
     )
     if top_limit <= 0:
         logger.info(
@@ -1668,20 +1641,8 @@ async def _load_top_screener_uids_for_competition(
         return []
 
     selected_uids: list[int] = []
-    qualified_miners_result = await db.execute(
-        select(Miner.ss58)
-        .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
-        .join(
-            Miner,
-            Miner.id == V_MINER_SCREENER_ELIGIBLE_RANKED.c.miner_id,
-        )
-        .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
-        .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank <= top_limit)
-        .where(Miner.miner_banned_status.is_(False))
-        .order_by(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank.asc())
-    )
-    for row in qualified_miners_result:
-        uid = hotkey_to_uid.get(str(row.ss58))
+    for ss58 in top_hotkeys:
+        uid = hotkey_to_uid.get(ss58)
         if uid is not None:
             selected_uids.append(uid)
 
@@ -1705,14 +1666,10 @@ async def _load_competition_upload_starts_at(
     *,
     competition_id: int,
 ) -> datetime | None:
-    row = (
-        await db.execute(
-            select(V_ACTIVE_COMPETITION.c.upload_starts_at)
-            .where(V_ACTIVE_COMPETITION.c.competition_id == competition_id)
-            .limit(1)
-        )
-    ).first()
-    upload_starts_at = row.upload_starts_at if row is not None else None
+    upload_starts_at = await get_active_competition_upload_starts_at(
+        db,
+        competition_id=competition_id,
+    )
     if upload_starts_at is not None and upload_starts_at.tzinfo is None:
         upload_starts_at = upload_starts_at.replace(tzinfo=timezone.utc)
     return upload_starts_at
@@ -1724,25 +1681,11 @@ async def _load_previous_competition_context(
     active_competition_id: int,
     current_upload_starts_at: datetime,
 ) -> tuple[int | None, datetime | None]:
-    # Do not use V_ACTIVE_COMPETITION here: it only includes active configs,
-    # while this lookup intentionally targets the latest previous competition.
-    row = (
-        await db.execute(
-            select(
-                CompetitionConfig.competition_fk.label("competition_id"),
-                CompetitionTimeframe.upload_starts_at.label("upload_starts_at"),
-            )
-            .select_from(CompetitionConfig)
-            .join(
-                CompetitionTimeframe,
-                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
-            )
-            .where(CompetitionConfig.competition_fk != active_competition_id)
-            .where(CompetitionTimeframe.upload_starts_at < current_upload_starts_at)
-            .order_by(CompetitionTimeframe.upload_starts_at.desc())
-            .limit(1)
-        )
-    ).first()
+    row = await get_previous_competition_context_row(
+        db,
+        active_competition_id=active_competition_id,
+        current_upload_starts_at=current_upload_starts_at,
+    )
     if row is None or row.competition_id is None:
         return None, None
     upload_starts_at = row.upload_starts_at
@@ -1924,13 +1867,10 @@ async def _load_top_miner_ss58_weights(
 ) -> dict[str, float]:
     top_miner_ss58_weights: dict[str, float] = {}
     try:
-        tm_rows = (
-            await db.execute(
-                select(TopMiner.ss58, TopMiner.weight)
-                .where(TopMiner.starts_at <= now)
-                .where(TopMiner.ends_at >= now)
-            )
-        ).all()
+        tm_rows = await get_active_top_miner_rows(
+            db,
+            now=now,
+        )
         for row in tm_rows:
             ss58 = str(row.ss58).strip()
             if ss58:

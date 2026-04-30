@@ -5,34 +5,36 @@ from functools import lru_cache
 import tiktoken
 
 from fastapi import HTTPException, status, Request
-from sqlalchemy import func, select, literal, and_, exists, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 import ipaddress
-from soma_shared.db.models.batch_assignment import BatchAssignment
-from soma_shared.db.models.batch_challenge import BatchChallenge
-from soma_shared.db.models.batch_challenge_score import BatchChallengeScore
-from soma_shared.db.models.challenge import Challenge
-from soma_shared.db.models.miner_upload import MinerUpload
-from soma_shared.db.models.challenge_batch import ChallengeBatch
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.script import Script
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.request import Request as RequestModel
-from soma_shared.db.models.competition import Competition
-from soma_shared.db.models.competition_config import CompetitionConfig
-from soma_shared.db.models.competition_challenge import CompetitionChallenge
-from soma_shared.db.models.compression_competition_config import (
-    CompressionCompetitionConfig,
-)
-from soma_shared.db.models.screener import Screener
-from soma_shared.db.models.screening_challenge import ScreeningChallenge
-from soma_shared.db.models.burn_request import BurnRequest
 from soma_shared.db.validator_log import log_validator_message
-from app.db.views import V_ACTIVE_COMPETITION, V_COMPETITION_CHALLENGES, V_MINER_SCREENER_ELIGIBLE_RANKED, V_MINER_STATUS
 from app.core.config import settings
 from app.api.deps import get_script_storage
 from app.core.logging import get_logger
-import math
+from app.db.interfaces import fetch_top_screener_miner_ids_for_competition
+from app.db.interfaces.burn_weight_queries import (
+    get_latest_burn_request_row,
+)
+from app.db.interfaces.competition_queries import (
+    get_active_competition_id_from_view,
+    get_active_competition_phase_row,
+)
+from app.db.interfaces.miner_selection_queries import (
+    count_screener_backlog_miners,
+    get_miner_and_script_for_competition,
+    select_competition_phase_miner_ss58,
+    select_screener_phase_miner_ss58,
+)
+from app.db.interfaces.request_queries import (
+    get_request_model_by_external_request_id,
+)
+from app.db.interfaces.validator_identity_queries import (
+    get_validator_by_ss58_unarchived,
+)
 
 logger = get_logger(__name__)
 TOKENIZER_CHEATING_CHARS_PER_TOKEN_THRESHOLD = 1.8
@@ -294,7 +296,7 @@ async def _log_error_response(
 
 
 async def _get_active_competition_id(db: AsyncSession) -> int | None:
-    return await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
+    return await get_active_competition_id_from_view(db)
 
 
 async def _get_current_burn_state(db: AsyncSession) -> tuple[bool, float]:
@@ -302,9 +304,7 @@ async def _get_current_burn_state(db: AsyncSession) -> tuple[bool, float]:
     default_active_no_row = False if settings.debug else True
     default_active_on_error = False
     try:
-        result = await db.execute(
-            select(BurnRequest).order_by(BurnRequest.created_at.desc()).limit(1)
-        )
+        latest_burn = await get_latest_burn_request_row(db)
     except Exception as exc:
         if db.in_transaction():
             await db.rollback()
@@ -315,7 +315,6 @@ async def _get_current_burn_state(db: AsyncSession) -> tuple[bool, float]:
         )
         return default_active_on_error, default_ratio
 
-    latest_burn = result.scalars().first()
     if latest_burn is None:
         return default_active_no_row, default_ratio
 
@@ -337,97 +336,36 @@ async def _select_miner_ss58(
         (Miner, Script): miner + selected script, or (None, None) if no work available
     """
     logger.info("_select_miner_ss58: Starting miner selection")
-    
-    comp_row = (
-        await db.execute(
-            select(
-                V_ACTIVE_COMPETITION.c.competition_id,
-                V_ACTIVE_COMPETITION.c.eval_starts_at,
-            ).limit(1)
-        )
-    ).first()
-    
+
+    comp_row = await get_active_competition_phase_row(db)
     if not comp_row:
         logger.info("_select_miner_ss58: No active competition found")
         return None, None
-    
-    competition_id = comp_row.competition_id
+
+    competition_id = int(comp_row.competition_id)
     eval_starts_at = comp_row.eval_starts_at
-    
+
     now = datetime.now(timezone.utc)
     if eval_starts_at and eval_starts_at.tzinfo is None:
         eval_starts_at = eval_starts_at.replace(tzinfo=timezone.utc)
     is_eval_phase = eval_starts_at and now >= eval_starts_at
-    
+
     miner_ss58 = None
-
-    # Screener challenge IDs for the active competition — used in both phases.
-    screener_challenge_ids_sq = (
-        select(ScreeningChallenge.challenge_fk)
-        .join(Screener, Screener.id == ScreeningChallenge.screener_fk)
-        .where(Screener.competition_fk == competition_id)
-        .where(Screener.is_active.is_(True))
-    )
-
-    # Correlated EXISTS: miner has screener batch_challenges that are unscored
-    # AND unassigned (covers expired/cleaned-up assignments that the view still
-    # counts as "pending" via screener_assigned - screener_scored).
-    unassigned_screener_work_exists = exists(
-        select(literal(1))
-        .select_from(ChallengeBatch)
-        .join(BatchChallenge, BatchChallenge.challenge_batch_fk == ChallengeBatch.id)
-        .outerjoin(
-            BatchChallengeScore,
-            BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
-        )
-        .outerjoin(
-            BatchAssignment,
-            BatchAssignment.challenge_batch_fk == ChallengeBatch.id,
-        )
-        .where(ChallengeBatch.miner_fk == Miner.id)
-        .where(BatchChallengeScore.id.is_(None))
-        .where(BatchAssignment.id.is_(None))
-        .where(BatchChallenge.challenge_fk.in_(screener_challenge_ids_sq))
-    )
-
-    # A miner has screener work remaining when the view shows a gap OR when the
-    # exists-check finds genuinely unassigned+unscored rows (expired assignments).
-    has_screener_work = or_(
-        (
-            func.coalesce(V_MINER_STATUS.c.scored_screened_challenges, 0)
-            + func.coalesce(V_MINER_STATUS.c.pending_assignments_screener, 0)
-        ) < func.coalesce(V_MINER_STATUS.c.screener_challenges, 0),
-        unassigned_screener_work_exists,
-    )
 
     if not is_eval_phase:
         # UPLOAD PHASE: only screener work
         logger.info("_select_miner_ss58: Upload phase - assigning screener work")
-        result = await db.execute(
-            select(V_MINER_STATUS.c.ss58)
-            .join(Miner, Miner.ss58 == V_MINER_STATUS.c.ss58)
-            .where(V_MINER_STATUS.c.competition_id == competition_id)
-            .where(V_MINER_STATUS.c.is_banned.is_(False))
-            .where(V_MINER_STATUS.c.has_script.is_(True))
-            .where(has_screener_work)
-            .order_by(V_MINER_STATUS.c.last_submit_at.asc())
-            .limit(1)
+        miner_ss58 = await select_screener_phase_miner_ss58(
+            db,
+            competition_id=competition_id,
         )
-        row = result.first()
-        if row:
-            miner_ss58 = row.ss58
     else:
         # EVAL PHASE: first screener backlog, then competition work
 
         # Check if screener backlog exists
-        screener_backlog = await db.scalar(
-            select(func.count())
-            .select_from(V_MINER_STATUS)
-            .join(Miner, Miner.ss58 == V_MINER_STATUS.c.ss58)
-            .where(V_MINER_STATUS.c.competition_id == competition_id)
-            .where(V_MINER_STATUS.c.is_banned.is_(False))
-            .where(V_MINER_STATUS.c.has_script.is_(True))
-            .where(has_screener_work)
+        screener_backlog = await count_screener_backlog_miners(
+            db,
+            competition_id=competition_id,
         )
 
         if screener_backlog and screener_backlog > 0:
@@ -436,19 +374,10 @@ async def _select_miner_ss58(
                 f"_select_miner_ss58: Eval phase - screener backlog exists "
                 f"({screener_backlog} miners), continuing screener work"
             )
-            result = await db.execute(
-                select(V_MINER_STATUS.c.ss58)
-                .join(Miner, Miner.ss58 == V_MINER_STATUS.c.ss58)
-                .where(V_MINER_STATUS.c.competition_id == competition_id)
-                .where(V_MINER_STATUS.c.is_banned.is_(False))
-                .where(V_MINER_STATUS.c.has_script.is_(True))
-                .where(has_screener_work)
-                .order_by(V_MINER_STATUS.c.last_submit_at.asc())
-                .limit(1)
+            miner_ss58 = await select_screener_phase_miner_ss58(
+                db,
+                competition_id=competition_id,
             )
-            row = result.first()
-            if row:
-                miner_ss58 = row.ss58
         else:
             # Screener done - assign competition work to top screeners
             logger.info(
@@ -460,128 +389,59 @@ async def _select_miner_ss58(
             if top_fraction <= 0:
                 logger.info("_select_miner_ss58: Top screener fraction is 0")
                 return None, None
-            
-            # Avoid selecting window-function column `total_eligible` directly;
-            # COUNT(*) is equivalent and avoids expensive window evaluation.
-            total_eligible_raw = await db.scalar(
-                select(func.count())
-                .select_from(V_MINER_SCREENER_ELIGIBLE_RANKED)
-                .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
+
+            top_miner_ids, total_eligible, top_limit = await fetch_top_screener_miner_ids_for_competition(
+                db,
+                competition_id=competition_id,
+                top_screener_scripts=top_fraction,
             )
-            total_eligible = int(total_eligible_raw) if total_eligible_raw else 0
-            
+
             if total_eligible <= 0:
                 logger.info("_select_miner_ss58: No eligible screeners found")
                 return None, None
-            
-            top_limit = int(math.ceil(total_eligible * top_fraction))
             if top_limit <= 0:
                 logger.info("_select_miner_ss58: Top limit is 0")
                 return None, None
-            
+            if not top_miner_ids:
+                logger.info("_select_miner_ss58: No top screener miners found")
+                return None, None
+
             logger.info(
                 f"_select_miner_ss58: Top screener limit: {top_limit} "
                 f"(fraction={top_fraction}, total_eligible={total_eligible})"
             )
-            
-            # Get miner IDs of top screeners
-            top_miner_rows = (
-                await db.execute(
-                    select(V_MINER_SCREENER_ELIGIBLE_RANKED.c.miner_id)
-                    .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.competition_id == competition_id)
-                    .where(V_MINER_SCREENER_ELIGIBLE_RANKED.c.rank <= top_limit)
-                )
-            ).all()
-            
-            if not top_miner_rows:
-                logger.info("_select_miner_ss58: No top screener miners found")
-                return None, None
-            
-            top_miner_ids = [row.miner_id for row in top_miner_rows]
             logger.info(f"_select_miner_ss58: Found {len(top_miner_ids)} top screeners")
 
-            unassigned_competition_work_exists = exists(
-                select(literal(1))
-                .select_from(ChallengeBatch)
-                .join(BatchChallenge, BatchChallenge.challenge_batch_fk == ChallengeBatch.id)
-                .outerjoin(
-                    BatchChallengeScore,
-                    BatchChallengeScore.batch_challenge_fk == BatchChallenge.id,
-                )
-                .outerjoin(
-                    BatchAssignment,
-                    BatchAssignment.challenge_batch_fk == ChallengeBatch.id,
-                )
-                .where(ChallengeBatch.miner_fk == Miner.id)
-                .where(BatchChallengeScore.id.is_(None))
-                .where(BatchAssignment.id.is_(None))
-                .where(
-                    BatchChallenge.challenge_fk.in_(
-                        select(CompetitionChallenge.challenge_fk)
-                        .where(CompetitionChallenge.competition_fk == competition_id)
-                        .where(CompetitionChallenge.is_active.is_(True))
-                    )
-                )
-                .where(~BatchChallenge.challenge_fk.in_(screener_challenge_ids_sq))
-            )
-            has_capacity_for_new_competition_work = (
-                (
-                    func.coalesce(V_MINER_STATUS.c.scored_competition_challenges, 0)
-                    + func.coalesce(V_MINER_STATUS.c.pending_assignments_competition, 0)
-                )
-                < func.coalesce(V_MINER_STATUS.c.competition_challenges, 0)
+            # Find top screener with free competition work
+            miner_ss58 = await select_competition_phase_miner_ss58(
+                db,
+                competition_id=competition_id,
+                top_miner_ids=top_miner_ids,
             )
 
-            # Find top screener with free competition work
-            result = await db.execute(
-                select(V_MINER_STATUS.c.ss58)
-                .join(Miner, Miner.ss58 == V_MINER_STATUS.c.ss58)
-                .where(V_MINER_STATUS.c.competition_id == competition_id)
-                .where(Miner.id.in_(top_miner_ids))
-                .where(V_MINER_STATUS.c.is_banned.is_(False))
-                .where(
-                    or_(
-                        has_capacity_for_new_competition_work,
-                        unassigned_competition_work_exists,
-                    )
-                )
-                .order_by(V_MINER_STATUS.c.last_submit_at.asc())
-                .limit(1)
-            )
-            row = result.first()
-            if row:
-                miner_ss58 = row.ss58
-    
     if not miner_ss58:
         logger.info("_select_miner_ss58: No miners with free work found")
         return None, None
-    
-    miner_script_row = (
-        await db.execute(
-            select(Miner, Script)
-            .join(Script, Script.miner_fk == Miner.id)
-            .join(MinerUpload, MinerUpload.script_fk == Script.id)
-            .where(Miner.ss58 == miner_ss58)
-            .where(MinerUpload.competition_fk == competition_id)
-            .order_by(MinerUpload.created_at.asc())
-            .limit(1)
-        )
-    ).first()
-    
-    if not miner_script_row:
+
+    miner_script_pair = await get_miner_and_script_for_competition(
+        db,
+        miner_ss58=miner_ss58,
+        competition_id=competition_id,
+    )
+    if not miner_script_pair:
         logger.warning(
-            f"_select_miner_ss58: Found miner_ss58={miner_ss58} in V_MINER_STATUS "
+            f"_select_miner_ss58: Found miner_ss58={miner_ss58} in candidate miner selection "
             "but could not retrieve Miner/Script objects"
         )
         return None, None
-    
-    miner, script = miner_script_row.Miner, miner_script_row.Script
-    
+
+    miner, script = miner_script_pair
+
     logger.info(
         f"_select_miner_ss58: Selected miner_ss58={miner.ss58}, "
         f"script_id={script.id}, script_uuid={script.script_uuid}"
     )
-    
+
     return miner, script
 
 
@@ -617,10 +477,10 @@ async def _get_request_row(
 ) -> RequestModel | None:
     if not request_id:
         return None
-    result = await db.execute(
-        select(RequestModel).where(RequestModel.external_request_id == request_id)
+    request_row = await get_request_model_by_external_request_id(
+        db,
+        request_id=request_id,
     )
-    request_row = result.scalars().first()
     if request_row is None:
         request_row = RequestModel(
             external_request_id=request_id,
@@ -642,12 +502,10 @@ async def _get_validator(
     Get existing validator by ss58 address.
     Raises HTTPException if validator is not found or archived.
     """
-    result = await db.execute(
-        select(Validator)
-        .where(Validator.ss58 == ss58)
-        .where(Validator.is_archive.is_(False))
+    validator = await get_validator_by_ss58_unarchived(
+        db,
+        ss58=ss58,
     )
-    validator = result.scalars().first()
     if validator is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
