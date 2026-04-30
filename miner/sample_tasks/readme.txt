@@ -11,6 +11,7 @@ Competition folders
 - Context-Compression-3
 - Context-Compression-4
 - Context-Compression-5
+- Context-Compression-6
 
 Each competition folder contains:
 

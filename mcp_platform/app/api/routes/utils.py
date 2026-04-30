@@ -37,7 +37,7 @@ from app.db.interfaces.validator_identity_queries import (
 )
 
 logger = get_logger(__name__)
-TOKENIZER_CHEATING_CHARS_PER_TOKEN_THRESHOLD = 1.3
+TOKENIZER_CHEATING_CHARS_PER_TOKEN_THRESHOLD = 1.8
 
 
 @lru_cache(maxsize=1)
@@ -389,6 +389,7 @@ async def _select_miner_ss58(
             if top_fraction <= 0:
                 logger.info("_select_miner_ss58: Top screener fraction is 0")
                 return None, None
+
             top_miner_ids, total_eligible, top_limit = await fetch_top_screener_miner_ids_for_competition(
                 db,
                 competition_id=competition_id,
