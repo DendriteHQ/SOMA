@@ -4,7 +4,6 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_script_storage, verify_miner_request_dep_tz
@@ -15,12 +14,14 @@ from soma_shared.contracts.miner.v1.messages import (
 )
 from soma_shared.db.session import get_db_session
 from soma_shared.db.miner_log import log_miner_message
-from soma_shared.db.models.competition import Competition
-from soma_shared.db.models.competition_config import CompetitionConfig
-from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
-from soma_shared.db.models.miner import Miner
-from soma_shared.db.models.miner_upload import MinerUpload
-from soma_shared.db.models.script import Script
+from app.db.interfaces.miner_queries import (
+    acquire_miner_upload_advisory_lock,
+    get_latest_active_competition_and_timeframe,
+    get_latest_active_competition_timeframe,
+    get_latest_miner_upload_created_at,
+    get_miner_banned_status_by_hotkey,
+    get_miner_upload_id_for_competition,
+)
 from app.services.blob.script_storage import ScriptStorage
 from app.services.script_store import (
     BannedMinerUploadError,
@@ -131,8 +132,9 @@ async def _ensure_miner_not_banned(
     *,
     miner_hotkey: str,
 ) -> None:
-    banned = await db.scalar(
-        select(Miner.miner_banned_status).where(Miner.ss58 == miner_hotkey).limit(1)
+    banned = await get_miner_banned_status_by_hotkey(
+        db,
+        miner_hotkey=miner_hotkey,
     )
     if banned:
         raise HTTPException(
@@ -149,15 +151,10 @@ async def _ensure_upload_frequency_allowed(
 ) -> None:
     if allowed_frequency_secs <= 0:
         return
-    result = await db.execute(
-        select(MinerUpload.created_at)
-        .join(Script, Script.id == MinerUpload.script_fk)
-        .join(Miner, Miner.id == Script.miner_fk)
-        .where(Miner.ss58 == miner_hotkey)
-        .order_by(MinerUpload.created_at.desc())
-        .limit(1)
+    last_upload_at = await get_latest_miner_upload_created_at(
+        db,
+        miner_hotkey=miner_hotkey,
     )
-    last_upload_at = result.scalars().first()
     if last_upload_at is None:
         return
     if last_upload_at.tzinfo is None:
@@ -173,20 +170,7 @@ async def _ensure_upload_frequency_allowed(
 
 async def _ensure_upload_window_open(db: AsyncSession) -> None:
     now = datetime.now(timezone.utc)
-    timeframe = await db.scalar(
-        select(CompetitionTimeframe)
-        .join(
-            CompetitionConfig,
-            CompetitionConfig.id == CompetitionTimeframe.competition_config_fk,
-        )
-        .join(
-            Competition,
-            Competition.id == CompetitionConfig.competition_fk,
-        )
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc(), CompetitionTimeframe.created_at.desc())
-        .limit(1)
-    )
+    timeframe = await get_latest_active_competition_timeframe(db)
     if timeframe is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -207,21 +191,7 @@ async def _ensure_upload_window_open(db: AsyncSession) -> None:
 
 async def _get_current_open_competition_id(db: AsyncSession) -> int:
     now = datetime.now(timezone.utc)
-    result = await db.execute(
-        select(Competition.id, CompetitionTimeframe)
-        .join(
-            CompetitionConfig,
-            CompetitionConfig.id == CompetitionTimeframe.competition_config_fk,
-        )
-        .join(
-            Competition,
-            Competition.id == CompetitionConfig.competition_fk,
-        )
-        .where(CompetitionConfig.is_active.is_(True))
-        .order_by(Competition.created_at.desc(), CompetitionTimeframe.created_at.desc())
-        .limit(1)
-    )
-    row = result.first()
+    row = await get_latest_active_competition_and_timeframe(db)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -248,13 +218,10 @@ async def _ensure_single_upload_for_competition(
     miner_hotkey: str,
     competition_id: int,
 ) -> None:
-    existing_upload = await db.scalar(
-        select(MinerUpload.id)
-        .join(Script, Script.id == MinerUpload.script_fk)
-        .join(Miner, Miner.id == Script.miner_fk)
-        .where(Miner.ss58 == miner_hotkey)
-        .where(MinerUpload.competition_fk == competition_id)
-        .limit(1)
+    existing_upload = await get_miner_upload_id_for_competition(
+        db,
+        miner_hotkey=miner_hotkey,
+        competition_id=competition_id,
     )
     if existing_upload is not None:
         raise HTTPException(
@@ -269,13 +236,10 @@ async def _acquire_miner_upload_lock(
     miner_hotkey: str,
     competition_id: int,
 ) -> None:
-    bind = db.get_bind()
-    if bind.dialect.name != "postgresql":
-        return
-    lock_key = f"miner-upload:{competition_id}:{miner_hotkey}"
-    await db.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
-        {"lock_key": lock_key},
+    await acquire_miner_upload_advisory_lock(
+        db,
+        miner_hotkey=miner_hotkey,
+        competition_id=competition_id,
     )
 
 

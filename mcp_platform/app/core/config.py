@@ -7,11 +7,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from pydantic_settings import BaseSettings
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(Path(__file__).resolve().parents[2] / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     _wallet: Any = PrivateAttr(default=None)
 
     # App
@@ -155,10 +161,19 @@ class Settings(BaseSettings):
         description="Extra time for HTTP request (must be > container offset)",
     )
 
-    # Validator stake requirements (in alpha tokens)
-    min_validator_stake: float = Field(
-        default=20000.0,
-        alias="MIN_VALIDATOR_STAKE",
+    # Validator stake requirements
+    # total_weight = alpha_stake + tao_stake * tao_weight
+    min_validator_total_weight: float = Field(
+        default=30000.0,
+        alias="MIN_VALIDATOR_TOTAL_WEIGHT",
+        validation_alias=AliasChoices(
+            "MIN_VALIDATOR_TOTAL_WEIGHT",
+            "MIN_VALIDATOR_STAKE",
+        ),
+    )
+    min_validator_alpha_weight: float = Field(
+        default=5000.0,
+        alias="MIN_VALIDATOR_ALPHA_WEIGHT",
     )
 
     # Remote sandbox service configuration (required)

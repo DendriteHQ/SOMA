@@ -86,7 +86,7 @@ class Settings(BaseModel):
             openrouter_api_token=os.getenv("OPENROUTER_API_TOKEN", ""),
             openrouter_model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1-mini"),
             llm_timeout_seconds=cls._get_float("LLM_TIMEOUT_SECONDS", 240),
-            llm_max_tokens=cls._get_int("LLM_MAX_TOKENS", 1024),
+            llm_max_tokens=cls._get_int("LLM_MAX_TOKENS", 4096),
             llm_temperature=cls._get_float("LLM_TEMPERATURE", 0),
             llm_provider_error_cooldown_seconds=cls._get_float(
                 "LLM_PROVIDER_ERROR_COOLDOWN_SECONDS", 600.0
