@@ -127,9 +127,11 @@ def _hash_api_key_secret(secret: str) -> str:
 
 
 async def _increment_rate_bucket(key: str, ttl_seconds: int) -> int:
-    current = await _rate_limit_cache.get(key)
-    next_value = int(current or 0) + 1
-    await _rate_limit_cache.set(key, next_value, ttl=ttl_seconds)
+    # Use cache-native increment to avoid read-modify-write races under concurrency.
+    next_value = int(await _rate_limit_cache.increment(key, delta=1))
+    # increment() does not set TTL, so apply expiry only when the bucket is created.
+    if next_value == 1:
+        await _rate_limit_cache.expire(key, ttl_seconds)
     return next_value
 
 
