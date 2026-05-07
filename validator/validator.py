@@ -38,6 +38,7 @@ from validator.chain.weigt_setter import WeightSetter
 from validator.evaluation.evaluator import BatchScoringError, Evaluator
 from validator.evaluation.llm_scorer import LLMClient, LLMInsufficientFundsError
 from soma_shared.utils.verifier import verify_httpx_response
+from validator.weight_history_store import WeightHistoryStore
 import bittensor as bt
 
 
@@ -61,6 +62,10 @@ class Validator(AbstractValidator):
         self._last_fetch_cause = "unknown"
         self._provider_degraded_until = 0.0
         self.evaluator = Evaluator(settings=self.settings)
+        self.weight_history_store = WeightHistoryStore(
+            file_path=self.settings.weight_history_file,
+            max_entries=self.settings.weight_history_max_entries,
+        )
         self.weight_setter = WeightSetter(
             netuid=self.settings.netuid, subtensor=self.settings.subtensor
         )
@@ -267,8 +272,9 @@ class Validator(AbstractValidator):
             return None
 
     async def set_weights(self) -> None:
+        logging.info("set_weights: Starting weight setting process")
+
         try:
-            logging.info("set_weights: Starting weight setting process")
             # Get best miners with their weights from platform
             # Platform decides how many miners to return based on its configuration
             best_miners_response = await self.get_best_miners()
@@ -277,11 +283,8 @@ class Validator(AbstractValidator):
             )
 
             if not best_miners_response or not best_miners_response.miners:
-                logging.warning(
-                    "No miners returned from platform setting weight to uid 0"
-                )
-                await self.weight_setter.set_weights(
-                    np.array([0], dtype=np.int64), np.array([1.0], dtype=np.float32)
+                await self._set_cached_weights_or_burn(
+                    reason="platform returned empty miner weights"
                 )
                 return
 
@@ -297,11 +300,54 @@ class Validator(AbstractValidator):
                 f"Setting weights for {len(uids)} miners: UIDs={uids.tolist()}, weights={weights.tolist()}"
             )
 
+            self.weight_history_store.append(uids, weights)
             await self.weight_setter.set_weights(uids, weights)
 
         except Exception as e:
             logging.error(f"Exception during setting weights: {e}", exc_info=True)
-            raise  # Re-raise to see if this is causing the crash
+            await self._set_cached_weights_or_burn(
+                reason=f"platform weight fetch failed: {e}"
+            )
+
+    async def _set_cached_weights_or_burn(self, *, reason: str) -> None:
+        latest_snapshot = self.weight_history_store.latest()
+        if latest_snapshot is None:
+            logging.warning(
+                "No cached weight snapshot available (%s); applying full burn",
+                reason,
+            )
+            await self._set_burn_weights(reason=reason)
+            return
+
+        snapshot_age_seconds = max(0.0, time.time() - latest_snapshot.recorded_at_unix)
+        grace_window_hours = max(0.0, self.settings.weight_platform_failure_grace_hours)
+        grace_window_seconds = grace_window_hours * 3600.0
+
+        if snapshot_age_seconds <= grace_window_seconds:
+            logging.warning(
+                "Platform weight source failed (%s). Reusing cached weights from %.2f hours ago (grace %.2f hours).",
+                reason,
+                snapshot_age_seconds / 3600.0,
+                grace_window_hours,
+            )
+            await self.weight_setter.set_weights(
+                latest_snapshot.uids, latest_snapshot.weights
+            )
+            return
+
+        logging.warning(
+            "Cached weights too old to reuse (%s): age %.2f hours exceeds grace %.2f hours. Applying full burn.",
+            reason,
+            snapshot_age_seconds / 3600.0,
+            grace_window_hours,
+        )
+        await self._set_burn_weights(reason=reason)
+
+    async def _set_burn_weights(self, *, reason: str) -> None:
+        logging.warning("Applying burn weights to uid 0 because: %s", reason)
+        await self.weight_setter.set_weights(
+            np.array([0], dtype=np.int64), np.array([1.0], dtype=np.float32)
+        )
 
     async def get_tasks_for_eval(self) -> GetChallengesResponse | None:
         try:
