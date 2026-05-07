@@ -3,6 +3,7 @@ import bittensor as bt
 from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict
 from typing import Any
+from pathlib import Path
 from bittensor.core.async_subtensor import AsyncSubtensor
 import logging
 
@@ -34,6 +35,9 @@ class Settings(BaseModel):
     llm_scoring_error_cooldown_seconds: float
     http_timeout_seconds: float
     weight_block_interval:int
+    weight_platform_failure_grace_hours: float
+    weight_history_max_entries: int
+    weight_history_file: str
      
     @classmethod
     def from_env(cls) -> "Settings":
@@ -61,6 +65,10 @@ class Settings(BaseModel):
                 },
             )
             raise
+
+        default_weight_history_file = str(
+            cls._default_weight_history_file()
+        )
 
         settings = cls(
             wallet_name=wallet_name,
@@ -95,9 +103,25 @@ class Settings(BaseModel):
                 "LLM_SCORING_ERROR_COOLDOWN_SECONDS", 600.0
             ),
             http_timeout_seconds = cls._get_float("HTTP_TIMEOUT_SECONDS", 240.0),
-            weight_block_interval = 110
+            weight_block_interval = 110,
+            weight_platform_failure_grace_hours=max(
+                0.0,
+                cls._get_float("WEIGHT_PLATFORM_FAILURE_GRACE_HOURS", 8.0),
+            ),
+            weight_history_max_entries=max(
+                1,
+                cls._get_int("WEIGHT_HISTORY_MAX_ENTRIES", 100),
+            ),
+            weight_history_file=(
+                os.getenv("WEIGHT_HISTORY_FILE") or default_weight_history_file
+            ),
         )
         return settings
+
+    @staticmethod
+    def _default_weight_history_file() -> Path:
+        validator_dir = Path(__file__).resolve().parent.parent
+        return validator_dir / "state" / "weight_history.json"
 
     @classmethod
     def resolve_public_ip(cls) -> str:

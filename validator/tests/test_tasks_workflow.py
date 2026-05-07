@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 
 import pytest
+import numpy as np
 
 TESTS_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../.."))
@@ -36,8 +37,14 @@ def _make_validator():
         wallet=object(),
         llm_provider_error_cooldown_seconds=600.0,
         llm_scoring_error_cooldown_seconds=600.0,
+        weight_platform_failure_grace_hours=8.0,
     )
     validator.evaluator = Mock()
+    validator.weight_setter = SimpleNamespace(set_weights=AsyncMock())
+    validator.weight_history_store = SimpleNamespace(
+        append=Mock(),
+        latest=Mock(return_value=None),
+    )
     validator.client = Mock()
     validator.client.post = AsyncMock()
     return validator
@@ -417,3 +424,80 @@ async def test_end_to_end_scores_and_reports():
 
     assert score_call is not None, "score_challenges endpoint was not called"
     assert score_call.kwargs["json"]["payload"]["batch_id"] == "batch-3"
+
+
+@pytest.mark.asyncio
+async def test_set_weights_uses_platform_weights_and_persists_snapshot():
+    validator = _make_validator()
+    validator.get_best_miners = AsyncMock(
+        return_value=SimpleNamespace(
+            miners=[
+                SimpleNamespace(uid=12, weight=0.75),
+                SimpleNamespace(uid=33, weight=0.25),
+            ]
+        )
+    )
+
+    await validator.set_weights()
+
+    validator.weight_history_store.append.assert_called_once()
+    validator.weight_setter.set_weights.assert_awaited_once()
+    uids, weights = validator.weight_setter.set_weights.await_args.args
+    assert np.array_equal(uids, np.array([12, 33], dtype=np.int64))
+    assert np.allclose(weights, np.array([0.75, 0.25], dtype=np.float32))
+
+
+@pytest.mark.asyncio
+async def test_set_weights_uses_cached_snapshot_when_platform_fails_within_grace():
+    validator = _make_validator()
+    validator.get_best_miners = AsyncMock(return_value=None)
+    cached_snapshot = SimpleNamespace(
+        recorded_at_unix=1_000.0,
+        uids=np.array([8, 21], dtype=np.int64),
+        weights=np.array([0.6, 0.4], dtype=np.float32),
+    )
+    validator.weight_history_store.latest.return_value = cached_snapshot
+    validator.settings.weight_platform_failure_grace_hours = 8.0
+
+    with patch("validator.validator.time.time", return_value=1_000.0 + 60.0):
+        await validator.set_weights()
+
+    validator.weight_history_store.append.assert_not_called()
+    validator.weight_setter.set_weights.assert_awaited_once()
+    uids, weights = validator.weight_setter.set_weights.await_args.args
+    assert np.array_equal(uids, cached_snapshot.uids)
+    assert np.allclose(weights, cached_snapshot.weights)
+
+
+@pytest.mark.asyncio
+async def test_set_weights_burns_when_cached_snapshot_is_stale():
+    validator = _make_validator()
+    validator.get_best_miners = AsyncMock(return_value=None)
+    validator.weight_history_store.latest.return_value = SimpleNamespace(
+        recorded_at_unix=1_000.0,
+        uids=np.array([2], dtype=np.int64),
+        weights=np.array([1.0], dtype=np.float32),
+    )
+    validator.settings.weight_platform_failure_grace_hours = 8.0
+
+    with patch("validator.validator.time.time", return_value=1_000.0 + 9 * 3600):
+        await validator.set_weights()
+
+    validator.weight_setter.set_weights.assert_awaited_once()
+    uids, weights = validator.weight_setter.set_weights.await_args.args
+    assert np.array_equal(uids, np.array([0], dtype=np.int64))
+    assert np.allclose(weights, np.array([1.0], dtype=np.float32))
+
+
+@pytest.mark.asyncio
+async def test_set_weights_burns_when_no_cached_snapshot_available():
+    validator = _make_validator()
+    validator.get_best_miners = AsyncMock(return_value=None)
+    validator.weight_history_store.latest.return_value = None
+
+    await validator.set_weights()
+
+    validator.weight_setter.set_weights.assert_awaited_once()
+    uids, weights = validator.weight_setter.set_weights.await_args.args
+    assert np.array_equal(uids, np.array([0], dtype=np.int64))
+    assert np.allclose(weights, np.array([1.0], dtype=np.float32))
