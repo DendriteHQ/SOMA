@@ -97,7 +97,7 @@ Before uploading, verify:
 The repository includes a convenient upload script:
 
 
-**Location:** `miner/upload_miner.py`
+**Location:** `miner/upload_miner_with_openrouter_key.py`
 
 
 #### ▶️ Running the Upload Script
