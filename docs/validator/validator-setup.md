@@ -27,9 +27,6 @@
 > **⚠️ IMPORTANT:** You'll need the following accounts before proceeding:
 
 - **Bittensor Wallet**: Registered and staked on netuid 114
-- **LLM API Token**: For LLM-based scoring
-  - 🔗 **OpenRouter**: Sign up at [openrouter.ai](https://openrouter.ai)
-
 ---
 
 ## 💻 System Requirements
@@ -40,7 +37,7 @@
 |-----------|-------------|
 | 🖥️ **CPU** | 4 cores |
 | 💾 **RAM** | 16 GB |
-| 💽 **Storage** | 200 GB SSD |
+| 💽 **Storage** | 500 GB SSD |
 | 🌐 **Network** | Stable internet with public IP |
 
 
@@ -166,29 +163,7 @@ INFO: No tasks available (attempt 1), backing off to 30.0s poll interval
 
 ---
 
-#### 2. 🔑 **LLM API Token Issues**
-
-**Problem:** LLM API authentication failures
-
-**Diagnostic steps:**
-```bash
-# Verify token is set
-env | grep OPENROUTER_API_TOKEN
-
-# Test OpenRouter connectivity
-curl https://openrouter.ai/api/v1/models \
-  -H "Authorization: Bearer $OPENROUTER_API_TOKEN"
-```
-
-**Checklist:**
-- [ ] Token is valid and not expired
-- [ ] Account has sufficient credits
-- [ ] Token has correct permissions
-- [ ] No typos in `.env` file
-
----
-
-#### 4. 🌐 **Platform Connection Failed**
+#### 2. 🌐 **Platform Connection Failed**
 
 **Problem:** Can't connect to platform API
 

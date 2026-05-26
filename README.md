@@ -47,7 +47,7 @@ Validators score miner solutions by:
 **Min Hardware Requirements:**
 - 4 CPU cores
 - 16 GB RAM
-- 200 GB SSD storage
+- 500 GB SSD storage
 
 [**→ Validator Setup Guide**](docs/validator/validator-setup.md)
 
@@ -70,9 +70,9 @@ The platform handles orchestration and evaluation. Validators automatically retr
 
 
 
-## First MCP competition: Context Compression
+## Current competition: Agent CoT Compression
 
-The inaugural MCP challenge focuses on **context compression** - a critical problem for reducing costs and improving quality in agentic AI systems.
+The second MCP challenge focuses on **CoT compression** - a critical problem for reducing costs and improving quality for AI agents.
 
 ### Why context compression?
 - Lower inference costs
@@ -101,13 +101,13 @@ The primary objective of the incentive mechanism is to reward:
 - Meaningful innovation that advances the field
 ---
 
-### Weekly Competition Cycle
+### Competition Cycle
 
-Each competition lasts **one week** and consists of three distinct phases:
+Each competition lasts **two week** and consists of three distinct phases:
 
 #### 1️⃣ Submission Window
 
-- Miners upload or update their algorithms on the platform
+- Miners upload their algorithms on the platform
 - Submissions must be associated with a registered hotkey
 - Only code submitted during this window is eligible for the current cycle
 
@@ -188,13 +188,3 @@ This subnet is **community-driven** and values transparency and collaboration:
 **Built on [Bittensor](https://bittensor.com) | Powered by the Community**
 
 </div>
-
-
-
-
-
-
-
-
-
-
