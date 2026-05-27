@@ -3,20 +3,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import combinations
 from math import isclose
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
-from app.db.views import V_MINER_COMPETITION_STATS
-from soma_shared.db.models.competition_config import CompetitionConfig
-from soma_shared.db.models.compression_competition_config import (
-    CompressionCompetitionConfig,
+from soma_shared.db.models.miner import Miner
+from soma_shared.db.models.swe_bench_run import SweBenchRun
+from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
+from soma_shared.db.models.swe_bench_task import SweBenchTask
+from app.services.swe_difficulty_calculator import (
+    DIFFICULTY_CATEGORIES,
+    CategoryValue,
+    MinerCategoryScores,
+    build_baseline_task_data,
+    build_miner_category_scores,
+    derive_task_difficulties,
 )
-
-
-CategoryValue = float
-MinerCategoryScores = dict[str, dict[CategoryValue, float]]
 
 
 @dataclass(frozen=True)
@@ -47,12 +51,23 @@ class IncentiveCalculationResult:
     layers: tuple[IncentiveLayerResult, ...]
 
 
-def _normalize_categories(categories: Sequence[float]) -> tuple[CategoryValue, ...]:
-    return tuple(sorted(float(category) for category in categories))
+def _normalize_categories(categories: Sequence[str]) -> tuple[CategoryValue, ...]:
+    seen: set[CategoryValue] = set()
+    normalized: list[CategoryValue] = []
+    for category in categories:
+        category_name = str(category)
+        if category_name in seen:
+            continue
+        seen.add(category_name)
+        normalized.append(category_name)
+
+    if seen.issubset(set(DIFFICULTY_CATEGORIES)):
+        return tuple(category for category in DIFFICULTY_CATEGORIES if category in seen)
+    return tuple(normalized)
 
 
 def build_incentive_layers(
-    categories: Sequence[float],
+    categories: Sequence[str],
 ) -> tuple[tuple[tuple[CategoryValue, ...], ...], ...]:
     normalized_categories = _normalize_categories(categories)
     layers: list[tuple[tuple[CategoryValue, ...], ...]] = []
@@ -83,7 +98,7 @@ def _subset_average_score(
 
 def calculate_incentive_weights(
     miner_category_scores: Mapping[str, Mapping[CategoryValue, float]],
-    categories: Sequence[float],
+    categories: Sequence[str],
     *,
     burn_ratio: float,
 ) -> IncentiveCalculationResult:
@@ -176,54 +191,63 @@ async def load_competition_incentive_inputs(
     *,
     competition_id: int,
 ) -> tuple[tuple[CategoryValue, ...], MinerCategoryScores]:
-    configured_ratios_raw = await db.scalar(
-        select(CompressionCompetitionConfig.compression_ratios)
-        .select_from(CompetitionConfig)
-        .outerjoin(
-            CompressionCompetitionConfig,
-            CompressionCompetitionConfig.competition_config_fk == CompetitionConfig.id,
-        )
-        .where(CompetitionConfig.competition_fk == competition_id)
-        .limit(1)
-    )
-    configured_ratios = _normalize_categories(configured_ratios_raw or ())
+    baseline_runs = aliased(SweBenchRun, name="baseline_runs")
+    baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
+    miner_runs = aliased(SweBenchRun, name="miner_runs")
+    miner_validations = aliased(SweBenchRunValidation, name="miner_validations")
 
     rows = (
         await db.execute(
             select(
-                V_MINER_COMPETITION_STATS.c.ss58,
-                V_MINER_COMPETITION_STATS.c.is_banned,
-                V_MINER_COMPETITION_STATS.c.partial_scores,
-            ).where(V_MINER_COMPETITION_STATS.c.competition_id == competition_id)
+                SweBenchTask.instance_id.label("task_name"),
+                Miner.ss58.label("hotkey"),
+                baseline_runs.id.label("baseline_run_id"),
+                baseline_runs.tokens_used.label("baseline_tokens_used"),
+                baseline_validations.resolved.label("baseline_resolved"),
+                miner_runs.id.label("run_id"),
+                miner_runs.attempt_no.label("attempt_no"),
+                miner_runs.tokens_used.label("run_tokens_used"),
+                miner_runs.time_taken_seconds.label("time_taken_seconds"),
+                miner_runs.agent_steps.label("agent_steps"),
+                miner_validations.resolved.label("run_resolved"),
+            )
+            .select_from(SweBenchTask)
+            .join(
+                baseline_runs,
+                and_(
+                    baseline_runs.task_fk == SweBenchTask.id,
+                    baseline_runs.baseline_run.is_(True),
+                ),
+            )
+            .outerjoin(
+                baseline_validations,
+                baseline_validations.run_fk == baseline_runs.id,
+            )
+            .join(
+                miner_runs,
+                and_(
+                    miner_runs.task_fk == SweBenchTask.id,
+                    miner_runs.baseline_run.is_(False),
+                ),
+            )
+            .join(Miner, Miner.id == miner_runs.miner_fk)
+            .outerjoin(miner_validations, miner_validations.run_fk == miner_runs.id)
+            .where(
+                SweBenchTask.competition_fk == competition_id,
+                Miner.miner_banned_status.is_(False),
+            )
+            .order_by(
+                SweBenchTask.instance_id.asc(),
+                Miner.ss58.asc(),
+                miner_runs.attempt_no.asc(),
+                miner_runs.id.asc(),
+            )
         )
     ).all()
 
-    miner_category_scores: MinerCategoryScores = {}
-    discovered_ratios: set[CategoryValue] = set(configured_ratios)
-
-    for row in rows:
-        if bool(row.is_banned):
-            continue
-
-        score_items: list[dict[str, Any]] = list(row.partial_scores or [])
-        if not score_items:
-            continue
-
-        ratio_scores: dict[CategoryValue, float] = {}
-        for item in score_items:
-            compression_ratio = item.get("compression_ratio")
-            score = item.get("score")
-            if compression_ratio is None or score is None:
-                continue
-            ratio_value = float(compression_ratio)
-            ratio_scores[ratio_value] = float(score)
-            discovered_ratios.add(ratio_value)
-
-        if ratio_scores:
-            miner_category_scores[str(row.ss58)] = ratio_scores
-
-    categories = configured_ratios or tuple(sorted(discovered_ratios))
-    return categories, miner_category_scores
+    task_difficulties = derive_task_difficulties(_build_baseline_task_data(rows))
+    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
+    return DIFFICULTY_CATEGORIES, miner_category_scores
 
 
 async def calculate_competition_incentive_weights(
