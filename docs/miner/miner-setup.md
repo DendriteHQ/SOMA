@@ -108,7 +108,7 @@ source .venv/bin/activate
 
 # Run the upload script
 cd miner
-python3 upload_miner.py 
+python3 miner/upload_miner_with_openrouter_key.py
 ```
 
 **Expected output:**
