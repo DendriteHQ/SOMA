@@ -16,31 +16,32 @@ where:
 
 2. If either token count is missing, non-positive, or otherwise invalid, the token component is treated as `0`.
 
-3. The base score and the coefficient $\lambda$ depend on the pass/fail outcome of the baseline run and the miner run:
+3. The base score and the coefficient $\lambda$ depend on the pass/fail outcome
+   of the baseline run and the miner run:
 
-	a. If the baseline run passes and the miner run passes:
+   a. If the baseline run passes and the miner run passes:
 
-$$
-Score(T_{type}) = 1.0, \qquad \lambda(T_{type}) = 0.5
-$$
+      $$
+      Score(T_{type}) = 1.0, \qquad \lambda(T_{type}) = 0.5
+      $$
 
-	b. If the baseline run passes and the miner run fails:
+   b. If the baseline run passes and the miner run fails:
 
-$$
-Score(T_{type}) = -4.0, \qquad \lambda(T_{type}) = 0.0
-$$
+      $$
+      Score(T_{type}) = -4.0, \qquad \lambda(T_{type}) = 0.0
+      $$
 
-	c. If the baseline run fails and the miner run passes:
+   c. If the baseline run fails and the miner run passes:
 
-$$
-Score(T_{type}) = 4.0, \qquad \lambda(T_{type}) = 0.5
-$$
+      $$
+      Score(T_{type}) = 4.0, \qquad \lambda(T_{type}) = 0.5
+      $$
 
-	d. If the baseline run fails and the miner run fails:
+   d. If the baseline run fails and the miner run fails:
 
-$$
-Score(T_{type}) = 0.0, \qquad \lambda(T_{type}) = 0.1
-$$
+      $$
+      Score(T_{type}) = 0.0, \qquad \lambda(T_{type}) = 0.1
+      $$
 
 4. If either the baseline validation result or the miner validation result is unknown, that baseline-miner comparison does not contribute to the score.
 
