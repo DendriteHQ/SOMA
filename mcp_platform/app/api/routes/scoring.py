@@ -193,14 +193,14 @@ def build_swe_miner_scores(
     screener_run_scores: list[float] = []
 
     for group in task_groups.values():
-        target_scores = (
-            screener_run_scores if bool(group["is_screener"]) else total_run_scores
-        )
-        target_scores.extend(
+        run_scores = [
             float(run["platform_score"])
             for run in group["runs"]
             if run["platform_score"] is not None
-        )
+        ]
+        total_run_scores.extend(run_scores)
+        if bool(group["is_screener"]):
+            screener_run_scores.extend(run_scores)
 
     total_score = sum(total_run_scores) / len(total_run_scores) if total_run_scores else None
     screener_score = (

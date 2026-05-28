@@ -47,7 +47,7 @@ Validators score miner solutions by:
 **Min Hardware Requirements:**
 - 4 CPU cores
 - 16 GB RAM
-- 200 GB SSD storage
+- 500 GB SSD storage
 
 [**→ Validator Setup Guide**](docs/validator/validator-setup.md)
 
@@ -57,7 +57,7 @@ Validators score miner solutions by:
 On SOMA, any problem that can be meaningfully solved using an MCP server - and that can significantly improve agent performance - may become a competition target. Miners compete to deliver the most effective model or algorithm for a given task.
 
 
-The miner’s responsibility is to design and implement model or algorithm that solves the defined problem as effectively as possible and upload it to the platform
+The miner's responsibility is to design and implement model or algorithm that solves the defined problem as effectively as possible and upload it to the platform
 
 **All a miner needs to participate is:**
 - A working algorithm that solves the active MCP task
@@ -70,9 +70,9 @@ The platform handles orchestration and evaluation. Validators automatically retr
 
 
 
-## First MCP competition: Context Compression
+## Current competition: Agent CoT Compression
 
-The inaugural MCP challenge focuses on **context compression** - a critical problem for reducing costs and improving quality in agentic AI systems.
+The second MCP challenge focuses on **CoT compression** - a critical problem for reducing costs and improving quality for AI agents.
 
 ### Why context compression?
 - Lower inference costs
@@ -81,33 +81,14 @@ The inaugural MCP challenge focuses on **context compression** - a critical prob
 - Stronger reasoning from distilled context
 - Scalable intelligence for multi-agent systems
 
-[**→ Context Compression**](docs/miner/context-compression.md)
 
+### Competition Cycle
 
-
-## Incentive Mechanism
-
-The subnet operates on a **recurring weekly competition cycle**, where validation mechanism incentivise the top algorithm by compression ratio and one overall winner.
-
-The platform aggregates validator assessments into final rankings, and validators set on-chain weights based on platform-calculated scores.
-
-Each miner may upload **one algorithm per hotkey per competition cycle**.
-
-The primary objective of the incentive mechanism is to reward:
-
-- **State-of-the-art algorithmic quality**
-- Solutions aligned with best engineering practices
-- Robust, generalizable approaches rather than overfitted heuristics
-- Meaningful innovation that advances the field
----
-
-### Weekly Competition Cycle
-
-Each competition lasts **one week** and consists of three distinct phases:
+Each competition lasts **two week** and consists of three distinct phases:
 
 #### 1️⃣ Submission Window
 
-- Miners upload or update their algorithms on the platform
+- Miners upload their algorithms and OpenRouter keys on the platform
 - Submissions must be associated with a registered hotkey
 - Only code submitted during this window is eligible for the current cycle
 
@@ -126,17 +107,10 @@ This screening stage ensures:
 
 - Qualified solutions are evaluated continuously under live competition conditions
 - Validators score miners according to the active task criteria
-- Final rankings are computed at the end of the weekly cycle
+- Final rankings are computed at the end of the cycle
 
----
+[**→ Incentive Mechanism**](docs/miner/INCENTIVE_MECHANISM.md)
 
-### Reward Distribution
-
-- The top-ranked miner is declared the weekly winner
-- The winner receives the subnet incentive allocation
-- After the reward period ends, a new weekly competition cycle begins
-
----
 
 This structure:
 
@@ -188,13 +162,3 @@ This subnet is **community-driven** and values transparency and collaboration:
 **Built on [Bittensor](https://bittensor.com) | Powered by the Community**
 
 </div>
-
-
-
-
-
-
-
-
-
-
