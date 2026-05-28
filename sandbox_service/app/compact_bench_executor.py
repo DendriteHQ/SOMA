@@ -47,6 +47,9 @@ PLUGIN_COPY_IGNORE_NAMES = {".git", PLUGIN_VENV_DIRNAME}
 TIKTOKEN_CACHE_DIRNAME = "tiktoken-cache"
 TIKTOKEN_CL100K_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 TIKTOKEN_CL100K_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
+BENCHMARK_PACKAGE_NAME = "soma_bench"
+DEFAULT_BENCHMARK_PACKAGE_SPEC = "git+https://github.com/DendriteHQ/SOMA-benchmark.git"
+DEFAULT_PLUGIN_REPOSITORY_URL = "https://github.com/DendriteHQ/SOMA-plugin.git"
 
 
 def _slug(value: str, *, default: str) -> str:
@@ -129,11 +132,11 @@ def _docker_remove_network(name: str) -> None:
 
 
 def _build_proxy_container_name() -> str:
-    return "soma-compact-bench-nginx"
+    return "soma-benchmark-nginx"
 
 
 def _resolve_private_network_name() -> str:
-    return os.getenv("COMPACT_BENCH_PRIVATE_NETWORK_NAME", "soma-compact-bench-private").strip() or "soma-compact-bench-private"
+    return os.getenv("COMPACT_BENCH_PRIVATE_NETWORK_NAME", "soma-benchmark-private").strip() or "soma-benchmark-private"
 
 
 def _normalize_proxy_upstream_base_url(value: str) -> str:
@@ -179,15 +182,30 @@ def _build_nginx_config(*, upstream_base_url: str, listen_port: int) -> str:
     )
 
 
-def _resolve_plugin_template_path() -> Path:
-    configured = os.getenv("COMPACT_BENCH_PLUGIN_TEMPLATE_PATH", "").strip()
-    if configured:
-        path = Path(configured).expanduser().resolve()
-    else:
-        path = (Path(__file__).resolve().parents[3] / "SOMA-OpenClaw-plugin").resolve()
-    if not path.is_dir():
-        raise RuntimeError(f"Compact-bench plugin template path does not exist: {path}")
-    return path
+def _resolve_benchmark_package_spec() -> str:
+    return (
+        os.getenv("COMPACT_BENCH_BENCHMARK_PACKAGE_SPEC", DEFAULT_BENCHMARK_PACKAGE_SPEC).strip()
+        or DEFAULT_BENCHMARK_PACKAGE_SPEC
+    )
+
+
+def _resolve_plugin_repository_url() -> str:
+    return (
+        os.getenv("COMPACT_BENCH_PLUGIN_REPOSITORY_URL", DEFAULT_PLUGIN_REPOSITORY_URL).strip()
+        or DEFAULT_PLUGIN_REPOSITORY_URL
+    )
+
+
+def _python_module_available(python_executable: str, module_name: str) -> bool:
+    result = _run_command(
+        [
+            python_executable,
+            "-c",
+            "import importlib.util, sys; raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) else 1)",
+            module_name,
+        ]
+    )
+    return result.returncode == 0
 
 
 def _download_miner_code(script_presigned_url: str) -> str:
@@ -271,7 +289,7 @@ def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
     return cache_path
 
 class CompactBenchExecutor:
-    """Runs compact-bench solve commands and captures produced patches."""
+    """Runs benchmark solve commands and captures produced patches."""
 
     def __init__(
         self,
@@ -279,17 +297,15 @@ class CompactBenchExecutor:
         python_executable: str | None = None,
         output_root: str | Path | None = None,
     ):
-        default_output_root = Path("/tmp") / "soma-compact-bench-service"
+        default_output_root = Path("/tmp") / "soma-benchmark-service"
         self._python_executable = python_executable or os.getenv("COMPACT_BENCH_PYTHON_EXECUTABLE") or sys.executable
         self._output_root = Path(output_root or os.getenv("COMPACT_BENCH_OUTPUT_ROOT") or default_output_root).expanduser().resolve()
         self._llm_proxy_handle: NginxProxyHandle | None = None
         self._llm_proxy_lock = threading.Lock()
+        self._benchmark_package_spec = _resolve_benchmark_package_spec()
+        self._plugin_repository_url = _resolve_plugin_repository_url()
 
-        if importlib.util.find_spec("soma_compact_bench") is None:
-            raise RuntimeError(
-                "The 'soma_compact_bench' package is not installed in the sandbox-service environment. "
-                "Install dependencies from requirements.txt before starting the service."
-            )
+        self._ensure_benchmark_installed()
 
     def execute_task(
         self,
@@ -304,7 +320,7 @@ class CompactBenchExecutor:
         )
         output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
-            "Compact-bench executor preparing run: run_id=%s benchmark=%s instance_id=%s output_dir=%s",
+            "Benchmark executor preparing run: run_id=%s benchmark=%s instance_id=%s output_dir=%s",
             task.run_id,
             task.benchmark,
             task.instance_id,
@@ -316,16 +332,16 @@ class CompactBenchExecutor:
             script_presigned_url=task.script_presigned_url,
         )
         logger.info(
-            "Compact-bench plugin prepared: run_id=%s plugin_path=%s",
+            "Benchmark plugin prepared: run_id=%s plugin_path=%s",
             task.run_id,
             plugin_path,
         )
-        command = self._build_command(task=task, output_dir=output_dir)
+        command = self._build_command(task=task, output_dir=output_dir, plugin_path=plugin_path)
         env = os.environ.copy()
         llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
         if llm_base_url:
             logger.info(
-                "Ensuring compact-bench LLM proxy: run_id=%s upstream_host=%s",
+                "Ensuring benchmark LLM proxy: run_id=%s upstream_host=%s",
                 task.run_id,
                 urlsplit(llm_base_url).netloc,
             )
@@ -333,18 +349,16 @@ class CompactBenchExecutor:
             env["LLM_BASE_URL"] = proxy_handle.proxy_base_url
             env["SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"] = proxy_handle.private_network_name
             logger.info(
-                "Compact-bench LLM proxy ready: run_id=%s proxy_base_url=%s private_network=%s",
+                "Benchmark LLM proxy ready: run_id=%s proxy_base_url=%s private_network=%s",
                 task.run_id,
                 proxy_handle.proxy_base_url,
                 proxy_handle.private_network_name,
             )
-        env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
-
         effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
         timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
         started_at = time.monotonic()
         logger.info(
-            "Starting compact-bench solve command: run_id=%s timeout_seconds=%s command=%s",
+            "Starting benchmark solve command: run_id=%s timeout_seconds=%s command=%s",
             task.run_id,
             timeout,
             shlex.join(command),
@@ -361,7 +375,7 @@ class CompactBenchExecutor:
         except subprocess.TimeoutExpired as exc:
             duration = time.monotonic() - started_at
             logger.error(
-                "Compact-bench solve command timed out: run_id=%s duration_seconds=%.3f timeout_seconds=%s",
+                "Benchmark solve command timed out: run_id=%s duration_seconds=%.3f timeout_seconds=%s",
                 task.run_id,
                 duration,
                 timeout,
@@ -391,7 +405,7 @@ class CompactBenchExecutor:
 
         duration = time.monotonic() - started_at
         logger.info(
-            "Compact-bench solve command finished: run_id=%s returncode=%s duration_seconds=%.3f",
+            "Benchmark solve command finished: run_id=%s returncode=%s duration_seconds=%.3f",
             task.run_id,
             process.returncode,
             duration,
@@ -418,7 +432,7 @@ class CompactBenchExecutor:
             metadata=row_metadata,
         )
         logger.info(
-            "Compact-bench result parsed: run_id=%s status=%s ok_status=%s patch_capture_status=%s total_tokens=%s agent_steps=%s",
+            "Benchmark result parsed: run_id=%s status=%s ok_status=%s patch_capture_status=%s total_tokens=%s agent_steps=%s",
             task.run_id,
             status,
             success,
@@ -428,13 +442,13 @@ class CompactBenchExecutor:
         )
         if stderr_text and success:
             logger.info(
-                "Compact-bench emitted stderr output during successful run: run_id=%s stderr=%s",
+                "Benchmark emitted stderr output during successful run: run_id=%s stderr=%s",
                 task.run_id,
                 stderr_text,
             )
         if error_text:
             logger.warning(
-                "Compact-bench reported error output: run_id=%s error=%s",
+                "Benchmark reported error output: run_id=%s error=%s",
                 task.run_id,
                 error_text,
             )
@@ -466,13 +480,104 @@ class CompactBenchExecutor:
         )
         return CompactBenchExecutionOutput(report=report, patch_text=patch_text)
 
-    def _build_command(self, *, task: CompactBenchRunTaskRequest, output_dir: Path) -> list[str]:
+    def _ensure_benchmark_installed(self) -> None:
+        logger.info(
+            "Ensuring SOMA-benchmark is installed in sandbox-service environment: python=%s package_spec=%s",
+            self._python_executable,
+            self._benchmark_package_spec,
+        )
+        install = _run_command(
+            [
+                self._python_executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--upgrade",
+                self._benchmark_package_spec,
+            ]
+        )
+        if install.returncode != 0:
+            raise RuntimeError(
+                "Failed to install SOMA-benchmark into the sandbox-service environment: "
+                f"{(install.stderr or install.stdout or '').strip()}"
+            )
+        if not _python_module_available(self._python_executable, BENCHMARK_PACKAGE_NAME):
+            raise RuntimeError(
+                "SOMA-benchmark installation completed, but the sandbox-service interpreter still cannot import "
+                f"{BENCHMARK_PACKAGE_NAME!r}."
+            )
+
+    def _plugin_checkout_path(self) -> Path:
+        return (self._output_root / "repo-cache" / "SOMA-plugin").resolve()
+
+    def _ensure_plugin_template_checkout(self) -> Path:
+        checkout_path = self._plugin_checkout_path()
+        checkout_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not (checkout_path / ".git").is_dir():
+            if checkout_path.exists():
+                shutil.rmtree(checkout_path, ignore_errors=True)
+            clone = _run_command(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    self._plugin_repository_url,
+                    str(checkout_path),
+                ]
+            )
+            if clone.returncode != 0:
+                raise RuntimeError(
+                    "Failed to clone SOMA-plugin repository for sandbox-service: "
+                    f"{(clone.stderr or clone.stdout or '').strip()}"
+                )
+            return checkout_path
+
+        remote = _run_command(["git", "-C", str(checkout_path), "remote", "get-url", "origin"])
+        current_remote = (remote.stdout or "").strip()
+        if remote.returncode != 0 or current_remote != self._plugin_repository_url:
+            shutil.rmtree(checkout_path, ignore_errors=True)
+            clone = _run_command(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    self._plugin_repository_url,
+                    str(checkout_path),
+                ]
+            )
+            if clone.returncode != 0:
+                raise RuntimeError(
+                    "Failed to refresh SOMA-plugin repository for sandbox-service: "
+                    f"{(clone.stderr or clone.stdout or '').strip()}"
+                )
+            return checkout_path
+
+        pull = _run_command(["git", "-C", str(checkout_path), "pull", "--ff-only"])
+        if pull.returncode != 0:
+            raise RuntimeError(
+                "Failed to update SOMA-plugin repository for sandbox-service: "
+                f"{(pull.stderr or pull.stdout or '').strip()}"
+            )
+        return checkout_path
+
+    def _build_command(
+        self,
+        *,
+        task: CompactBenchRunTaskRequest,
+        output_dir: Path,
+        plugin_path: Path,
+    ) -> list[str]:
         # TODO: define the executable command and runtime flags directly in this service
         # instead of passing command-shaping inputs through the payload contract.
         command = [
             self._python_executable,
             "-m",
-            "soma_compact_bench.benchmark.solve",
+            BENCHMARK_PACKAGE_NAME,
+            "benchmark-solve",
             "--agent-name",
             task.agent_name,
             "--benchmark",
@@ -486,19 +591,26 @@ class CompactBenchExecutor:
             str(task.run_id),
         ]
         if task.agent_name == "openclaw":
-            command.append("--openclaw-ignore-api-key")
+            command.extend(
+                [
+                    "--openclaw-current-user",
+                    "--openclaw-ignore-api-key",
+                ]
+            )
+            if not task.openclaw_disable_somarizer:
+                command.extend(["--openclaw-plugin-path", str(plugin_path)])
         if task.model:
             command.extend(["--model", task.model])
         if task.openclaw_disable_somarizer:
-            command.append("--openclaw-disable-somarizer")
+            command.append("--openclaw-disable-plugin")
         return command
 
     def _materialize_plugin_checkout(self, *, output_dir: Path, script_presigned_url: str) -> Path:
-        template_path = _resolve_plugin_template_path()
+        template_path = self._ensure_plugin_template_checkout()
         plugin_path = output_dir / "soma-miner-plugin"
         plugin_path.mkdir(parents=True, exist_ok=True)
         logger.info(
-            "Materializing plugin checkout: output_dir=%s template_path=%s",
+            "Materializing plugin checkout from git: output_dir=%s template_path=%s",
             output_dir,
             template_path,
         )
@@ -536,7 +648,12 @@ class CompactBenchExecutor:
             self._llm_proxy_handle = handle
             return handle
 
-    def _start_llm_proxy(self, *, upstream_base_url: str, private_network_name: str) -> NginxProxyHandle:
+    def _start_llm_proxy(
+        self,
+        *,
+        upstream_base_url: str,
+        private_network_name: str,
+    ) -> NginxProxyHandle:
         proxy_port = self._get_llm_proxy_port()
         container_name = _build_proxy_container_name()
         config_path = self._output_root / "llm-proxy.nginx.conf"
@@ -559,7 +676,7 @@ class CompactBenchExecutor:
         )
         _ensure_docker_network(private_network_name, internal=True)
         logger.info(
-            "Starting compact-bench nginx proxy: container_name=%s upstream_host=%s private_network=%s proxy_port=%s connect_timeout=%ss send_timeout=%ss read_timeout=%ss keepalive_timeout=%ss",
+            "Starting benchmark nginx proxy: container_name=%s upstream_host=%s private_network=%s proxy_port=%s connect_timeout=%ss send_timeout=%ss read_timeout=%ss keepalive_timeout=%ss",
             container_name,
             urlsplit(upstream_base_url).netloc,
             private_network_name,
@@ -587,7 +704,7 @@ class CompactBenchExecutor:
         )
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(f"Failed to start compact-bench nginx proxy container: {message}")
+            raise RuntimeError(f"Failed to start benchmark nginx proxy container: {message}")
         try:
             _docker_connect_network(private_network_name, container_name, alias=container_name)
         except Exception:
@@ -601,7 +718,7 @@ class CompactBenchExecutor:
             )
             raise
         logger.info(
-            "Compact-bench nginx proxy ready: container_name=%s proxy_base_url=http://%s:%s",
+            "Benchmark nginx proxy ready: container_name=%s proxy_base_url=http://%s:%s",
             container_name,
             container_name,
             proxy_port,
