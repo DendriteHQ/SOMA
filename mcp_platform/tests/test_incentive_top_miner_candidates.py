@@ -523,3 +523,83 @@ async def test_incentive_admin_route_rejects_generation_before_evaluation_end(
 	exc = exc_info.value
 	assert getattr(exc, "status_code", None) == 409
 	assert "evaluation has not ended yet" in str(getattr(exc, "detail", exc)).lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+	"competition_days, payout_days",
+	[
+		(7, 7),
+		(28, 14),
+	],
+)
+async def test_incentive_admin_route_generation_is_independent_of_competition_length(
+	async_session: AsyncSession,
+	monkeypatch: pytest.MonkeyPatch,
+	competition_days: int,
+	payout_days: int,
+) -> None:
+	now = datetime.now(timezone.utc).replace(microsecond=0)
+	upload_start = now - timedelta(days=competition_days + 2)
+	upload_end = upload_start + timedelta(days=max(1, competition_days // 2))
+	eval_start = upload_end
+	eval_end = now - timedelta(hours=1)
+	payout_start = now + timedelta(hours=2)
+	payout_end = payout_start + timedelta(days=payout_days)
+	competition_id = 300 + competition_days
+
+	await _seed_competition_window(
+		async_session,
+		competition_id=competition_id,
+		upload_starts_at=upload_start,
+		upload_ends_at=upload_end,
+		eval_starts_at=eval_start,
+		eval_ends_at=eval_end,
+	)
+
+	async def fake_burn_state(*args, **kwargs):
+		return False, 0.9
+
+	async def fake_generate_candidates(
+		db: AsyncSession,
+		*,
+		competition_id: int,
+		burn_ratio: float,
+		starts_at: datetime,
+		ends_at: datetime,
+	) -> list[TopMiner]:
+		assert burn_ratio == 0.0
+		candidate = _top_miner_row(
+			competition_id,
+			ss58=f"candidate-{competition_id}",
+			competition_id=competition_id,
+			approved=False,
+			starts_at=starts_at,
+			ends_at=ends_at,
+		)
+		db.add(candidate)
+		await db.flush()
+		return [candidate]
+
+	monkeypatch.setattr(
+		"app.api.routes.incentive_admin._get_current_burn_state",
+		fake_burn_state,
+	)
+	monkeypatch.setattr(
+		"app.api.routes.incentive_admin.replace_competition_top_miner_candidates",
+		fake_generate_candidates,
+	)
+
+	response = await generate_incentive_candidates(
+		competition_id,
+		GenerateIncentiveCandidatesRequest(
+			starts_at=payout_start,
+			ends_at=payout_end,
+		),
+		db=async_session,
+	)
+
+	assert response.competition_id == competition_id
+	assert response.created_candidate_count == 1
+	assert _normalize_datetime(response.starts_at) == payout_start
+	assert _normalize_datetime(response.ends_at) == payout_end
