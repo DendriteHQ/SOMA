@@ -347,12 +347,12 @@ class CompactBenchExecutor:
         self._benchmark_package_spec = _resolve_benchmark_package_spec()
         self._plugin_repository_url = _resolve_plugin_repository_url()
 
-        self._ensure_benchmark_installed()
+        # self._ensure_benchmark_installed()
         _build_compression_service_image()
 
-        if importlib.util.find_spec("soma_compact_bench") is None:
+        if importlib.util.find_spec("soma_bench") is None:
             raise RuntimeError(
-                "The 'soma_compact_bench' package is not installed in the sandbox-service environment. "
+                "The 'soma_bench' package is not installed in the sandbox-service environment. "
                 "Install dependencies from requirements.txt before starting the service."
             )
 
@@ -494,10 +494,11 @@ class CompactBenchExecutor:
             total_tokens,
             agent_steps,
         )
-        if stderr_text and success:
+        if stderr_text:
             logger.info(
-                "Benchmark emitted stderr output during successful run: run_id=%s stderr=%s",
+                "Benchmark emitted stderr output: run_id=%s ok_status=%s stderr=%s",
                 task.run_id,
+                success,
                 stderr_text,
             )
         if error_text:
