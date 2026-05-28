@@ -43,7 +43,7 @@ class NginxProxyHandle:
 
 PLUGIN_VENV_DIRNAME = ".soma-openclaw-venv"
 PLUGIN_BACKEND_FILENAME = "base_miner.py"
-PLUGIN_COPY_IGNORE_NAMES = {".git", PLUGIN_VENV_DIRNAME}
+PLUGIN_COPY_IGNORE_NAMES = {".git", PLUGIN_VENV_DIRNAME, "logs"}
 TIKTOKEN_CACHE_DIRNAME = "tiktoken-cache"
 COMPRESSION_SERVICE_IMAGE_NAME = "soma-compression-service:latest"
 COMPRESSION_SERVICE_CONTEXT_DIRNAME = "compression_service"
@@ -454,6 +454,7 @@ class CompactBenchExecutor:
                 patch_diff=None,
                 metadata=metadata,
             )
+            shutil.rmtree(output_dir, ignore_errors=True)
             return CompactBenchExecutionOutput(report=report, patch_text="")
 
         duration = time.monotonic() - started_at
@@ -531,6 +532,7 @@ class CompactBenchExecutor:
             patch_diff=patch_text or None,
             metadata=metadata,
         )
+        shutil.rmtree(output_dir, ignore_errors=True)
         return CompactBenchExecutionOutput(report=report, patch_text=patch_text)
 
     def _ensure_benchmark_installed(self) -> None:
