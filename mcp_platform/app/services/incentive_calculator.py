@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from itertools import combinations
 from math import isclose
-from typing import Sequence
+from typing import Mapping, Sequence
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -13,6 +14,10 @@ from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
+from soma_shared.db.models.top_miner import TopMiner
+from app.db.interfaces.burn_weight_queries import (
+    delete_unapproved_competition_top_miner_rows,
+)
 from app.services.swe_difficulty_calculator import (
     DIFFICULTY_CATEGORIES,
     CategoryValue,
@@ -265,3 +270,75 @@ async def calculate_competition_incentive_weights(
         categories,
         burn_ratio=burn_ratio,
     )
+
+
+async def replace_competition_top_miner_candidates(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+    burn_ratio: float,
+    starts_at: datetime,
+    ends_at: datetime,
+) -> list[TopMiner]:
+    calculation = await calculate_competition_incentive_weights(
+        db,
+        competition_id=competition_id,
+        burn_ratio=burn_ratio,
+    )
+
+    candidate_hotkeys = tuple(sorted(calculation.final_weights))
+    miner_ids_by_ss58: dict[str, int] = {}
+    if candidate_hotkeys:
+        miner_rows = (
+            await db.execute(
+                select(Miner.id, Miner.ss58).where(Miner.ss58.in_(candidate_hotkeys))
+            )
+        ).all()
+        miner_ids_by_ss58 = {
+            str(row.ss58): int(row.id)
+            for row in miner_rows
+            if row.ss58 is not None and row.id is not None
+        }
+
+    await delete_unapproved_competition_top_miner_rows(
+        db,
+        competition_id=competition_id,
+        starts_at=starts_at,
+        ends_at=ends_at,
+    )
+
+    created_at = datetime.now(timezone.utc)
+    candidate_entries = [
+        (hotkey, float(weight))
+        for hotkey, weight in calculation.final_weights.items()
+        if weight > 0.0
+    ]
+
+    next_top_miner_id: int | None = None
+    if db.bind is not None and db.bind.dialect.name == "sqlite" and candidate_entries:
+        current_max_id = await db.scalar(select(func.max(TopMiner.id)))
+        next_top_miner_id = int(current_max_id or 0) + 1
+
+    top_miner_rows: list[TopMiner] = []
+    for hotkey, weight in candidate_entries:
+        record_kwargs = {
+            "ss58": hotkey,
+            "competition_fk": competition_id,
+            "winner_type": "overall",
+            "compression_ratio": None,
+            "weight": weight,
+            "approved": False,
+            "starts_at": starts_at,
+            "ends_at": ends_at,
+            "miner_fk": miner_ids_by_ss58.get(hotkey),
+            "created_at": created_at,
+        }
+        if next_top_miner_id is not None:
+            record_kwargs["id"] = next_top_miner_id
+            next_top_miner_id += 1
+        top_miner_rows.append(TopMiner(**record_kwargs))
+
+    if top_miner_rows:
+        db.add_all(top_miner_rows)
+    await db.flush()
+    return top_miner_rows
