@@ -361,14 +361,12 @@ async def _load_top_miner_ss58_weights(
     *,
     request_id: str | None,
     now: datetime,
-    active_competition_id: int,
 ) -> dict[str, float]:
     top_miner_ss58_weights: dict[str, float] = {}
     try:
         tm_rows = await get_active_top_miner_rows(
             db,
             now=now,
-            competition_id=active_competition_id,
         )
         for row in tm_rows:
             ss58 = str(row.ss58).strip()
@@ -427,7 +425,6 @@ async def _build_best_miners_payload(
         db,
         request_id=request_id,
         now=now,
-        active_competition_id=active_competition_id,
     )
 
     top_miner_weight_total = sum(w for w in top_miner_ss58_weights.values() if w > 0.0)

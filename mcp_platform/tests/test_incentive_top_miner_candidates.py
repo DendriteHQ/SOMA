@@ -123,7 +123,7 @@ async def _seed_competition_window(
 
 
 @pytest.mark.asyncio
-async def test_get_active_top_miner_rows_filters_approved_current_competition(
+async def test_get_active_top_miner_rows_filters_only_approved_active_windows(
 	async_session: AsyncSession,
 ) -> None:
 	now = datetime.now(timezone.utc)
@@ -171,10 +171,12 @@ async def test_get_active_top_miner_rows_filters_approved_current_competition(
 	rows = await get_active_top_miner_rows(
 		async_session,
 		now=now,
-		competition_id=1,
 	)
 
-	assert [(row.ss58, row.weight) for row in rows] == [("approved-current", 0.25)]
+	assert [(row.ss58, row.weight) for row in rows] == [
+		("approved-current", 0.25),
+		("approved-other-competition", 0.25),
+	]
 
 
 @pytest.mark.asyncio

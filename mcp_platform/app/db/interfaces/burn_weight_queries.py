@@ -29,12 +29,10 @@ async def get_active_top_miner_rows(
     db: AsyncSession,
     *,
     now: datetime,
-    competition_id: int,
 ):
     return (
         await db.execute(
             select(TopMiner.ss58, TopMiner.weight)
-            .where(TopMiner.competition_fk == competition_id)
             .where(TopMiner.approved.is_(True))
             .where(TopMiner.starts_at <= now)
             .where(TopMiner.ends_at >= now)
