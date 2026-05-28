@@ -12,12 +12,25 @@ MCP_PLATFORM_DIR = os.path.abspath(os.path.join(TESTS_DIR, ".."))
 if MCP_PLATFORM_DIR not in sys.path:
 	sys.path.insert(0, MCP_PLATFORM_DIR)
 
+os.environ.setdefault("PRIVATE_NETWORK_CIDRS", '["127.0.0.1/32"]')
+os.environ.setdefault("TRUSTED_PROXY_CIDRS", '["127.0.0.1/32"]')
+os.environ.setdefault("SANDBOX_SERVICE_URL", "http://sandbox.test")
+
 from app.db.interfaces.burn_weight_queries import (
 	delete_unapproved_competition_top_miner_rows,
 	get_active_top_miner_rows,
 )
+from app.api.routes.incentive_admin import (
+	GenerateIncentiveCandidatesRequest,
+	SetTopMinerApprovalRequest,
+	generate_incentive_candidates,
+	update_top_miner_approval,
+)
 from app.services.top_miner_approval import set_top_miner_approval
 from soma_shared.db.models.base import Base
+from soma_shared.db.models.competition import Competition
+from soma_shared.db.models.competition_config import CompetitionConfig
+from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.models.top_miner import TopMiner
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -73,6 +86,40 @@ def _top_miner_row(
 		ends_at=ends_at,
 		created_at=starts_at,
 	)
+
+
+async def _seed_competition_window(
+	async_session: AsyncSession,
+	*,
+	competition_id: int,
+	upload_starts_at: datetime,
+	upload_ends_at: datetime,
+	eval_starts_at: datetime,
+	eval_ends_at: datetime,
+) -> None:
+	competition = Competition(
+		id=competition_id,
+		competition_name=f"Competition {competition_id}",
+	)
+	competition_config = CompetitionConfig(
+		id=competition_id,
+		competition_fk=competition_id,
+		is_active=True,
+	)
+	competition_timeframe = CompetitionTimeframe(
+		id=competition_id,
+		competition_config_fk=competition_id,
+		upload_starts_at=upload_starts_at,
+		upload_ends_at=upload_ends_at,
+		eval_starts_at=eval_starts_at,
+		eval_ends_at=eval_ends_at,
+	)
+	async_session.add_all([
+		competition,
+		competition_config,
+		competition_timeframe,
+	])
+	await async_session.flush()
 
 
 @pytest.mark.asyncio
@@ -301,3 +348,176 @@ async def test_disapproving_active_approved_winner_invalidates_window_and_recomp
 	assert rows[1].approved is True
 	assert rows[2].ss58 == "replacement"
 	assert rows[2].approved is False
+
+
+@pytest.mark.asyncio
+async def test_incentive_admin_route_workflow_generates_then_approves_then_recomputes(
+	async_session: AsyncSession,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	now = datetime.now(timezone.utc).replace(microsecond=0)
+	upload_start = now - timedelta(days=2)
+	upload_end = now - timedelta(days=1)
+	eval_start = upload_end
+	eval_end = now - timedelta(hours=1)
+	payout_start = now - timedelta(minutes=5)
+	payout_end = now + timedelta(days=14)
+	await _seed_competition_window(
+		async_session,
+		competition_id=101,
+		upload_starts_at=upload_start,
+		upload_ends_at=upload_end,
+		eval_starts_at=eval_start,
+		eval_ends_at=eval_end,
+	)
+
+	async def fake_burn_state(*args, **kwargs):
+		return True, 0.4
+
+	async def fake_generate_candidates(
+		db: AsyncSession,
+		*,
+		competition_id: int,
+		burn_ratio: float,
+		starts_at: datetime,
+		ends_at: datetime,
+	) -> list[TopMiner]:
+		assert competition_id == 101
+		assert burn_ratio == 0.4
+		candidate = _top_miner_row(
+			50,
+			ss58="candidate-a",
+			competition_id=competition_id,
+			approved=False,
+			starts_at=starts_at,
+			ends_at=ends_at,
+		)
+		db.add(candidate)
+		await db.flush()
+		return [candidate]
+
+	monkeypatch.setattr(
+		"app.api.routes.incentive_admin._get_current_burn_state",
+		fake_burn_state,
+	)
+	monkeypatch.setattr(
+		"app.api.routes.incentive_admin.replace_competition_top_miner_candidates",
+		fake_generate_candidates,
+	)
+
+	generate_response = await generate_incentive_candidates(
+		101,
+		GenerateIncentiveCandidatesRequest(
+			starts_at=payout_start,
+			ends_at=payout_end,
+		),
+		db=async_session,
+	)
+
+	generated_row = await async_session.get(TopMiner, 50)
+	assert generate_response.competition_id == 101
+	assert generate_response.created_candidate_count == 1
+	assert generated_row is not None
+	assert generated_row.approved is False
+	assert _normalize_datetime(generate_response.starts_at) == payout_start
+	assert _normalize_datetime(generate_response.ends_at) == payout_end
+
+	approve_response = await update_top_miner_approval(
+		50,
+		SetTopMinerApprovalRequest(approved=True),
+		db=async_session,
+	)
+	approved_row = await async_session.get(TopMiner, 50)
+	assert approve_response.approved is True
+	assert approve_response.triggered_recompute is False
+	assert approved_row is not None
+	assert approved_row.approved is True
+
+	async def fake_burn_ratio(*args, **kwargs) -> float:
+		return 0.4
+
+	async def fake_recompute_candidates(
+		db: AsyncSession,
+		*,
+		competition_id: int,
+		burn_ratio: float,
+		starts_at: datetime,
+		ends_at: datetime,
+	) -> list[TopMiner]:
+		assert competition_id == 101
+		assert burn_ratio == 0.4
+		await delete_unapproved_competition_top_miner_rows(
+			db,
+			competition_id=competition_id,
+			starts_at=starts_at,
+			ends_at=ends_at,
+		)
+		fresh_candidate = _top_miner_row(
+			51,
+			ss58="candidate-b",
+			competition_id=competition_id,
+			approved=False,
+			starts_at=starts_at,
+			ends_at=ends_at,
+		)
+		fresh_candidate.weight = 0.6
+		db.add(fresh_candidate)
+		await db.flush()
+		return [fresh_candidate]
+
+	monkeypatch.setattr(
+		"app.services.top_miner_approval._get_current_burn_ratio",
+		fake_burn_ratio,
+	)
+	monkeypatch.setattr(
+		"app.services.top_miner_approval.replace_competition_top_miner_candidates",
+		fake_recompute_candidates,
+	)
+
+	disapprove_response = await update_top_miner_approval(
+		50,
+		SetTopMinerApprovalRequest(approved=False),
+		db=async_session,
+	)
+	rows = (
+		await async_session.execute(
+			select(TopMiner).where(TopMiner.competition_fk == 101).order_by(TopMiner.id.asc())
+		)
+	).scalars().all()
+
+	assert disapprove_response.approved is False
+	assert disapprove_response.triggered_recompute is True
+	assert disapprove_response.invalidated_row_count == 1
+	assert disapprove_response.created_candidate_count == 1
+	assert [row.id for row in rows] == [51]
+	assert rows[0].ss58 == "candidate-b"
+	assert rows[0].approved is False
+
+
+@pytest.mark.asyncio
+async def test_incentive_admin_route_rejects_generation_before_evaluation_end(
+	async_session: AsyncSession,
+) -> None:
+	now = datetime.now(timezone.utc).replace(microsecond=0)
+	await _seed_competition_window(
+		async_session,
+		competition_id=202,
+		upload_starts_at=now - timedelta(days=1),
+		upload_ends_at=now + timedelta(hours=1),
+		eval_starts_at=now + timedelta(hours=1),
+		eval_ends_at=now + timedelta(days=2),
+	)
+
+	with pytest.raises(Exception) as exc_info:
+		await generate_incentive_candidates(
+			202,
+			GenerateIncentiveCandidatesRequest(
+				starts_at=now + timedelta(days=3),
+				ends_at=now + timedelta(days=17),
+			),
+			db=async_session,
+		)
+
+	exc = exc_info.value
+	assert getattr(exc, "status_code", None) == 409
+	assert "evaluation has not ended yet" in str(getattr(exc, "detail", exc)).lower()

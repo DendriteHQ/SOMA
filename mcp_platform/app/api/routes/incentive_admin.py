@@ -48,7 +48,6 @@ router = APIRouter(
     dependencies=[Depends(_require_private_network)],
 )
 
-
 def _normalize_utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -73,28 +72,23 @@ async def _resolve_top_miner_window(
     starts_at: datetime | None,
     ends_at: datetime | None,
 ) -> tuple[datetime, datetime]:
+    current_now = datetime.now(timezone.utc)
+
     if (starts_at is None) != (ends_at is None):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="starts_at and ends_at must be provided together",
         )
-
-    if starts_at is not None and ends_at is not None:
-        normalized_starts_at = _normalize_utc_datetime(starts_at)
-        normalized_ends_at = _normalize_utc_datetime(ends_at)
-        if normalized_starts_at >= normalized_ends_at:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="starts_at must be before ends_at",
-            )
-        return normalized_starts_at, normalized_ends_at
+    if starts_at is None or ends_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="starts_at and ends_at are required",
+        )
 
     timeframe_row = (
         await db.execute(
             select(
-                CompetitionTimeframe.upload_starts_at,
                 CompetitionTimeframe.eval_ends_at,
-                CompetitionTimeframe.upload_ends_at,
             )
             .join(
                 CompetitionConfig,
@@ -111,16 +105,22 @@ async def _resolve_top_miner_window(
             detail="Competition timeframe not found",
         )
 
-    normalized_starts_at = _normalize_utc_datetime(timeframe_row.upload_starts_at)
-    normalized_ends_at = _normalize_utc_datetime(
-        timeframe_row.eval_ends_at or timeframe_row.upload_ends_at
-    )
-    if normalized_starts_at >= normalized_ends_at:
+    normalized_eval_ends_at = _normalize_utc_datetime(timeframe_row.eval_ends_at)
+    if current_now < normalized_eval_ends_at:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Competition timeframe is invalid for top miner window",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Competition evaluation has not ended yet",
         )
-    return normalized_starts_at, normalized_ends_at
+
+    if starts_at is not None and ends_at is not None:
+        normalized_starts_at = _normalize_utc_datetime(starts_at)
+        normalized_ends_at = _normalize_utc_datetime(ends_at)
+        if normalized_starts_at >= normalized_ends_at:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="starts_at must be before ends_at",
+            )
+        return normalized_starts_at, normalized_ends_at
 
 
 @router.post(
