@@ -45,6 +45,8 @@ PLUGIN_VENV_DIRNAME = ".soma-openclaw-venv"
 PLUGIN_BACKEND_FILENAME = "base_miner.py"
 PLUGIN_COPY_IGNORE_NAMES = {".git", PLUGIN_VENV_DIRNAME}
 TIKTOKEN_CACHE_DIRNAME = "tiktoken-cache"
+COMPRESSION_SERVICE_IMAGE_NAME = "soma-compression-service:latest"
+COMPRESSION_SERVICE_CONTEXT_DIRNAME = "compression_service"
 TIKTOKEN_CL100K_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 TIKTOKEN_CL100K_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
 BENCHMARK_PACKAGE_NAME = "soma_bench"
@@ -129,6 +131,46 @@ def _docker_connect_network(name: str, container_name: str, *, alias: str | None
 
 def _docker_remove_network(name: str) -> None:
     _run_command(["docker", "network", "rm", name])
+
+
+def _docker_image_exists(name: str) -> bool:
+    result = _run_command(["docker", "image", "inspect", name])
+    return result.returncode == 0
+
+
+def _resolve_compression_service_context() -> Path:
+    configured = os.getenv("COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT", "").strip()
+    if configured:
+        path = Path(configured).expanduser().resolve()
+    else:
+        path = (Path(__file__).resolve().parents[1] / COMPRESSION_SERVICE_CONTEXT_DIRNAME).resolve()
+    if not path.is_dir():
+        raise RuntimeError(f"Compression service build context not found: {path}")
+    return path
+
+
+def _get_compression_service_image_name() -> str:
+    return os.getenv("COMPACT_BENCH_COMPRESSION_SERVICE_IMAGE", COMPRESSION_SERVICE_IMAGE_NAME).strip() or COMPRESSION_SERVICE_IMAGE_NAME
+
+
+def _build_compression_service_image() -> None:
+    image_name = _get_compression_service_image_name()
+    if _docker_image_exists(image_name):
+        logger.info("Compression service image already exists: %s", image_name)
+        return
+    context_path = _resolve_compression_service_context()
+    logger.info(
+        "Building compression service Docker image: name=%s context=%s",
+        image_name,
+        context_path,
+    )
+    result = _run_command(["docker", "build", "-t", image_name, str(context_path)])
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"Failed to build compression service Docker image {image_name!r}: {message}")
+    if not _docker_image_exists(image_name):
+        raise RuntimeError(f"Compression service Docker image not found after build: {image_name}")
+    logger.info("Compression service Docker image built successfully: %s", image_name)
 
 
 def _build_proxy_container_name() -> str:
@@ -306,6 +348,13 @@ class CompactBenchExecutor:
         self._plugin_repository_url = _resolve_plugin_repository_url()
 
         self._ensure_benchmark_installed()
+        _build_compression_service_image()
+
+        if importlib.util.find_spec("soma_compact_bench") is None:
+            raise RuntimeError(
+                "The 'soma_compact_bench' package is not installed in the sandbox-service environment. "
+                "Install dependencies from requirements.txt before starting the service."
+            )
 
     def execute_task(
         self,
@@ -339,6 +388,7 @@ class CompactBenchExecutor:
         command = self._build_command(task=task, output_dir=output_dir, plugin_path=plugin_path)
         env = os.environ.copy()
         llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
+        proxy_handle: NginxProxyHandle | None = None
         if llm_base_url:
             logger.info(
                 "Ensuring benchmark LLM proxy: run_id=%s upstream_host=%s",
@@ -354,6 +404,9 @@ class CompactBenchExecutor:
                 proxy_handle.proxy_base_url,
                 proxy_handle.private_network_name,
             )
+        env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
+        env["SOMA_OPENCLAW_PLUGIN_PATH"] = str(plugin_path)
+
         effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
         timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
         started_at = time.monotonic()
