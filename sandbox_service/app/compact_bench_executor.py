@@ -612,12 +612,6 @@ class CompactBenchExecutor:
                 )
             return checkout_path
 
-        pull = _run_command(["git", "-C", str(checkout_path), "pull", "--ff-only"])
-        if pull.returncode != 0:
-            raise RuntimeError(
-                "Failed to update SOMA-plugin repository for sandbox-service: "
-                f"{(pull.stderr or pull.stdout or '').strip()}"
-            )
         return checkout_path
 
     def _build_command(
