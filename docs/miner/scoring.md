@@ -2,6 +2,13 @@
 
 This document explains how SWE miner scores are computed. This logic is implemented in `mcp_platform/app/api/routes/scoring.py`.
 
+The scoring has two layers:
+
+1. A raw score is computed from the currently implemented per-run baseline comparison formula.
+2. The final miner total score is obtained by applying a smooth miner-level multiplier based on total token savings across the whole miner dataset.
+
+## 1. Raw Run Score
+
 1. Every miner run is compared against baseline runs of the same task. Each comparison uses:
 
 $$
@@ -17,31 +24,31 @@ where:
 2. If either token count is missing, non-positive, or otherwise invalid, the token component is treated as `0`.
 
 3. The base score and the coefficient $\lambda$ depend on the pass/fail outcome
-   of the baseline run and the miner run:
+of the baseline run and the miner run:
 
-   a. If the baseline run passes and the miner run passes:
+Case A: the baseline run passes and the miner run passes.
 
-      $$
-      Score(T_{type}) = 1.0, \qquad \lambda(T_{type}) = 0.5
-      $$
+$$
+Score(T_{type}) = 1.0, \qquad \lambda(T_{type}) = 0.5
+$$
 
-   b. If the baseline run passes and the miner run fails:
+Case B: the baseline run passes and the miner run fails.
 
-      $$
-      Score(T_{type}) = -4.0, \qquad \lambda(T_{type}) = 0.0
-      $$
+$$
+Score(T_{type}) = -4.0, \qquad \lambda(T_{type}) = 0.0
+$$
 
-   c. If the baseline run fails and the miner run passes:
+Case C: the baseline run fails and the miner run passes.
 
-      $$
-      Score(T_{type}) = 4.0, \qquad \lambda(T_{type}) = 0.5
-      $$
+$$
+Score(T_{type}) = 4.0, \qquad \lambda(T_{type}) = 0.5
+$$
 
-   d. If the baseline run fails and the miner run fails:
+Case D: the baseline run fails and the miner run fails.
 
-      $$
-      Score(T_{type}) = 0.0, \qquad \lambda(T_{type}) = 0.1
-      $$
+$$
+Score(T_{type}) = 0.0, \qquad \lambda(T_{type}) = 0.1
+$$
 
 4. If either the baseline validation result or the miner validation result is unknown, that baseline-miner comparison does not contribute to the score.
 
@@ -61,18 +68,63 @@ $$
 
 where $M_t$ is the number of scored miner runs for task $t$.
 
-7. The miner total score is the arithmetic average of all valid run scores across all tasks, including screener tasks:
+7. The miner raw total score is the arithmetic average of all valid run scores across all tasks, including screener tasks:
 
 $$
-TotalScore(m)=\frac{1}{K_m}\sum_{r \in AllRuns(m)}RunScore(r)
+RawTotalScore(m)=\frac{1}{K_m}\sum_{r \in AllRuns(m)}RunScore(r)
 $$
 
 where $K_m$ is the number of all scored runs of miner $m$.
 
-8. The miner screener score is computed separately, using only screener tasks:
+8. The miner raw screener score is computed separately, using only screener tasks:
 
 $$
-ScreenerScore(m)=\frac{1}{S_m}\sum_{r \in ScreenerRuns(m)}RunScore(r)
+RawScreenerScore(m)=\frac{1}{S_m}\sum_{r \in ScreenerRuns(m)}RunScore(r)
 $$
 
 where $S_m$ is the number of scored screener runs of miner $m$.
+
+## 2. Miner-Level Token Savings Multiplier
+
+1. After the raw score is computed, a miner-level multiplier is applied to the miner total score using the miner's total token usage across the whole dataset. This is intended as a smooth prevention mechanism against no-compression approaches and against solutions that use additional tokens instead of reducing them:
+
+$$
+s = 1 - \frac{Tok_C}{Tok_B}
+$$
+
+where:
+
+- $Tok_C$ is the total number of tokens over all compressed runs by that miner,
+- $Tok_B$ is the total number of tokens over all baseline runs for the same miner dataset slice.
+
+2. The savings ratio is then normalized and clamped:
+
+$$
+x = \min\left(1, \max\left(\frac{s + 0.20}{0.40}, 0\right)\right)
+$$
+
+3. The smooth multiplier is:
+
+$$
+m(s) = -2x^3 + 3x^2
+$$
+
+4. This gives the intended behavior:
+
+- if the miner saves at least $20\%$, then $m(s)=1$ and the raw score is unchanged,
+- if the miner increases token usage by at least $20\%$, then $m(s)=0$ and the final score becomes $-4$,
+- between those points, the score is adjusted smoothly toward $-4$.
+
+5. The final total score is:
+
+$$
+FinalTotalScore(m) = -4 + (RawTotalScore(m) + 4) \cdot m(s)
+$$
+
+6. The screener score is not adjusted by this penalty. Screener tasks still contribute to $RawTotalScore(m)$ through the normal raw-score averaging, but the separate screener score remains:
+
+$$
+ScreenerScore(m) = RawScreenerScore(m)
+$$
+
+7. If the aggregate token totals are missing or invalid, the multiplier defaults to $1$ and the raw total score is left unchanged.

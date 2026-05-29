@@ -46,6 +46,43 @@ def trim_token_ratio(tokens_without_compression: int | None, tokens_with_compres
     return max(-2.0, min(2.0, log(ratio)))
 
 
+def compute_miner_token_savings_ratio(
+    total_baseline_tokens: int | float | None,
+    total_compressed_tokens: int | float | None,
+) -> float | None:
+    if total_baseline_tokens is None or total_compressed_tokens is None:
+        return None
+    if total_baseline_tokens <= 0 or total_compressed_tokens <= 0:
+        return None
+
+    return 1.0 - (float(total_compressed_tokens) / float(total_baseline_tokens))
+
+
+def compute_miner_score_multiplier(savings_ratio: float | None) -> float:
+    if savings_ratio is None:
+        return 1.0
+
+    normalized_ratio = max(0.0, min(1.0, (savings_ratio + 0.20) / 0.40))
+    return (-2.0 * (normalized_ratio ** 3)) + (3.0 * (normalized_ratio ** 2))
+
+
+def adjust_miner_score_with_token_savings(
+    raw_score: float | None,
+    *,
+    total_baseline_tokens: int | float | None,
+    total_compressed_tokens: int | float | None,
+) -> float | None:
+    if raw_score is None:
+        return None
+
+    savings_ratio = compute_miner_token_savings_ratio(
+        total_baseline_tokens,
+        total_compressed_tokens,
+    )
+    multiplier = compute_miner_score_multiplier(savings_ratio)
+    return -4.0 + ((raw_score + 4.0) * multiplier)
+
+
 def base_swe_score(
     pass_without_compression: bool | None,
     pass_with_compression: bool | None,
@@ -191,6 +228,10 @@ def build_swe_miner_scores(
 ) -> tuple[float | None, float | None]:
     total_run_scores: list[float] = []
     screener_run_scores: list[float] = []
+    total_baseline_tokens = 0
+    total_compressed_tokens = 0
+    has_baseline_tokens = False
+    has_compressed_tokens = False
 
     for group in task_groups.values():
         run_scores = [
@@ -202,10 +243,34 @@ def build_swe_miner_scores(
         if bool(group["is_screener"]):
             screener_run_scores.extend(run_scores)
 
-    total_score = sum(total_run_scores) / len(total_run_scores) if total_run_scores else None
-    screener_score = (
+        for baseline in group["baseline_runs"].values():
+            baseline_tokens = baseline["tokens_used"]
+            if baseline_tokens is None or baseline_tokens <= 0:
+                continue
+            total_baseline_tokens += int(baseline_tokens)
+            has_baseline_tokens = True
+
+        for run in group["runs"]:
+            compressed_tokens = run["tokens_with_compression"]
+            if compressed_tokens is None or compressed_tokens <= 0:
+                continue
+            total_compressed_tokens += int(compressed_tokens)
+            has_compressed_tokens = True
+
+    raw_total_score = sum(total_run_scores) / len(total_run_scores) if total_run_scores else None
+    raw_screener_score = (
         sum(screener_run_scores) / len(screener_run_scores)
         if screener_run_scores
         else None
     )
+
+    baseline_token_total = total_baseline_tokens if has_baseline_tokens else None
+    compressed_token_total = total_compressed_tokens if has_compressed_tokens else None
+
+    total_score = adjust_miner_score_with_token_savings(
+        raw_total_score,
+        total_baseline_tokens=baseline_token_total,
+        total_compressed_tokens=compressed_token_total,
+    )
+    screener_score = raw_screener_score
     return total_score, screener_score
