@@ -4,8 +4,8 @@ This document explains how SWE miner scores are computed. This logic is implemen
 
 The scoring has two layers:
 
-1. A raw score is computed from the currently implemented per-run baseline comparison formula.
-2. The final miner total score is obtained by applying a smooth miner-level multiplier based on total token savings across the whole miner dataset.
+1. A raw score is computed from the current run-vs-baseline formula.
+2. The final total score adds one extra multiplier based on total token savings.
 
 ## 1. Raw Run Score
 
@@ -86,7 +86,7 @@ where $S_m$ is the number of scored screener runs of miner $m$.
 
 ## 2. Miner-Level Token Savings Multiplier
 
-1. After the raw score is computed, a miner-level multiplier is applied to the miner total score using the miner's total token usage across the whole dataset. This is intended as a smooth prevention mechanism against no-compression approaches and against solutions that use additional tokens instead of reducing them:
+1. After the raw total score is computed, one extra multiplier is applied from the miner's total token usage across the whole dataset. This is meant to penalize miners who do not compress, or who use more tokens than the baseline:
 
 $$
 s = 1 - \frac{Tok_C}{Tok_B}
@@ -109,9 +109,9 @@ $$
 m(s) = -2x^3 + 3x^2
 $$
 
-4. This gives the intended behavior:
+4. This means:
 
-- if the miner saves at least $20\%$, then $m(s)=1$ and the raw score is unchanged,
+- if the miner saves at least $20\%$, then $m(s)=1$ and the raw total score stays the same,
 - if the miner increases token usage by at least $20\%$, then $m(s)=0$ and the final score becomes $-4$,
 - between those points, the score is adjusted smoothly toward $-4$.
 
@@ -121,10 +121,10 @@ $$
 FinalTotalScore(m) = -4 + (RawTotalScore(m) + 4) \cdot m(s)
 $$
 
-6. The screener score is not adjusted by this penalty. Screener tasks still contribute to $RawTotalScore(m)$ through the normal raw-score averaging, but the separate screener score remains:
+6. The screener score is not changed by this penalty. Screener tasks still count inside $RawTotalScore(m)$, but the separate screener score remains:
 
 $$
 ScreenerScore(m) = RawScreenerScore(m)
 $$
 
-7. If the aggregate token totals are missing or invalid, the multiplier defaults to $1$ and the raw total score is left unchanged.
+7. If the token totals are missing or invalid, the multiplier is $1$, so the raw total score stays unchanged.
