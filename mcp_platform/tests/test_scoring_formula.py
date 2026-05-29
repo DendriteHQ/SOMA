@@ -54,30 +54,69 @@ def test_adjusted_score_respects_requested_endpoints():
     assert abs(scoring.compute_miner_score_multiplier(-0.2) - 0.0) < 1e-9
     assert abs(scoring.compute_miner_score_multiplier(0.0) - 0.5) < 1e-9
     assert abs(scoring.compute_miner_score_multiplier(0.2) - 1.0) < 1e-9
+    assert abs(scoring.compute_miner_score_multiplier(-0.5) - 0.0) < 1e-9
+    assert abs(scoring.compute_miner_score_multiplier(0.5) - 1.0) < 1e-9
 
     assert abs(
         scoring.adjust_miner_score_with_token_savings(
-        2.0,
-        total_baseline_tokens=100,
-        total_compressed_tokens=80,
-    )
+            2.0,
+            total_baseline_tokens=100,
+            total_compressed_tokens=80,
+        )
         - 2.0
     ) < 1e-9
     assert abs(
         scoring.adjust_miner_score_with_token_savings(
-        2.0,
-        total_baseline_tokens=100,
-        total_compressed_tokens=120,
-    )
+            2.0,
+            total_baseline_tokens=100,
+            total_compressed_tokens=120,
+        )
         + 4.0
     ) < 1e-9
     assert abs(
         scoring.adjust_miner_score_with_token_savings(
-        2.0,
-        total_baseline_tokens=100,
-        total_compressed_tokens=100,
-    )
+            2.0,
+            total_baseline_tokens=100,
+            total_compressed_tokens=100,
+        )
         + 1.0
+    ) < 1e-9
+
+
+def test_adjusted_score_keeps_raw_score_when_token_totals_are_invalid():
+    scoring = _load_scoring_module()
+
+    assert abs(
+        scoring.adjust_miner_score_with_token_savings(
+            1.5,
+            total_baseline_tokens=None,
+            total_compressed_tokens=80,
+        )
+        - 1.5
+    ) < 1e-9
+    assert abs(
+        scoring.adjust_miner_score_with_token_savings(
+            1.5,
+            total_baseline_tokens=100,
+            total_compressed_tokens=None,
+        )
+        - 1.5
+    ) < 1e-9
+    assert abs(
+        scoring.adjust_miner_score_with_token_savings(
+            1.5,
+            total_baseline_tokens=0,
+            total_compressed_tokens=80,
+        )
+        - 1.5
+    ) < 1e-9
+    assert abs(
+        scoring.adjust_miner_score_with_token_savings(
+            1.5,
+            total_baseline_tokens=100,
+            total_compressed_tokens=0,
+        )
+        - 1.5
     ) < 1e-9
 
 
@@ -110,4 +149,26 @@ def test_build_swe_miner_scores_applies_global_token_multiplier():
     total_score, screener_score = scoring.build_swe_miner_scores(task_groups)
 
     assert abs(total_score + 1.5) < 1e-9
+    assert abs(screener_score - 2.0) < 1e-9
+
+
+def test_build_swe_miner_scores_leaves_total_raw_when_tokens_are_missing():
+    scoring = _load_scoring_module()
+
+    task_groups = {
+        "task-a": {
+            "is_screener": True,
+            "baseline_runs": {1: {"tokens_used": None}},
+            "runs": [{"platform_score": 2.0, "tokens_with_compression": 80}],
+        },
+        "task-b": {
+            "is_screener": False,
+            "baseline_runs": {2: {"tokens_used": 100}},
+            "runs": [{"platform_score": 0.0, "tokens_with_compression": None}],
+        },
+    }
+
+    total_score, screener_score = scoring.build_swe_miner_scores(task_groups)
+
+    assert abs(total_score - 1.0) < 1e-9
     assert abs(screener_score - 2.0) < 1e-9
