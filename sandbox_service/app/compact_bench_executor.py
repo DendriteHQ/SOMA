@@ -385,7 +385,16 @@ class CompactBenchExecutor:
             task.run_id,
             plugin_path,
         )
-        command = self._build_command(task=task, output_dir=output_dir, plugin_path=plugin_path)
+        effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
+        timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
+        openclaw_agent_timeout_seconds = int(timeout) if timeout is not None else None
+
+        command = self._build_command(
+            task=task,
+            output_dir=output_dir,
+            plugin_path=plugin_path,
+            openclaw_agent_timeout_seconds=openclaw_agent_timeout_seconds,
+        )
         env = os.environ.copy()
         llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
         proxy_handle: NginxProxyHandle | None = None
@@ -407,8 +416,6 @@ class CompactBenchExecutor:
         env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
         env["SOMA_OPENCLAW_PLUGIN_PATH"] = str(plugin_path)
 
-        effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
-        timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
         started_at = time.monotonic()
         logger.info(
             "Starting benchmark solve command: run_id=%s timeout_seconds=%s command=%s",
@@ -620,6 +627,7 @@ class CompactBenchExecutor:
         task: CompactBenchRunTaskRequest,
         output_dir: Path,
         plugin_path: Path,
+        openclaw_agent_timeout_seconds: int | None = None,
     ) -> list[str]:
         # TODO: define the executable command and runtime flags directly in this service
         # instead of passing command-shaping inputs through the payload contract.
@@ -649,6 +657,8 @@ class CompactBenchExecutor:
             )
             if not task.openclaw_disable_somarizer:
                 command.extend(["--openclaw-plugin-path", str(plugin_path)])
+            if openclaw_agent_timeout_seconds is not None:
+                command.extend(["--openclaw-command", f"--timeout {openclaw_agent_timeout_seconds}"])
         if task.model:
             command.extend(["--model", task.model])
         if task.openclaw_disable_somarizer:
