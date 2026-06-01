@@ -121,14 +121,16 @@ def compute_swe_run_score(
     )
 
 
-def build_swe_task_groups(rows: list[Any]) -> dict[str, dict[str, object]]:
-    tasks: dict[str, dict[str, object]] = {}
+def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
+    tasks: dict[int, dict[str, object]] = {}
 
     for row in rows:
+        task_id = int(row.task_id)
         task_name = str(row.task_name)
         group = tasks.setdefault(
-            task_name,
+            task_id,
             {
+                "task_id": task_id,
                 "task_name": task_name,
                 "is_screener": bool(row.is_screener),
                 "hotkey": str(row.hotkey),
@@ -204,6 +206,7 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
     ]
 
     return SweMinerTaskResultItem(
+        task_id=int(group["task_id"]),
         task_name=str(group["task_name"]),
         is_screener=bool(group["is_screener"]),
         pass_without_compression=group["baseline_pass_without_compression"],
@@ -224,7 +227,7 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
 
 
 def build_swe_miner_scores(
-    task_groups: dict[str, dict[str, object]],
+    task_groups: dict[int, dict[str, object]],
 ) -> tuple[float | None, float | None]:
     total_run_scores: list[float] = []
     screener_run_scores: list[float] = []

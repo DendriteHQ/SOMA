@@ -12,6 +12,7 @@ def _load_scoring_module():
 
     @dataclass
     class SweMinerTaskResultItem:
+        task_id: int
         task_name: str
         is_screener: bool
         pass_without_compression: bool | None

@@ -380,7 +380,7 @@ async def _fetch_swe_rows(
     *,
     comp_id: int,
     hotkey: str | None = None,
-    task_name: str | None = None,
+    task_id: int | None = None,
 ) -> list[sa.Row]:
     baseline_runs = SWE_BENCH_RUNS.alias("baseline_runs")
     baseline_validations = SWE_BENCH_RUN_VALIDATIONS.alias("baseline_validations")
@@ -438,8 +438,8 @@ async def _fetch_swe_rows(
 
     if hotkey is not None:
         query = query.where(Miner.ss58 == hotkey)
-    if task_name is not None:
-        query = query.where(SWE_BENCH_TASKS.c.instance_id == task_name)
+    if task_id is not None:
+        query = query.where(SWE_BENCH_TASKS.c.id == task_id)
 
     try:
         result = await db.execute(query)
@@ -449,7 +449,7 @@ async def _fetch_swe_rows(
             extra={
                 "competition_id": comp_id,
                 "hotkey": hotkey,
-                "task_name": task_name,
+                "task_id": task_id,
             },
             exc_info=exc,
         )
@@ -459,6 +459,26 @@ async def _fetch_swe_rows(
         ) from exc
 
     return list(result)
+
+
+async def _resolve_swe_task_id(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    task_name: str,
+) -> int:
+    task_id = await db.scalar(
+        select(SWE_BENCH_TASKS.c.id)
+        .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+        .where(SWE_BENCH_TASKS.c.instance_id == task_name)
+        .limit(1)
+    )
+    if task_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        )
+    return int(task_id)
 
 
 def _required_screener_task_passes(total_screener_tasks: int) -> int:
@@ -2046,7 +2066,7 @@ async def get_swe_miner_task_results(
         )
         for group in task_groups.values()
     ]
-    tasks.sort(key=lambda item: item.task_name)
+    tasks.sort(key=lambda item: item.task_id)
 
     return SweMinerTaskResultsResponse(tasks=tasks, total=len(tasks))
 
@@ -2071,7 +2091,8 @@ async def get_swe_miner_task_result(
         eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
-    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_name=task_name)
+    task_id = await _resolve_swe_task_id(db, comp_id=comp_id, task_name=task_name)
+    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2079,7 +2100,7 @@ async def get_swe_miner_task_result(
         )
 
     task_groups = build_swe_task_groups(rows)
-    task_group = task_groups.get(task_name)
+    task_group = task_groups.get(task_id)
     if task_group is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2119,7 +2140,8 @@ async def get_swe_miner_task_runs(
         eval_ends_at = eval_ends_at.replace(tzinfo=timezone.utc)
     competition_finished = eval_ends_at is not None and datetime.now(timezone.utc) >= eval_ends_at
 
-    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_name=task_name)
+    task_id = await _resolve_swe_task_id(db, comp_id=comp_id, task_name=task_name)
+    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey, task_id=task_id)
     if not rows:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2127,7 +2149,7 @@ async def get_swe_miner_task_runs(
         )
 
     task_groups = build_swe_task_groups(rows)
-    task_group = task_groups.get(task_name)
+    task_group = task_groups.get(task_id)
     if task_group is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2140,7 +2162,12 @@ async def get_swe_miner_task_runs(
     )
 
     return SweMinerTaskRunsResponse(
-        task_name=task_name if competition_finished else TEXT_HIDDEN_PLACEHOLDER,
+        task_id=int(task_group["task_id"]),
+        task_name=(
+            str(task_group["task_name"])
+            if competition_finished
+            else TEXT_HIDDEN_PLACEHOLDER
+        ),
         is_screener=bool(task_group["is_screener"]),
         pass_without_compression=task_group["baseline_pass_without_compression"],
         tokens_without_compression=(
