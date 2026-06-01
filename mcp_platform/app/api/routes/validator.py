@@ -185,7 +185,7 @@ async def _collect_top_screener_uids(
 ) -> tuple[list[int], list[int], list[int]]:
     min_resolved = max(
         1,
-        int(getattr(settings, "screener_min_resolved", 4)),
+        settings.screener_min_resolved,
     )
     previous_competition_grace_hours = max(
         0.0,

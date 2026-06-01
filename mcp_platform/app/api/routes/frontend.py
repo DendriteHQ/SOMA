@@ -79,6 +79,12 @@ from app.api.routes.scoring import (
     build_swe_task_groups,
     build_swe_task_result_item,
 )
+from app.services.swe_difficulty_calculator import (
+    build_baseline_task_data,
+    build_miner_category_scores,
+    derive_task_difficulties,
+)
+from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.api.routes.utils import (
     _get_current_burn_state,
     _require_private_network,
@@ -1901,14 +1907,25 @@ async def list_swe_miners_by_competition(
     for row in rows:
         miner_rows.setdefault(str(row.hotkey), []).append(row)
 
+    min_resolved = settings.screener_min_resolved
+    eligible_hotkeys = set(
+        await fetch_swebench_eligible_ss58_for_competition(
+            db, competition_id=comp_id, min_resolved=min_resolved
+        )
+    )
+
+    task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
+    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
+
     grouped: dict[str, dict[str, object]] = {}
     for hotkey, task_rows in miner_rows.items():
         task_groups = build_swe_task_groups(task_rows)
-        total_score, screener_score = build_swe_miner_scores(task_groups)
+        total_score, _ = build_swe_miner_scores(task_groups)
         grouped[hotkey] = {
             "hotkey": hotkey,
             "total_score": total_score,
-            "screener_score": screener_score,
+            "screener_passed": hotkey in eligible_hotkeys,
+            "category_scores": miner_category_scores.get(hotkey),
         }
 
     sorted_miners = sorted(
@@ -1916,7 +1933,7 @@ async def list_swe_miners_by_competition(
         key=lambda item: (
             item["total_score"] is None,
             -(item["total_score"] or 0.0),
-            -(item["screener_score"] or 0.0),
+            not item["screener_passed"],
             item["hotkey"],
         ),
     )
@@ -1931,7 +1948,8 @@ async def list_swe_miners_by_competition(
             SweMinerLeaderboardItem(
                 hotkey=str(item["hotkey"]),
                 total_score=item["total_score"],
-                screener_score=item["screener_score"],
+                screener_passed=bool(item["screener_passed"]),
+                category_scores=item["category_scores"] or None,
             )
             for item in selected_miners
         ],
@@ -1964,13 +1982,25 @@ async def get_swe_miner_by_competition(
 
     task_groups = build_swe_task_groups(rows)
     task_items = [build_swe_task_result_item(group) for group in task_groups.values()]
-    total_score, screener_score = build_swe_miner_scores(task_groups)
+    total_score, _ = build_swe_miner_scores(task_groups)
+
+    task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
+    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
+    category_scores = miner_category_scores.get(hotkey) or None
+
+    min_resolved = settings.screener_min_resolved
+    eligible_hotkeys = set(
+        await fetch_swebench_eligible_ss58_for_competition(
+            db, competition_id=comp_id, min_resolved=min_resolved
+        )
+    )
 
     return SweMinerSummaryResponse(
         miner=SweMinerSummary(
             hotkey=hotkey,
             total_score=total_score,
-            screener_score=screener_score,
+            screener_passed=hotkey in eligible_hotkeys,
+            category_scores=category_scores,
             task_count=len(task_items),
             screener_task_count=sum(1 for item in task_items if item.is_screener),
         )
