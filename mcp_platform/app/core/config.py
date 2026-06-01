@@ -94,6 +94,10 @@ class Settings(BaseSettings):
         alias="SCREENER_EXTRA_SCORE_POINTS",
     )
 
+    screener_min_resolved: int = Field(
+        default=4,
+        alias="SCREENER_MIN_RESOLVED",
+    )
     screener_weight_per_miner: float = Field(
         default=0.00002,
         alias="SCREENER_WEIGHT_PER_MINER",
