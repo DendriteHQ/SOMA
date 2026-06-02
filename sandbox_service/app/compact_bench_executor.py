@@ -281,6 +281,7 @@ def _get_miner_download_timeout() -> float:
 
 
 def _copy_plugin_template_checkout(*, template_path: Path, plugin_path: Path) -> None:
+    """Deprecated: use CompactBenchExecutor._write_plugin_template() instead."""
     for child in template_path.iterdir():
         if child.name in PLUGIN_COPY_IGNORE_NAMES:
             continue
@@ -373,6 +374,27 @@ class CompactBenchExecutor:
                 "The 'soma_bench' package is not installed in the sandbox-service environment. "
                 "Install dependencies from requirements.txt before starting the service."
             )
+
+        self._preload_plugin_template()
+
+    def _preload_plugin_template(self) -> None:
+        template = self._ensure_plugin_template_checkout()
+        self._plugin_template_cache: dict[str, bytes] = {}
+        total_bytes = 0
+        for f in template.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(template)
+            if any(part in PLUGIN_COPY_IGNORE_NAMES for part in rel.parts):
+                continue
+            data = f.read_bytes()
+            self._plugin_template_cache[str(rel)] = data
+            total_bytes += len(data)
+        logger.info(
+            "Preloaded plugin template into memory: files=%s total_bytes=%s",
+            len(self._plugin_template_cache),
+            total_bytes,
+        )
 
     def _maybe_cleanup_stale_output_dirs(self, *, force: bool = False) -> None:
         retention_seconds = _coerce_positive_int(
@@ -733,17 +755,21 @@ class CompactBenchExecutor:
             command.append("--openclaw-disable-plugin")
         return command
 
+    def _write_plugin_template(self, plugin_path: Path) -> None:
+        for rel, data in self._plugin_template_cache.items():
+            dest = plugin_path / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+
     def _materialize_plugin_checkout(self, *, output_dir: Path, script_presigned_url: str) -> Path:
-        template_path = self._ensure_plugin_template_checkout()
         plugin_path = output_dir / "soma-miner-plugin"
         plugin_path.mkdir(parents=True, exist_ok=True)
         logger.info(
-            "Materializing plugin checkout from git: output_dir=%s template_path=%s",
+            "Materializing plugin checkout from preloaded template: output_dir=%s",
             output_dir,
-            template_path,
         )
 
-        _copy_plugin_template_checkout(template_path=template_path, plugin_path=plugin_path)
+        self._write_plugin_template(plugin_path)
 
         miner_code = _download_miner_code(script_presigned_url)
         (plugin_path / PLUGIN_BACKEND_FILENAME).write_text(miner_code, encoding="utf-8")
