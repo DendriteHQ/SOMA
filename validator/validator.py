@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 import os
+import threading
 
 ROOT = Path(__file__).resolve().parent.parent
 MCP_PLATFORM_DIR = ROOT / "mcp_platform"
@@ -59,6 +60,12 @@ class Validator(AbstractValidator):
         self.settings = self.init_settings()
         self._last_fetch_cause = "unknown"
         self._provider_degraded_until = 0.0
+        self._state_lock = threading.Lock()
+        self._current_competition_id = self._load_competition_state()
+        self._pending_competition_id: int | None = None
+        self._active_evaluations = 0
+        self._cleanup_in_progress = False
+        self._cleanup_task: asyncio.Task | None = None
         self.evaluator = Evaluator(settings=self.settings)
         self.weight_setter = WeightSetter(
             netuid=self.settings.netuid, subtensor=self.settings.subtensor
@@ -75,6 +82,100 @@ class Validator(AbstractValidator):
     @staticmethod
     def _platform_endpoint(base_url: str, path: str) -> str:
         return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+    def _competition_state_path(self) -> Path:
+        return Path(self.settings.swebench_competition_state_file)
+
+    def _load_competition_state(self) -> int | None:
+        path = self._competition_state_path()
+        try:
+            if not path.exists():
+                return None
+            raw = json.loads(path.read_text())
+            competition_id = raw.get("competition_id")
+            if competition_id is None:
+                return None
+            return int(competition_id)
+        except Exception:
+            logging.warning(
+                "Failed to load competition state file",
+                extra={"path": str(path)},
+                exc_info=True,
+            )
+            return None
+
+    def _write_competition_state(self, competition_id: int) -> None:
+        path = self._competition_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "competition_id": int(competition_id),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True))
+        tmp_path.replace(path)
+
+    async def _note_evaluation_started(self) -> None:
+        with self._state_lock:
+            self._active_evaluations += 1
+
+    async def _note_evaluation_finished(self) -> None:
+        should_schedule_cleanup = False
+        with self._state_lock:
+            self._active_evaluations = max(0, self._active_evaluations - 1)
+            if (
+                self._active_evaluations == 0
+                and self._pending_competition_id is not None
+                and not self._cleanup_in_progress
+            ):
+                self._cleanup_in_progress = True
+                should_schedule_cleanup = True
+
+        if should_schedule_cleanup:
+            self._cleanup_task = asyncio.create_task(self._run_competition_cleanup())
+
+    async def handle_competition_heartbeat(self, competition_id: int | None) -> None:
+        if competition_id is None:
+            return
+
+        should_schedule_cleanup = False
+        with self._state_lock:
+            if self._current_competition_id == competition_id and self._pending_competition_id is None:
+                return
+            self._pending_competition_id = int(competition_id)
+            if self._active_evaluations == 0 and not self._cleanup_in_progress:
+                self._cleanup_in_progress = True
+                should_schedule_cleanup = True
+
+        if should_schedule_cleanup:
+            self._cleanup_task = asyncio.create_task(self._run_competition_cleanup())
+
+    async def _run_competition_cleanup(self) -> None:
+        try:
+            cleanup_result = await asyncio.to_thread(
+                self.evaluator.cleanup_competition_cache,
+            )
+            with self._state_lock:
+                latest_competition_id = self._pending_competition_id
+                if latest_competition_id is not None:
+                    self._current_competition_id = int(latest_competition_id)
+                    self._pending_competition_id = None
+                    self._write_competition_state(int(latest_competition_id))
+                self._cleanup_in_progress = False
+            logging.info(
+                "Competition cleanup completed",
+                extra={
+                    "competition_id": self._current_competition_id,
+                    "cleanup_result": cleanup_result,
+                },
+            )
+        except Exception as exc:
+            with self._state_lock:
+                self._cleanup_in_progress = False
+            logging.error(
+                f"Competition cleanup failed: {exc}",
+                exc_info=True,
+            )
     
     async def async_init(self) -> None:
         """Initialize async resources in the correct event loop"""
@@ -588,6 +689,7 @@ class Validator(AbstractValidator):
         weight_task: asyncio.Task | None = None
 
         async def process_task(task: SweBenchValidationTask) -> None:
+            await self._note_evaluation_started()
             try:
                 results = await self.evaluator.evaluate(task)
                 # logging.info(f"Async evaluation results: {results}")
@@ -628,6 +730,8 @@ class Validator(AbstractValidator):
                     error_details={"error": str(exc)},
                     retryable=True,
                 )
+            finally:
+                await self._note_evaluation_finished()
 
         try:
             logging.info("Validator run loop started")
@@ -656,11 +760,17 @@ class Validator(AbstractValidator):
                 max_in_flight = self.settings.max_concurrent_evaluations
                 fetch_due = now >= fetch_cooldown_until
                 provider_ready = now >= self._provider_degraded_until
+                with self._state_lock:
+                    competition_switch_pending = (
+                        self._cleanup_in_progress
+                        or self._pending_competition_id is not None
+                    )
                 can_fetch = (
                     has
                     and len(in_flight) < max_in_flight
                     and fetch_due
                     and provider_ready
+                    and not competition_switch_pending
                 )
                 cooldown_remaining = max(0.0, fetch_cooldown_until - now)
                 provider_cooldown_remaining = max(
@@ -672,7 +782,8 @@ class Validator(AbstractValidator):
                     f"ratio_fail_streak: {consecutive_ratio_failures}, "
                     f"fetch_due: {fetch_due}, cooldown_remaining: {cooldown_remaining:.1f}s, "
                     f"provider_ready: {provider_ready}, "
-                    f"provider_cooldown_remaining: {provider_cooldown_remaining:.1f}s"
+                    f"provider_cooldown_remaining: {provider_cooldown_remaining:.1f}s, "
+                    f"competition_switch_pending: {competition_switch_pending}"
                 )
                 if can_fetch:
                     logging.info("Fetching tasks from platform...")
@@ -808,6 +919,7 @@ def create_app() -> FastAPI:
         if validator is None:
             logging.error("Validator is None, raising 503")
             raise HTTPException(status_code=503, detail="Validator not initialized")
+        await validator.handle_competition_heartbeat(request.payload.competition_id)
         payload = HeartbeatResponse(
             ok=True,
             server_ts=datetime.now(timezone.utc),

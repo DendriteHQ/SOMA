@@ -19,6 +19,7 @@ DEFAULT_DATASET_NAME = "SWE-bench/SWE-bench_Verified"
 DEFAULT_DATASET_SPLIT = "test"
 DEFAULT_ARCH = "x86_64"
 DEFAULT_IMAGE_TEMPLATE = "ghcr.io/epoch-research/swe-bench.eval.{arch}.{instance_id}"
+DEFAULT_IMAGE_PREFIX = "ghcr.io/epoch-research/swe-bench.eval."
 DEFAULT_MODEL_NAME = "soma-validator"
 DEFAULT_REMOVE_IMAGE_AFTER_RUN = True
 DEFAULT_CONTAINER_PIDS_LIMIT = 512
@@ -70,6 +71,80 @@ class SWEBenchContainerEvaluator:
             arch=arch,
             image_name=image_name,
         )
+
+    def cleanup_competition_cache(self) -> dict[str, int]:
+        image_prefix = str(
+            self._get_setting("swebench_eval_image_prefix", DEFAULT_IMAGE_PREFIX)
+        ).strip()
+        if not image_prefix:
+            raise ValueError("swebench_eval_image_prefix is required")
+
+        docker = importlib.import_module("docker")
+        client = docker.from_env(timeout=600)
+        removed_containers = 0
+        removed_images = 0
+
+        try:
+            containers = list(client.containers.list(all=True))
+            running_image_ids = {
+                str(getattr(getattr(container, "image", None), "id", ""))
+                for container in containers
+                if str(getattr(container, "status", "")).lower() == "running"
+            }
+
+            for container in containers:
+                container_image = getattr(container, "image", None)
+                tags = list(getattr(container_image, "tags", []) or [])
+                if not any(str(tag).startswith(image_prefix) for tag in tags):
+                    continue
+                if str(getattr(container, "status", "")).lower() == "running":
+                    continue
+                try:
+                    container.remove(force=True)
+                    removed_containers += 1
+                except Exception:
+                    logger.debug(
+                        "Failed to remove SWE-Bench container during cleanup",
+                        exc_info=True,
+                    )
+
+            for image in client.images.list():
+                tags = list(getattr(image, "tags", []) or [])
+                if not tags:
+                    continue
+                if not any(str(tag).startswith(image_prefix) for tag in tags):
+                    continue
+                if str(getattr(image, "id", "")) in running_image_ids:
+                    continue
+                try:
+                    client.images.remove(image.id, force=False, noprune=False)
+                    removed_images += 1
+                except Exception:
+                    logger.debug(
+                        "Failed to remove SWE-Bench image during cleanup",
+                        exc_info=True,
+                    )
+
+            logger.info(
+                "swebench_competition_cache_cleanup_completed",
+                extra={
+                    "image_prefix": image_prefix,
+                    "removed_containers": removed_containers,
+                    "removed_images": removed_images,
+                },
+            )
+            return {
+                "removed_containers": removed_containers,
+                "removed_images": removed_images,
+            }
+        finally:
+            if hasattr(client, "close"):
+                try:
+                    client.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close Docker client after cleanup", exc_info=True
+                    )
 
     def _evaluate_instance_diff_sync(
         self,
