@@ -232,6 +232,7 @@ class Validator(AbstractValidator):
             )
             return None
 
+
     async def _note_evaluation_started(self) -> None:
         with self._state_lock:
             self._active_evaluations += 1
