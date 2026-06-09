@@ -56,6 +56,13 @@ def _non_baseline_eligibility_sql(
         f"""
                     EXISTS (
                         SELECT 1
+                        FROM miners m
+                        WHERE m.id = {miner_fk_expr}
+                          AND m.miner_banned_status = FALSE
+                    )
+                    AND
+                    EXISTS (
+                        SELECT 1
                         FROM miner_uploads mu
                         WHERE mu.script_fk = {script_fk_expr}{competition_filter}
                     )
@@ -893,6 +900,28 @@ async def _dispatch_due_runs(
     )
 
     async for db in get_db_session():
+        banned_pending_result = await db.execute(
+            text(
+                """
+                UPDATE swe_bench_runs r
+                SET status = 'failed',
+                    last_error = 'Miner failed review before sandbox dispatch',
+                    updated_at = now()
+                FROM miners m
+                WHERE r.status = 'pending'
+                  AND r.baseline_run = FALSE
+                  AND r.miner_fk = m.id
+                  AND m.miner_banned_status = TRUE
+                """
+            )
+        )
+        banned_pending_count = int(banned_pending_result.rowcount or 0)
+        if banned_pending_count > 0:
+            logger.info(
+                "swebench_orchestrator_failed_banned_pending_runs",
+                extra={"failed_runs": banned_pending_count},
+            )
+
         strict_fifo_dispatch = bool(settings.swebench_dispatch_strict_fifo)
         batch_size = (
             1
@@ -1216,6 +1245,7 @@ async def _load_script_dispatch_context(
                 JOIN miner_uploads u ON u.script_fk = s.id
                 WHERE s.id = :script_fk
                   AND m.id = :miner_fk
+                                    AND m.miner_banned_status = FALSE
                   AND u.competition_fk = :competition_fk
                   {key_filter}
                 ORDER BY u.created_at DESC
