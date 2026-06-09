@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from pydantic import ValidationError
 
 from app.core.config import settings
+from app.db.interfaces.competition_queries import get_active_competition_id_direct
 from soma_shared.contracts.common.signatures import SignedEnvelope
 from soma_shared.contracts.validator.v1.messages import (
     HeartbeatRequest,
@@ -76,12 +77,18 @@ def _run_heartbeat_loop(
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     while not stop_event.is_set():
+        active_competition_id = _get_active_competition_id(loop)
         validators = getattr(app.state, "registered_validators", {}) or {}
         for validator in list(validators.values()):
             if stop_event.is_set():
                 break
             try:
-                _send_heartbeat_and_log(validator, timeout_secs, loop)
+                _send_heartbeat_and_log(
+                    validator,
+                    timeout_secs,
+                    loop,
+                    active_competition_id=active_competition_id,
+                )
             except Exception:
                 logger.exception(
                     "heartbeat_send_failed",
@@ -94,6 +101,8 @@ def _send_heartbeat_and_log(
     validator: dict[str, Any],
     timeout_secs: int,
     loop: asyncio.AbstractEventLoop,
+    *,
+    active_competition_id: int | None,
 ) -> None:
     request_id = uuid.uuid4().hex
     validator_ss58 = str(validator.get("validator_ss58", ""))
@@ -118,6 +127,7 @@ def _send_heartbeat_and_log(
             port=int(port),
             timeout_secs=timeout_secs,
             validator_ss58=validator_ss58,
+            active_competition_id=active_competition_id,
         )
     else:
         logger.warning(
@@ -152,11 +162,13 @@ def _send_heartbeat_request(
     port: int,
     timeout_secs: int,
     validator_ss58: str,
+    active_competition_id: int | None,
 ) -> tuple[str, str | None, bool | None, str | None]:
     url = f"http://{ip}:{port}/heartbeat"
     payload = HeartbeatRequest(
         ts=datetime.now(timezone.utc),
         version=settings.app_name,
+        competition_id=active_competition_id,
     )
     nonce = generate_nonce()
     wallet = get_wallet_from_settings()
@@ -244,6 +256,26 @@ def _send_heartbeat_request(
         )
 
     return ("failed", None, None, None)
+
+
+def _get_active_competition_id(loop: asyncio.AbstractEventLoop) -> int | None:
+    async def _fetch() -> int | None:
+        metrics_token = begin_db_request_metrics_scope()
+        try:
+            async for session in get_db_session():
+                return await get_active_competition_id_direct(
+                    session,
+                    now=datetime.now(timezone.utc),
+                )
+        finally:
+            end_db_request_metrics_scope(metrics_token)
+
+    future = asyncio.run_coroutine_threadsafe(_fetch(), loop)
+    try:
+        return future.result(timeout=20)
+    except Exception:
+        logger.exception("heartbeat_competition_lookup_failed")
+        return None
 
 
 async def _log_heartbeat_entry(

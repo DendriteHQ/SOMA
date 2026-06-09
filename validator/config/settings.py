@@ -3,6 +3,7 @@ import bittensor as bt
 from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict
 from typing import Any
+from pathlib import Path
 from bittensor.core.async_subtensor import AsyncSubtensor
 import logging
 
@@ -37,6 +38,8 @@ class Settings(BaseModel):
     swebench_eval_remove_image_after_run: bool
     swebench_validation_request_path: str
     swebench_validation_submit_path: str
+    swebench_competition_state_file: Path
+    swebench_eval_image_prefix: str
      
     @classmethod
     def from_env(cls) -> "Settings":
@@ -116,6 +119,16 @@ class Settings(BaseModel):
             swebench_eval_remove_image_after_run=cls._get_bool(
                 "SWEBENCH_EVAL_REMOVE_IMAGE_AFTER_RUN",
                 True,
+            ),
+            swebench_competition_state_file=Path(
+                os.getenv(
+                    "SWEBENCH_COMPETITION_STATE_FILE",
+                    "validator/.runtime/current_competition.json",
+                )
+            ),
+            swebench_eval_image_prefix=os.getenv(
+                "SWEBENCH_EVAL_IMAGE_PREFIX",
+                "ghcr.io/epoch-research/swe-bench.eval.",
             ),
             swebench_validation_request_path=os.getenv(
                 "SWEBENCH_VALIDATION_REQUEST_PATH",
