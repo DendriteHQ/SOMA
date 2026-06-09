@@ -58,6 +58,9 @@ class Evaluator:
             image_name=image_name,
         )
 
+    def cleanup_competition_cache(self) -> dict[str, int]:
+        return self._swebench_evaluator.cleanup_competition_cache()
+
     async def _evaluate_task(
         self,
         *,
