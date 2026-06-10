@@ -23,9 +23,9 @@ from app.services.swe_difficulty_calculator import (
     CategoryValue,
     MinerCategoryScores,
     build_baseline_task_data,
-    build_miner_category_scores,
     derive_task_difficulties,
 )
+from app.api.routes.scoring import build_swe_miner_category_scores_with_penalty
 
 
 @dataclass(frozen=True)
@@ -251,7 +251,7 @@ async def load_competition_incentive_inputs(
     ).all()
 
     task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
-    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
+    miner_category_scores = build_swe_miner_category_scores_with_penalty(rows, task_difficulties)
     return DIFFICULTY_CATEGORIES, miner_category_scores
 
 

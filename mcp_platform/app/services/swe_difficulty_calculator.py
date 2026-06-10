@@ -323,3 +323,4 @@ def build_miner_category_scores(
         }
         for hotkey, category_scores in sorted(miner_category_scores.items())
     }
+
