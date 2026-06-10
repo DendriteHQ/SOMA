@@ -463,6 +463,23 @@ async def _fetch_swe_rows(
     return list(result)
 
 
+def _derive_swe_task_categories(rows: list[sa.Row]) -> dict[str, str]:
+    return {
+        difficulty.task_name: difficulty.category
+        for difficulty in derive_task_difficulties(build_baseline_task_data(rows))
+    }
+
+
+async def _fetch_swe_task_categories(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+) -> dict[str, str]:
+    return _derive_swe_task_categories(
+        await _fetch_swe_rows(db, comp_id=comp_id)
+    )
+
+
 async def _resolve_swe_task_id(
     db: AsyncSession,
     *,
@@ -1961,15 +1978,12 @@ async def list_swe_miners_by_competition(
             db, competition_id=comp_id, min_resolved=min_resolved
         )
     )
+    task_categories = _derive_swe_task_categories(rows)
 
     grouped: dict[str, dict[str, object]] = {}
     for hotkey, task_rows in miner_rows.items():
         task_groups = build_swe_task_groups(task_rows)
         total_score, _ = build_swe_miner_scores(task_groups)
-        task_categories = {
-            difficulty.task_name: difficulty.category
-            for difficulty in derive_task_difficulties(build_baseline_task_data(task_rows))
-        }
         category_scores = build_swe_category_scores(task_groups, task_categories)
         grouped[hotkey] = {
             "hotkey": hotkey,
@@ -2034,10 +2048,7 @@ async def get_swe_miner_by_competition(
     task_items = [build_swe_task_result_item(group) for group in task_groups.values()]
     total_score, _ = build_swe_miner_scores(task_groups)
 
-    task_categories = {
-        difficulty.task_name: difficulty.category
-        for difficulty in derive_task_difficulties(build_baseline_task_data(rows))
-    }
+    task_categories = await _fetch_swe_task_categories(db, comp_id=comp_id)
     category_scores = build_swe_category_scores(task_groups, task_categories)
 
     min_resolved = settings.screener_min_resolved
@@ -2077,10 +2088,7 @@ async def get_swe_miner_penalties(
         )
 
     task_groups = build_swe_task_groups(rows)
-    task_categories = {
-        difficulty.task_name: difficulty.category
-        for difficulty in derive_task_difficulties(build_baseline_task_data(rows))
-    }
+    task_categories = await _fetch_swe_task_categories(db, comp_id=comp_id)
     return {
         "comp_id": comp_id,
         "hotkey": hotkey,

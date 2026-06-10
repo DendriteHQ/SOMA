@@ -58,6 +58,22 @@ def test_calculate_incentive_weights_requires_complete_subset_scores() -> None:
     assert all("Hard" not in element.subset or element.winners == ("A",) for element in result.layers[1].elements)
 
 
+def test_calculate_incentive_weights_uses_total_scores_for_full_category_layer() -> None:
+    result = calculate_incentive_weights(
+        {
+            "A": {"Easy": 3.0, "Medium": 3.0, "Hard": 0.0},
+            "B": {"Easy": 2.0, "Medium": 2.0, "Hard": 2.0},
+        },
+        ["Easy", "Medium", "Hard"],
+        burn_ratio=0.0,
+        miner_total_scores={"A": 1.0, "B": 2.0},
+    )
+
+    assert result.layers[0].elements[0].subset == ("Easy", "Medium", "Hard")
+    assert result.layers[0].elements[0].winners == ("B",)
+    assert result.final_weights["B"] > result.final_weights["A"]
+
+
 def test_derive_task_difficulties_weights_loss_ratio_more_than_tokens() -> None:
     task_difficulties = derive_task_difficulties(
         {

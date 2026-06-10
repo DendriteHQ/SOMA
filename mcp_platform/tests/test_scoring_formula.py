@@ -5,6 +5,7 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _load_scoring_module():
@@ -173,3 +174,77 @@ def test_build_swe_miner_scores_leaves_total_raw_when_tokens_are_missing():
 
     assert abs(total_score - 1.0) < 1e-9
     assert abs(screener_score - 2.0) < 1e-9
+
+
+def test_build_swe_category_scores_uses_platform_scores_without_run_baseline_fields():
+    scoring = _load_scoring_module()
+
+    task_groups = {
+        "task-a": {
+            "task_name": "task-a",
+            "baseline_runs": {1: {"tokens_used": 100}},
+            "runs": [{"platform_score": 2.0, "tokens_with_compression": 80}],
+        },
+        "task-b": {
+            "task_name": "task-b",
+            "baseline_runs": {2: {"tokens_used": 100}},
+            "runs": [{"platform_score": 0.0, "tokens_with_compression": 100}],
+        },
+    }
+
+    category_scores = scoring.build_swe_category_scores(
+        task_groups,
+        {"task-a": "Easy", "task-b": "Hard"},
+    )
+
+    assert category_scores["Easy"] == 2.0
+    assert category_scores["Medium"] is None
+    assert category_scores["Hard"] == -2.0
+
+
+def test_build_swe_miner_category_scores_with_penalty_returns_scores_for_complete_miners():
+    scoring = _load_scoring_module()
+
+    task_difficulties = [
+        SimpleNamespace(task_name="task-1", category="Easy"),
+        SimpleNamespace(task_name="task-2", category="Hard"),
+    ]
+    rows = [
+        SimpleNamespace(
+            task_id=1,
+            task_name="task-1",
+            is_screener=False,
+            hotkey="miner-a",
+            baseline_run_id=101,
+            baseline_tokens_used=100,
+            baseline_resolved=True,
+            run_id=201,
+            attempt_no=1,
+            run_tokens_used=80,
+            time_taken_seconds=10.0,
+            agent_steps=5,
+            run_resolved=True,
+        ),
+        SimpleNamespace(
+            task_id=2,
+            task_name="task-2",
+            is_screener=False,
+            hotkey="miner-a",
+            baseline_run_id=102,
+            baseline_tokens_used=100,
+            baseline_resolved=True,
+            run_id=202,
+            attempt_no=1,
+            run_tokens_used=100,
+            time_taken_seconds=12.0,
+            agent_steps=6,
+            run_resolved=False,
+        ),
+    ]
+
+    scores = scoring.build_swe_miner_category_scores_with_penalty(rows, task_difficulties)
+
+    assert set(scores) == {"miner-a"}
+    assert scores["miner-a"]["Easy"] == 2.0
+    assert scores["miner-a"]["Hard"] == -4.0
+    assert scores["miner-a"]["Medium"] is None

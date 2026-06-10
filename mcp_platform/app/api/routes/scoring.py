@@ -252,7 +252,7 @@ def build_swe_category_scores(
     task_groups: dict[int, dict[str, object]],
     task_categories: dict[str, str],
 ) -> dict[str, float | None]:
-    category_scores, _, _ = _build_category_score_context(task_groups, task_categories)
+    category_scores, _, _, _ = _build_category_score_context(task_groups, task_categories)
     return category_scores
 
 
@@ -286,11 +286,7 @@ def _build_category_score_context(
 
             for run in group["runs"]:
                 applied_score = run.get("platform_score")
-                base_score_info = base_swe_score(
-                    run.get("pass_without_compression"),
-                    run.get("pass_with_compression"),
-                )
-                if applied_score is not None and base_score_info is not None:
+                if applied_score is not None:
                     raw_scores.append(float(applied_score))
 
                 compressed_value = run.get("tokens_with_compression")
@@ -355,7 +351,7 @@ def build_swe_miner_category_scores_with_penalty(
         if required_tasks and set(task_scores_by_name) != required_tasks:
             continue
 
-        category_scores, _, _ = _build_category_score_context(task_groups, category_by_task)
+        category_scores, _, _, _ = _build_category_score_context(task_groups, category_by_task)
         miner_category_scores[hotkey] = {
             category: float(score) if score is not None else score
             for category, score in category_scores.items()
