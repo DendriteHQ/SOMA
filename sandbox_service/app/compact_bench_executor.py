@@ -313,6 +313,7 @@ def _download_tiktoken_cl100k_payload() -> bytes:
 
 
 def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
+    """Deprecated: use CompactBenchExecutor._write_tiktoken_cache() instead."""
     payload: bytes | None = None
 
     try:
@@ -373,6 +374,43 @@ class CompactBenchExecutor:
                 "The 'soma_bench' package is not installed in the sandbox-service environment. "
                 "Install dependencies from requirements.txt before starting the service."
             )
+
+        self._preload_tiktoken_cache()
+
+    def _preload_tiktoken_cache(self) -> None:
+        payload: bytes | None = None
+
+        try:
+            payload = _download_tiktoken_cl100k_payload()
+            logger.info("Downloaded canonical cl100k_base.tiktoken for plugin cache seeding")
+        except Exception as download_error:
+            asset_path = _resolve_tiktoken_cl100k_asset_path()
+            if asset_path is None or not asset_path.is_file():
+                raise RuntimeError(
+                    "Unable to download canonical cl100k_base.tiktoken and no local fallback asset was found"
+                ) from download_error
+            payload = asset_path.read_bytes()
+            logger.warning(
+                "Falling back to local cl100k_base.tiktoken asset for plugin cache seeding: %s",
+                asset_path,
+            )
+
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != TIKTOKEN_CL100K_SHA256:
+            raise RuntimeError(
+                "Canonical cl100k_base.tiktoken hash mismatch: "
+                f"expected {TIKTOKEN_CL100K_SHA256}, got {digest}"
+            )
+
+        self._tiktoken_payload: bytes = payload
+
+    def _write_tiktoken_cache(self, plugin_path: Path) -> Path | None:
+        cache_dir = plugin_path / TIKTOKEN_CACHE_DIRNAME
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha1(TIKTOKEN_CL100K_URL.encode("utf-8")).hexdigest()
+        cache_path = cache_dir / cache_key
+        cache_path.write_bytes(self._tiktoken_payload)
+        return cache_path
 
     def _maybe_cleanup_stale_output_dirs(self, *, force: bool = False) -> None:
         retention_seconds = _coerce_positive_int(
@@ -747,7 +785,7 @@ class CompactBenchExecutor:
 
         miner_code = _download_miner_code(script_presigned_url)
         (plugin_path / PLUGIN_BACKEND_FILENAME).write_text(miner_code, encoding="utf-8")
-        cache_path = _seed_tiktoken_cache(plugin_path)
+        cache_path = self._write_tiktoken_cache(plugin_path)
         logger.info(
             "Injected miner code into plugin checkout: plugin_path=%s code_bytes=%s tiktoken_cache=%s",
             plugin_path,
