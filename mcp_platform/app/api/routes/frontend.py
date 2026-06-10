@@ -76,6 +76,8 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.api.routes.scoring import (
     build_swe_miner_scores,
+    build_swe_category_scores,
+    build_swe_miner_penalty_summary,
     build_swe_task_groups,
     build_swe_task_result_item,
 )
@@ -1960,18 +1962,20 @@ async def list_swe_miners_by_competition(
         )
     )
 
-    task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
-    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
-
     grouped: dict[str, dict[str, object]] = {}
     for hotkey, task_rows in miner_rows.items():
         task_groups = build_swe_task_groups(task_rows)
         total_score, _ = build_swe_miner_scores(task_groups)
+        task_categories = {
+            difficulty.task_name: difficulty.category
+            for difficulty in derive_task_difficulties(build_baseline_task_data(task_rows))
+        }
+        category_scores = build_swe_category_scores(task_groups, task_categories)
         grouped[hotkey] = {
             "hotkey": hotkey,
             "total_score": total_score,
             "screener_passed": hotkey in eligible_hotkeys,
-            "category_scores": miner_category_scores.get(hotkey),
+            "category_scores": category_scores,
         }
 
     sorted_miners = sorted(
@@ -2030,9 +2034,11 @@ async def get_swe_miner_by_competition(
     task_items = [build_swe_task_result_item(group) for group in task_groups.values()]
     total_score, _ = build_swe_miner_scores(task_groups)
 
-    task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
-    miner_category_scores = build_miner_category_scores(rows, task_difficulties)
-    category_scores = miner_category_scores.get(hotkey) or None
+    task_categories = {
+        difficulty.task_name: difficulty.category
+        for difficulty in derive_task_difficulties(build_baseline_task_data(rows))
+    }
+    category_scores = build_swe_category_scores(task_groups, task_categories)
 
     min_resolved = settings.screener_min_resolved
     eligible_hotkeys = set(
@@ -2051,6 +2057,35 @@ async def get_swe_miner_by_competition(
             screener_task_count=sum(1 for item in task_items if item.is_screener),
         )
     )
+
+
+@frontend_router.get(
+    "/swe/miners/{comp_id}/{hotkey}/penalties",
+)
+async def get_swe_miner_penalties(
+    comp_id: int,
+    hotkey: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, object]:
+    await _ensure_competition_exists(db, comp_id)
+    rows = await _fetch_swe_rows(db, comp_id=comp_id, hotkey=hotkey)
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Miner not found in this competition",
+        )
+
+    task_groups = build_swe_task_groups(rows)
+    task_categories = {
+        difficulty.task_name: difficulty.category
+        for difficulty in derive_task_difficulties(build_baseline_task_data(rows))
+    }
+    return {
+        "comp_id": comp_id,
+        "hotkey": hotkey,
+        **build_swe_miner_penalty_summary(task_groups, task_categories),
+    }
 
 
 @frontend_router.get(

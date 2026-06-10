@@ -207,20 +207,6 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         for run in runs
         if run["tokens_with_compression"] is not None
     ]
-    raw_platform_score = (sum(run_scores) / len(run_scores) if run_scores else None)
-    baseline_tokens = (
-        int(group["baseline_tokens_without_compression"])
-        if group["baseline_tokens_without_compression"] is not None
-        else None
-    )
-    avg_compressed = (
-        sum(compressed_tokens) / len(compressed_tokens) if compressed_tokens else None
-    )
-    adjusted_score = adjust_miner_score_with_token_savings(
-        raw_platform_score,
-        total_baseline_tokens=baseline_tokens,
-        total_compressed_tokens=int(avg_compressed) if avg_compressed else None,
-    )
     return SweMinerTaskResultItem(
         task_id=int(group["task_id"]),
         task_name=str(group["task_name"]),
@@ -238,9 +224,126 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         tokens_with_compression=(
             sum(compressed_tokens) / len(compressed_tokens) if compressed_tokens else None
         ),
-        platform_score=adjusted_score,
+        platform_score=(sum(run_scores) / len(run_scores) if run_scores else None),
         run_count=len(runs),
     )
+
+
+def build_swe_miner_penalty_summary(
+    task_groups: dict[int, dict[str, object]],
+    task_categories: dict[str, str],
+) -> dict[str, object]:
+    category_penalties: dict[str, float | None] = {}
+    total_raw_scores: list[float] = []
+    total_baseline_tokens = 0
+    total_compressed_tokens = 0
+
+    for category in ("Easy", "Medium", "Hard"):
+        raw_scores: list[float] = []
+        applied_scores: list[float] = []
+        baseline_tokens: list[int] = []
+        compressed_tokens: list[int] = []
+
+        for group in task_groups.values():
+            if task_categories.get(str(group["task_name"])) != category:
+                continue
+
+            for baseline in group["baseline_runs"].values():
+                tokens_used = baseline.get("tokens_used")
+                if tokens_used is not None and tokens_used > 0:
+                    baseline_tokens.append(int(tokens_used))
+
+            for run in group["runs"]:
+                applied_score = run.get("platform_score")
+                base_score_info = base_swe_score(
+                    run.get("pass_without_compression"),
+                    run.get("pass_with_compression"),
+                )
+                if applied_score is not None and base_score_info is not None:
+                    applied_value = float(applied_score)
+                    raw_value = float(base_score_info[0])
+                    applied_scores.append(applied_value)
+                    raw_scores.append(raw_value)
+
+                compressed_value = run.get("tokens_with_compression")
+                if compressed_value is not None and compressed_value > 0:
+                    compressed_tokens.append(int(compressed_value))
+
+        category_raw_score = sum(raw_scores) / len(raw_scores) if raw_scores else None
+        category_baseline_tokens = sum(baseline_tokens) if baseline_tokens else None
+        category_compressed_tokens = sum(compressed_tokens) if compressed_tokens else None
+        category_applied_score = adjust_miner_score_with_token_savings(
+            category_raw_score,
+            total_baseline_tokens=category_baseline_tokens,
+            total_compressed_tokens=category_compressed_tokens,
+        )
+        category_penalties[category] = (
+            category_raw_score - category_applied_score
+            if category_raw_score is not None and category_applied_score is not None
+            else None
+        )
+        if category_raw_score is not None:
+            total_raw_scores.extend(raw_scores)
+        if category_baseline_tokens is not None:
+            total_baseline_tokens += category_baseline_tokens
+        if category_compressed_tokens is not None:
+            total_compressed_tokens += category_compressed_tokens
+
+    raw_total_score = sum(total_raw_scores) / len(total_raw_scores) if total_raw_scores else None
+    applied_total_score, _ = build_swe_miner_scores(task_groups)
+    return {
+        "categories": category_penalties,
+        "total": (
+            raw_total_score - applied_total_score
+            if raw_total_score is not None and applied_total_score is not None
+            else None
+        ),
+    }
+
+
+def build_swe_category_scores(
+    task_groups: dict[int, dict[str, object]],
+    task_categories: dict[str, str],
+) -> dict[str, float | None]:
+    category_scores: dict[str, float | None] = {}
+
+    for category in ("Easy", "Medium", "Hard"):
+        raw_scores: list[float] = []
+        baseline_tokens: list[int] = []
+        compressed_tokens: list[int] = []
+
+        for group in task_groups.values():
+            if task_categories.get(str(group["task_name"])) != category:
+                continue
+
+            for baseline in group["baseline_runs"].values():
+                tokens_used = baseline.get("tokens_used")
+                if tokens_used is not None and tokens_used > 0:
+                    baseline_tokens.append(int(tokens_used))
+
+            for run in group["runs"]:
+                applied_score = run.get("platform_score")
+                base_score_info = base_swe_score(
+                    run.get("pass_without_compression"),
+                    run.get("pass_with_compression"),
+                )
+                if applied_score is not None and base_score_info is not None:
+                    raw_scores.append(float(applied_score))
+
+                compressed_value = run.get("tokens_with_compression")
+                if compressed_value is not None and compressed_value > 0:
+                    compressed_tokens.append(int(compressed_value))
+
+        category_raw_score = sum(raw_scores) / len(raw_scores) if raw_scores else None
+        category_scores[category] = adjust_miner_score_with_token_savings(
+            category_raw_score,
+            total_baseline_tokens=(sum(baseline_tokens) if baseline_tokens else None),
+            total_compressed_tokens=(sum(compressed_tokens) if compressed_tokens else None),
+        )
+
+    return category_scores
+
+
 def build_swe_miner_scores(
     task_groups: dict[int, dict[str, object]],
 ) -> tuple[float | None, float | None]:
