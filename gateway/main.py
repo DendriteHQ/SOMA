@@ -181,10 +181,43 @@ def _extract_forward_headers(request: Request) -> dict[str, str]:
     headers: dict[str, str] = {}
     for key, value in request.headers.items():
         lower = key.lower()
-        if lower in skip or lower.startswith("x-run-id"):
+        if lower in skip or lower.startswith("x-run-id") or lower.startswith("x-batch-id"):
             continue
         headers[key] = value
     return headers
+
+
+async def _resolve_batch_auth_context(batch_id: int) -> tuple[bool, str | None, str | None]:
+    engine: AsyncEngine = app.state.db_engine
+    query = text(
+        """
+        SELECT
+            CASE WHEN sbb.miner_fk IS NULL THEN TRUE ELSE FALSE END AS baseline_run,
+            mok.secret_ref,
+            m.ss58
+        FROM swe_bench_run_batches sbb
+        LEFT JOIN miner_openrouter_api_keys mok
+            ON mok.miner_fk = sbb.miner_fk
+           AND mok.revoked_at IS NULL
+        LEFT JOIN miners m
+            ON m.id = sbb.miner_fk
+        WHERE sbb.id = :batch_id
+        LIMIT 1
+        """
+    )
+    async with engine.connect() as conn:
+        result = await conn.execute(query, {"batch_id": batch_id})
+        row = result.first()
+    if row is None:
+        raise ValueError(f"swe_bench_run_batches.id={batch_id} not found")
+    baseline_run = bool(row[0])
+    api_key_path = str(row[1]).strip() if row[1] is not None else None
+    miner_hotkey = str(row[2]).strip() if row[2] is not None else None
+    if not baseline_run and (not api_key_path):
+        raise ValueError(
+            f"No active miner OpenRouter key path found for swe_bench_run_batches.id={batch_id}",
+        )
+    return baseline_run, api_key_path, miner_hotkey
 
 
 @app.get("/health")
@@ -192,9 +225,14 @@ async def health() -> dict[str, str]:
     return {"status": "healthy", "service": "gateway"}
 
 
-async def _resolve_authorization_header(run_id: int) -> tuple[str, str]:
+async def _resolve_authorization_header(*, run_id: int | None, batch_id: int | None) -> tuple[str, str]:
     try:
-        baseline_run, api_key_path, miner_hotkey = await _resolve_run_auth_context(run_id)
+        if batch_id is not None:
+            baseline_run, api_key_path, miner_hotkey = await _resolve_batch_auth_context(batch_id)
+        elif run_id is not None:
+            baseline_run, api_key_path, miner_hotkey = await _resolve_run_auth_context(run_id)
+        else:
+            raise ValueError("Either run_id or batch_id must be provided")
         if baseline_run:
             baseline_api_key = (os.getenv("GATEWAY_BASELINE_OPENROUTER_API_KEY") or "").strip()
             if not baseline_api_key:
@@ -207,7 +245,7 @@ async def _resolve_authorization_header(run_id: int) -> tuple[str, str]:
             api_key_value = await asyncio.to_thread(_resolve_api_key_from_ssm, str(api_key_path))
             resolved_hotkey = miner_hotkey or "unknown"
     except Exception as exc:
-        logger.exception("Failed to resolve API key for run_id=%s", run_id)
+        logger.exception("Failed to resolve API key for run_id=%s batch_id=%s", run_id, batch_id)
         raise HTTPException(status_code=400, detail=f"API key resolution failed: {exc}") from exc
     return f"Bearer {api_key_value}", resolved_hotkey
 
@@ -270,19 +308,35 @@ async def proxy_openai_compatible(
     path: str,
     request: Request,
     x_run_id: str | None = Header(default=None, alias="X-Run-Id"),
+    x_batch_id: str | None = Header(default=None, alias="X-Batch-Id"),
 ) -> Response:
-    if not x_run_id:
-        raise HTTPException(status_code=400, detail="Missing required header: X-Run-Id")
-    try:
-        run_id = int(x_run_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="X-Run-Id must be an integer") from exc
+    if not x_run_id and not x_batch_id:
+        raise HTTPException(status_code=400, detail="Missing required header: X-Run-Id or X-Batch-Id")
+
+    run_id: int | None = None
+    batch_id: int | None = None
+    if x_batch_id:
+        try:
+            batch_id = int(x_batch_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="X-Batch-Id must be an integer") from exc
+    if x_run_id:
+        try:
+            run_id = int(x_run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="X-Run-Id must be an integer") from exc
 
     method = request.method.upper()
-    logger.info("gateway_request_received run_id=%s method=%s path=/v1/%s", run_id, method, path)
+    logger.info(
+        "gateway_request_received run_id=%s batch_id=%s method=%s path=/v1/%s",
+        run_id,
+        batch_id,
+        method,
+        path,
+    )
 
     headers = _extract_forward_headers(request)
-    auth_header, miner_hotkey = await _resolve_authorization_header(run_id)
+    auth_header, miner_hotkey = await _resolve_authorization_header(run_id=run_id, batch_id=batch_id)
     headers["Authorization"] = auth_header
 
     body_bytes = await request.body()
@@ -310,8 +364,9 @@ async def proxy_openai_compatible(
             if key.lower() != "content-type"
         }
         logger.info(
-            "gateway_request_completed run_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s stream=true",
+            "gateway_request_completed run_id=%s batch_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s stream=true",
             run_id,
+            batch_id,
             miner_hotkey,
             method,
             path,
@@ -329,8 +384,9 @@ async def proxy_openai_compatible(
             resp = await client.request(method, url, headers=headers, content=body_bytes)
     except Exception as exc:
         logger.exception(
-            "gateway_upstream_failed run_id=%s miner_hotkey=%s method=%s path=/v1/%s",
+            "gateway_upstream_failed run_id=%s batch_id=%s miner_hotkey=%s method=%s path=/v1/%s",
             run_id,
+            batch_id,
             miner_hotkey,
             method,
             path,
@@ -339,8 +395,9 @@ async def proxy_openai_compatible(
 
     passthrough_headers = _select_passthrough_response_headers(resp.headers)
     logger.info(
-        "gateway_request_completed run_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s",
+        "gateway_request_completed run_id=%s batch_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s",
         run_id,
+        batch_id,
         miner_hotkey,
         method,
         path,

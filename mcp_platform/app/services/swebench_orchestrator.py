@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,7 @@ from app.core.logging import get_logger
 from app.services.blob.s3 import S3BlobStorage
 from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
 from soma_shared.db.models.swe_bench_run import SweBenchRun
+from soma_shared.db.models.swe_bench_run_batch import SweBenchRunBatch
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
 from soma_shared.db.models.competition import Competition
@@ -851,93 +853,159 @@ async def _dispatch_due_runs(
 
         expires_in = int(max(60.0, float(settings.sandbox_timeout_per_task_seconds) + 300.0))
 
+        grouped_rows: dict[tuple[int | None, int | None], list[dict[str, Any]]] = {}
         for row in dispatch_rows:
-            run_id = int(row["run_id"])
+            group_key = (
+                int(row["miner_fk"]) if row.get("miner_fk") is not None else None,
+                int(row["script_fk"]) if row.get("script_fk") is not None else None,
+            )
+            grouped_rows.setdefault(group_key, []).append(row)
+
+        for (miner_fk, script_fk), group in grouped_rows.items():
+            reference_row = group[0]
+            baseline_run = bool(reference_row["baseline_run"])
+            batch_row = SweBenchRunBatch(
+                miner_fk=miner_fk,
+                script_fk=script_fk,
+            )
+            db.add(batch_row)
+            await db.flush()
+
             try:
                 script_presigned_url = await _resolve_script_presigned_url(
                     db=db,
                     app=app,
                     s3_storage=s3_storage,
                     expires_in=expires_in,
-                    script_fk=row.get("script_fk"),
-                    miner_fk=row.get("miner_fk"),
-                    competition_fk=row.get("competition_fk"),
-                    baseline_run=bool(row["baseline_run"]),
+                    script_fk=script_fk,
+                    miner_fk=miner_fk,
+                    competition_fk=reference_row.get("competition_fk"),
+                    baseline_run=baseline_run,
                 )
             except LookupError as exc:
-                await db.execute(
-                    text(
-                        "UPDATE swe_bench_runs SET status = 'pending', last_error = :error, updated_at = now() WHERE id = :run_id"
-                    ),
-                    {"run_id": run_id, "error": str(exc)},
-                )
-                deferred += 1
+                error_text = str(exc)
+                for row in group:
+                    run_id = int(row["run_id"])
+                    await db.execute(
+                        text(
+                            "UPDATE swe_bench_runs SET status = 'pending', last_error = :error, updated_at = now() WHERE id = :run_id"
+                        ),
+                        {"run_id": run_id, "error": error_text},
+                    )
+                    deferred += 1
                 continue
 
-            ok, error, retryable = await manager.dispatch_swebench_run(
-                run_id=run_id,
-                benchmark=str(settings.swebench_benchmark_name),
-                instance_id=str(row["instance_id"]),
-                storage_uuid=str(row["diff_storage_uuid"]),
+            batch_dispatch_id = str(batch_row.id)
+            task_payloads: list[dict[str, Any]] = []
+            for row in group:
+                task_payloads.append(
+                    {
+                        "run_id": int(row["run_id"]),
+                        "benchmark": str(settings.swebench_benchmark_name),
+                        "instance_id": str(row["instance_id"]),
+                        "storage_uuid": str(row["diff_storage_uuid"]),
+                        "task_context": {
+                            "competition_fk": int(row["competition_fk"]),
+                            "miner_fk": row["miner_fk"],
+                            "script_fk": row["script_fk"],
+                            "attempt_no": int(row["attempt_no"]),
+                            "planned_repeats": int(row["planned_repeats"]),
+                            "baseline_run": bool(row["baseline_run"]),
+                            "is_screener": bool(row["is_screener"]),
+                        },
+                    }
+                )
+
+            ok, failed_run_ids, error, retryable = await manager.dispatch_swebench_run_batch(
+                batch_id=batch_dispatch_id,
                 script_presigned_url=script_presigned_url,
-                task_context={
-                    "competition_fk": int(row["competition_fk"]),
-                    "miner_fk": row["miner_fk"],
-                    "script_fk": row["script_fk"],
-                    "attempt_no": int(row["attempt_no"]),
-                    "planned_repeats": int(row["planned_repeats"]),
-                    "baseline_run": bool(row["baseline_run"]),
-                    "is_screener": bool(row["is_screener"]),
-                },
+                tasks=task_payloads,
             )
 
-            if ok:
-                await db.execute(
-                    text(
-                        "UPDATE swe_bench_runs SET status = 'dispatched', last_error = NULL, updated_at = now() WHERE id = :run_id"
-                    ),
-                    {"run_id": run_id},
-                )
-                dispatched += 1
-                retry_not_before.pop(run_id, None)
-                retry_attempts.pop(run_id, None)
-                continue
+            accepted_count = 0
+            failed_run_ids_set = {int(run_id) for run_id in failed_run_ids}
+            for row in group:
+                run_id = int(row["run_id"])
+                if run_id in failed_run_ids_set:
+                    attempt = retry_attempts.get(run_id, 0) + 1
+                    retry_attempts[run_id] = attempt
+                    base = max(0.1, float(settings.swebench_retry_base_seconds))
+                    max_seconds = max(base, float(settings.swebench_retry_max_seconds))
+                    jitter = max(0.0, float(settings.swebench_retry_jitter_seconds))
+                    backoff_seconds = min(max_seconds, base * (2 ** max(0, attempt - 1)))
+                    if jitter > 0:
+                        backoff_seconds += random.uniform(0.0, jitter)
+                    retry_not_before[run_id] = time.monotonic() + backoff_seconds
 
-            if retryable:
-                attempt = retry_attempts.get(run_id, 0) + 1
-                retry_attempts[run_id] = attempt
-                base = max(0.1, float(settings.swebench_retry_base_seconds))
-                max_seconds = max(base, float(settings.swebench_retry_max_seconds))
-                jitter = max(0.0, float(settings.swebench_retry_jitter_seconds))
-                backoff_seconds = min(max_seconds, base * (2 ** max(0, attempt - 1)))
-                if jitter > 0:
-                    backoff_seconds += random.uniform(0.0, jitter)
-                retry_not_before[run_id] = time.monotonic() + backoff_seconds
+                    await db.execute(
+                        text(
+                            "UPDATE swe_bench_runs SET status = 'pending', batch_fk = NULL, last_error = :error, updated_at = now() WHERE id = :run_id"
+                        ),
+                        {
+                            "run_id": run_id,
+                            "error": "Compact-bench batch dispatch rejected this run",
+                        },
+                    )
+                    deferred += 1
+                    continue
 
-                # Keep run pending; orchestrator will retry in next polling tick.
-                await db.execute(
-                    text(
-                        "UPDATE swe_bench_runs SET status = 'pending', last_error = :error, updated_at = now() WHERE id = :run_id"
-                    ),
-                    {"run_id": run_id, "error": error},
-                )
-                deferred += 1
+                if ok:
+                    await db.execute(
+                        text(
+                            "UPDATE swe_bench_runs SET status = 'dispatched', batch_fk = :batch_fk, last_error = NULL, updated_at = now() WHERE id = :run_id"
+                        ),
+                        {
+                            "run_id": run_id,
+                            "batch_fk": int(batch_row.id),
+                        },
+                    )
+                    accepted_count += 1
+                    dispatched += 1
+                    retry_not_before.pop(run_id, None)
+                    retry_attempts.pop(run_id, None)
+                    continue
 
-                is_capacity_error = bool(error) and "at capacity" in error.lower()
-                if is_capacity_error:
-                    cooldown_seconds = min(max_seconds, base + (random.uniform(0.0, jitter) if jitter > 0 else 0.0))
-                    app.state.swebench_global_retry_not_before = time.monotonic() + cooldown_seconds
-                    break
-            else:
-                retry_not_before.pop(run_id, None)
-                retry_attempts.pop(run_id, None)
+                if retryable:
+                    attempt = retry_attempts.get(run_id, 0) + 1
+                    retry_attempts[run_id] = attempt
+                    base = max(0.1, float(settings.swebench_retry_base_seconds))
+                    max_seconds = max(base, float(settings.swebench_retry_max_seconds))
+                    jitter = max(0.0, float(settings.swebench_retry_jitter_seconds))
+                    backoff_seconds = min(max_seconds, base * (2 ** max(0, attempt - 1)))
+                    if jitter > 0:
+                        backoff_seconds += random.uniform(0.0, jitter)
+                    retry_not_before[run_id] = time.monotonic() + backoff_seconds
+
+                    await db.execute(
+                        text(
+                            "UPDATE swe_bench_runs SET status = 'pending', batch_fk = NULL, last_error = :error, updated_at = now() WHERE id = :run_id"
+                        ),
+                        {"run_id": run_id, "error": error},
+                    )
+                    deferred += 1
+                    is_capacity_error = bool(error) and "at capacity" in error.lower()
+                    if is_capacity_error:
+                        cooldown_seconds = min(
+                            max_seconds,
+                            base + (random.uniform(0.0, jitter) if jitter > 0 else 0.0),
+                        )
+                        app.state.swebench_global_retry_not_before = time.monotonic() + cooldown_seconds
+                else:
+                    retry_not_before.pop(run_id, None)
+                    retry_attempts.pop(run_id, None)
+                    await db.execute(
+                        text(
+                            "UPDATE swe_bench_runs SET status = 'failed', batch_fk = NULL, last_error = :error, updated_at = now() WHERE id = :run_id"
+                        ),
+                        {"run_id": run_id, "error": error},
+                    )
+                    failed += 1
+
+            if accepted_count == 0:
                 await db.execute(
-                    text(
-                        "UPDATE swe_bench_runs SET status = 'failed', last_error = :error, updated_at = now() WHERE id = :run_id"
-                    ),
-                    {"run_id": run_id, "error": error},
+                    text("DELETE FROM swe_bench_run_batches WHERE id = :batch_id"),
+                    {"batch_id": int(batch_row.id)},
                 )
-                failed += 1
 
         deferred += deferred_by_cooldown
         await db.commit()

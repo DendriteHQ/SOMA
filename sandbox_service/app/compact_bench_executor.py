@@ -670,6 +670,172 @@ class CompactBenchExecutor:
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
+    def execute_batch(
+        self,
+        *,
+        batch_id: str,
+        tasks: list[CompactBenchRunTaskRequest],
+        timeout_per_task: float | None,
+    ) -> list[CompactBenchExecutionOutput]:
+        if not tasks:
+            return []
+
+        self._maybe_cleanup_stale_output_dirs()
+        output_dir = self._output_root / _slug(batch_id, default="batch")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        shared_script_url = tasks[0].script_presigned_url
+        if any(task.script_presigned_url != shared_script_url for task in tasks):
+            raise RuntimeError("Batch execution requires shared script_presigned_url for all tasks")
+
+        first_task = tasks[0]
+        manifest_path, benchmark_id_to_run_id = self._write_batch_manifest(
+            batch_id=batch_id,
+            output_dir=output_dir,
+            tasks=tasks,
+        )
+        command = self._build_batch_command(
+            tasks=tasks,
+            output_dir=output_dir,
+            manifest_path=manifest_path,
+        )
+
+        try:
+            plugin_path = self._materialize_plugin_checkout(
+                output_dir=output_dir,
+                script_presigned_url=shared_script_url,
+            )
+            env = os.environ.copy()
+            llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
+            if llm_base_url:
+                proxy_handle = self._ensure_llm_proxy(llm_base_url)
+                env["LLM_BASE_URL"] = proxy_handle.proxy_base_url
+                env["SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"] = proxy_handle.private_network_name
+            env.pop("SOMA_OPENCLAW_RUN_ID_HEADER_VALUE", None)
+            env["SOMA_OPENCLAW_BATCH_ID_HEADER_VALUE"] = str(batch_id)
+            env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
+            env["SOMA_OPENCLAW_PLUGIN_PATH"] = str(plugin_path)
+
+            started_at = time.monotonic()
+            process = subprocess.run(
+                command,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=(
+                    None
+                    if timeout_per_task is None
+                    else max(1.0, float(timeout_per_task)) * max(1, len(tasks))
+                ),
+                check=False,
+            )
+            duration = time.monotonic() - started_at
+
+            rows = self._read_result_rows(output_dir)
+            row_by_benchmark_id: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                benchmark_id = str(row.get("benchmark_id") or "").strip()
+                if benchmark_id:
+                    row_by_benchmark_id[benchmark_id] = row
+
+            outputs: list[CompactBenchExecutionOutput] = []
+            for task in tasks:
+                benchmark_id = ""
+                for candidate_id, candidate_run_id in benchmark_id_to_run_id.items():
+                    if candidate_run_id == task.run_id:
+                        benchmark_id = candidate_id
+                        break
+                row = row_by_benchmark_id.get(benchmark_id)
+                if row is None:
+                    metadata = dict(task.metadata)
+                    metadata.update(
+                        {
+                            "benchmark": task.benchmark,
+                            "instance_id": task.instance_id,
+                            "status": "runtime-error",
+                            "command": shlex.join(command),
+                            "returncode": process.returncode,
+                            "output_dir": str(output_dir),
+                            "plugin_path": str(plugin_path),
+                        }
+                    )
+                    error_text = process.stderr.strip() or process.stdout.strip() or "No result row for batch item"
+                    outputs.append(
+                        CompactBenchExecutionOutput(
+                            report=CompactBenchReportRequest(
+                                run_id=task.run_id,
+                                ok_status=False,
+                                error=error_text,
+                                execution_time_seconds=duration,
+                                total_tokens=None,
+                                agent_steps=None,
+                                patch_capture_status=False,
+                                patch_diff=None,
+                                metadata=metadata,
+                            ),
+                            patch_text="",
+                        )
+                    )
+                    continue
+
+                row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                patch_capture = (
+                    row_metadata.get("patch_capture")
+                    if isinstance(row_metadata.get("patch_capture"), dict)
+                    else {}
+                )
+                patch_path = patch_capture.get("patch_path") if isinstance(patch_capture, dict) else None
+                patch_capture_status = False
+                patch_text = ""
+                if isinstance(patch_path, str) and patch_path.strip():
+                    patch_file = Path(patch_path)
+                    if patch_file.is_file():
+                        patch_capture_status = True
+                        patch_text = patch_file.read_text(encoding="utf-8")
+
+                status = str(row.get("status") or "runtime-error")
+                success = status == "completed"
+                row_error_text = str(row.get("error") or "").strip() or None
+                error_text = row_error_text if row_error_text else (None if success else "Batch runtime execution failed")
+                total_tokens, agent_steps = self._extract_execution_metrics(
+                    row=row,
+                    metadata=row_metadata,
+                )
+                metadata = dict(task.metadata)
+                metadata.update(row_metadata)
+                metadata.update(
+                    {
+                        "benchmark": task.benchmark,
+                        "instance_id": task.instance_id,
+                        "status": status,
+                        "command": shlex.join(command),
+                        "returncode": process.returncode,
+                        "output_dir": str(output_dir),
+                        "plugin_path": str(plugin_path),
+                        "total_tokens": total_tokens,
+                    }
+                )
+
+                outputs.append(
+                    CompactBenchExecutionOutput(
+                        report=CompactBenchReportRequest(
+                            run_id=task.run_id,
+                            ok_status=success,
+                            error=error_text,
+                            execution_time_seconds=duration,
+                            total_tokens=total_tokens,
+                            agent_steps=agent_steps,
+                            patch_capture_status=patch_capture_status,
+                            patch_diff=patch_text or None,
+                            metadata=metadata,
+                        ),
+                        patch_text=patch_text,
+                    )
+                )
+            return outputs
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
     def _ensure_benchmark_installed(self) -> None:
         logger.info(
             "Ensuring SOMA-benchmark is installed in sandbox-service environment: python=%s package_spec=%s",
@@ -791,6 +957,114 @@ class CompactBenchExecutor:
         if task.openclaw_disable_somarizer:
             command.append("--openclaw-disable-plugin")
         return command
+
+    def _build_batch_command(
+        self,
+        *,
+        tasks: list[CompactBenchRunTaskRequest],
+        output_dir: Path,
+        manifest_path: Path,
+    ) -> list[str]:
+        first_task = tasks[0]
+        concurrency = self._resolve_batch_concurrency(task_count=len(tasks))
+        timeout_candidates = [int(task.openclaw_timeout) for task in tasks if task.openclaw_timeout is not None]
+        max_openclaw_timeout = max(timeout_candidates) if timeout_candidates else None
+
+        command = [
+            self._python_executable,
+            "-m",
+            BENCHMARK_PACKAGE_NAME,
+            "benchmark-run-infer",
+            "--dataset",
+            str(manifest_path),
+            "--runtime-backend",
+            first_task.agent_name,
+            "--workspace",
+            "docker",
+            "--output-dir",
+            str(output_dir),
+            "--execute",
+            "--concurrency",
+            str(concurrency),
+        ]
+        if first_task.agent_name == "openclaw":
+            command.extend(
+                [
+                    "--openclaw-current-user",
+                    "--openclaw-ignore-api-key",
+                ]
+            )
+            if first_task.openclaw_disable_somarizer:
+                command.append("--openclaw-disable-plugin")
+            if max_openclaw_timeout is not None:
+                command.extend(["--openclaw-command", f"--timeout {max_openclaw_timeout}"])
+        return command
+
+    def _resolve_batch_concurrency(self, *, task_count: int) -> int:
+        configured = os.getenv("COMPACT_BENCH_BATCH_CONCURRENCY", "").strip()
+        if configured:
+            try:
+                value = int(configured)
+                if value > 0:
+                    return min(value, task_count)
+            except ValueError:
+                pass
+        return max(1, task_count)
+
+    def _write_batch_manifest(
+        self,
+        *,
+        batch_id: str,
+        output_dir: Path,
+        tasks: list[CompactBenchRunTaskRequest],
+    ) -> tuple[Path, dict[str, int]]:
+        from soma_bench.benchmark.solve import build_direct_manifest_row
+        from soma_bench.benchmark.runner_settings import resolve_runner_config
+
+        benchmark_id_to_run_id: dict[str, int] = {}
+        manifest_rows: list[dict[str, Any]] = []
+        repo_root = Path(__file__).resolve().parents[3] / "SOMA-benchmark"
+
+        for task in tasks:
+            resolved = resolve_runner_config(
+                repo_root=repo_root,
+                agent_name=task.agent_name,
+                model=task.model,
+                benchmark_name=task.benchmark,
+                selection_id=task.instance_id,
+                ignore_api_key=True,
+            )
+            benchmark_id = _slug(f"{task.instance_id}-run-{task.run_id}", default="task")
+            row = build_direct_manifest_row(
+                benchmark_name=task.benchmark,
+                instance_id=task.instance_id,
+                runtime_setup_entry=resolved.benchmark.runtime_setup_entry,
+                runtime_options={
+                    "openclaw_ignore_api_key": True,
+                    **(
+                        {"openclaw_command": f"--timeout {int(task.openclaw_timeout)}"}
+                        if task.openclaw_timeout is not None
+                        else {}
+                    ),
+                },
+            )
+            row["benchmark_id"] = benchmark_id
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            metadata.update(
+                {
+                    "batch_id": batch_id,
+                    "batch_run_id": int(task.run_id),
+                }
+            )
+            row["metadata"] = metadata
+            manifest_rows.append(row)
+            benchmark_id_to_run_id[benchmark_id] = int(task.run_id)
+
+        manifest_path = output_dir / "batch-manifest.jsonl"
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            for row in manifest_rows:
+                handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+        return manifest_path, benchmark_id_to_run_id
 
     def _write_plugin_template(self, plugin_path: Path) -> None:
         for rel, data in self._plugin_template_cache.items():
@@ -952,6 +1226,24 @@ class CompactBenchExecutor:
             if isinstance(payload, dict):
                 return payload
         return {}
+
+    def _read_result_rows(self, output_dir: Path) -> list[dict[str, Any]]:
+        output_json_path = output_dir / "output.jsonl"
+        if not output_json_path.is_file():
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for raw_line in output_json_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+        return rows
 
     def _extract_execution_metrics(
         self,

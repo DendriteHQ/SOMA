@@ -7,6 +7,9 @@ from typing import Any
 import httpx
 
 from soma_shared.contracts.sandbox.v1.messages import (
+    CompactBenchRunTaskBatchItem,
+    CompactBenchRunTaskBatchRequest,
+    CompactBenchRunTaskBatchResponse,
     CompactBenchRunTaskRequest,
     CompactBenchRunTaskResponse,
 )
@@ -194,6 +197,22 @@ class RemoteCompactBenchManager:
         response.raise_for_status()
         return CompactBenchRunTaskResponse.model_validate(response.json())
 
+    async def _dispatch_batch(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        payload: CompactBenchRunTaskBatchRequest,
+        timeout: float,
+    ) -> CompactBenchRunTaskBatchResponse:
+        sandbox_url = self._pick_sandbox_url()
+        response = await client.post(
+            f"{sandbox_url}/run_compact_bench_task_batch",
+            json=payload.model_dump(mode="json"),
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return CompactBenchRunTaskBatchResponse.model_validate(response.json())
+
     def _format_dispatch_error(self, exc: Exception) -> tuple[str, bool]:
         if isinstance(exc, httpx.TimeoutException):
             return "Compact-bench service acknowledgement timed out", True
@@ -244,6 +263,75 @@ class RemoteCompactBenchManager:
         if dispatch_result.success:
             return True, None, False
         return False, "Compact-bench service rejected task dispatch", False
+
+    async def dispatch_swebench_run_batch(
+        self,
+        *,
+        batch_id: str,
+        script_presigned_url: str,
+        tasks: list[dict[str, Any]],
+    ) -> tuple[bool, list[int], str | None, bool]:
+        if not tasks:
+            raise SandboxExecutionError("dispatch_swebench_run_batch requires at least one task")
+
+        batch_items: list[CompactBenchRunTaskBatchItem] = []
+        for raw_task in tasks:
+            run_id = raw_task.get("run_id")
+            if run_id is None:
+                raise SandboxExecutionError("Batch task payload requires 'run_id'")
+
+            context = dict(raw_task.get("task_context") or {})
+            context.setdefault("run_id", int(run_id))
+            context.setdefault("benchmark", raw_task.get("benchmark"))
+            context.setdefault("instance_id", raw_task.get("instance_id"))
+            if raw_task.get("openclaw_timeout") is not None:
+                context.setdefault("openclaw_timeout", raw_task.get("openclaw_timeout"))
+
+            request_item = self._build_task_request(
+                run_id=int(run_id),
+                task_context=context,
+                storage_uuid=str(raw_task.get("storage_uuid") or ""),
+                script_presigned_url=script_presigned_url,
+                challenge_text="",
+            )
+            batch_items.append(
+                CompactBenchRunTaskBatchItem(
+                    benchmark=request_item.benchmark,
+                    instance_id=request_item.instance_id,
+                    run_id=request_item.run_id,
+                    agent_name=request_item.agent_name,
+                    model=request_item.model,
+                    openclaw_timeout=request_item.openclaw_timeout,
+                    openclaw_disable_somarizer=request_item.openclaw_disable_somarizer,
+                    metadata=request_item.metadata,
+                )
+            )
+
+        payload = CompactBenchRunTaskBatchRequest(
+            batch_id=batch_id,
+            script_presigned_url=script_presigned_url,
+            tasks=batch_items,
+        )
+        timeout = max(1.0, float(self._submission_timeout_seconds))
+        async with httpx.AsyncClient() as client:
+            try:
+                dispatch_result = await self._dispatch_batch(
+                    client=client,
+                    payload=payload,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                error, retryable = self._format_dispatch_error(exc)
+                return False, [], error, retryable
+
+        if dispatch_result.success:
+            return True, list(dispatch_result.failed_run_ids), None, False
+        return (
+            False,
+            list(dispatch_result.failed_run_ids),
+            dispatch_result.error or "Compact-bench service rejected batch dispatch",
+            False,
+        )
 
     def shutdown(self) -> None:
         logger.info("[RemoteCompactBench] Shutdown complete")

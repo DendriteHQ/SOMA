@@ -19,6 +19,9 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from soma_shared.contracts.sandbox.v1.messages import (
+    CompactBenchRunTaskBatchItem,
+    CompactBenchRunTaskBatchRequest,
+    CompactBenchRunTaskBatchResponse,
     CompactBenchReportRequest,
     CompactBenchRunTaskRequest,
     CompactBenchRunTaskResponse,
@@ -154,13 +157,13 @@ async def startup() -> None:
     get_compact_bench_executor()
     max_concurrent = _get_max_concurrent()
     app.state.sandbox_semaphore = asyncio.Semaphore(max_concurrent)
-    app.state.active_runs: set[int] = set()
+    app.state.active_runs = set()
     app.state.capacity_reject_count = 0
     app.state.accepted_after_reject = 0
-    app.state.rejected_by_run_id: dict[int, int] = {}
+    app.state.rejected_by_run_id = {}
     app.state.capacity_cooldown_until = 0.0
     app.state.runtime_fail_counters = Counter()
-    app.state.last_transport_error: dict[str, Any] | None = None
+    app.state.last_transport_error = None
 
     app.state.callback_queue = CallbackQueue(_get_callback_queue_path())
     app.state.callback_retry_task = asyncio.create_task(_callback_retry_loop())
@@ -368,7 +371,11 @@ async def _callback_retry_loop() -> None:
         await asyncio.sleep(_get_callback_retry_poll_seconds())
 
 
-async def _execute_compact_bench_task_in_background(request: CompactBenchRunTaskRequest) -> None:
+async def _execute_compact_bench_task_in_background(
+    request: CompactBenchRunTaskRequest,
+    *,
+    batch_id: str | None = None,
+) -> None:
     try:
         executor = get_compact_bench_executor()
         logger.info(
@@ -379,7 +386,7 @@ async def _execute_compact_bench_task_in_background(request: CompactBenchRunTask
         )
         output = await asyncio.to_thread(
             executor.execute_task,
-            batch_id=str(request.run_id),
+            batch_id=(batch_id or str(request.run_id)),
             task=request,
             timeout_per_task=request.openclaw_timeout,
         )
@@ -472,6 +479,7 @@ async def _execute_compact_bench_task_in_background(request: CompactBenchRunTask
             metadata={
                 "benchmark": request.benchmark,
                 "instance_id": request.instance_id,
+                "batch_id": batch_id,
                 "traceback": tb,
             },
         )
@@ -482,6 +490,112 @@ async def _execute_compact_bench_task_in_background(request: CompactBenchRunTask
         active_runs.discard(request.run_id)
         logger.info("Releasing compact-bench capacity slot: run_id=%s", request.run_id)
         _release_capacity_slot()
+
+
+async def _execute_compact_bench_batch_in_background(
+    *,
+    batch_id: str,
+    requests: list[CompactBenchRunTaskRequest],
+) -> None:
+    run_ids = [request.run_id for request in requests]
+    try:
+        executor = get_compact_bench_executor()
+        logger.info(
+            "Starting compact-bench shared batch execution: batch_id=%s runs=%s",
+            batch_id,
+            run_ids,
+        )
+        outputs = await asyncio.to_thread(
+            executor.execute_batch,
+            batch_id=batch_id,
+            tasks=requests,
+            timeout_per_task=max(
+                [float(request.openclaw_timeout) for request in requests if request.openclaw_timeout is not None]
+                or [1800.0]
+            ),
+        )
+        output_by_run_id = {output.report.run_id: output for output in outputs}
+
+        for request in requests:
+            output = output_by_run_id.get(request.run_id)
+            if output is None:
+                fallback_report = CompactBenchReportRequest(
+                    run_id=request.run_id,
+                    ok_status=False,
+                    error="Missing batch result for accepted run",
+                    execution_time_seconds=None,
+                    total_tokens=None,
+                    agent_steps=None,
+                    patch_capture_status=False,
+                    patch_diff=None,
+                    metadata={
+                        "benchmark": request.benchmark,
+                        "instance_id": request.instance_id,
+                        "batch_id": batch_id,
+                    },
+                )
+                app.state.runtime_fail_counters[_classify_runtime_failure(fallback_report.error)] += 1
+                await _enqueue_callback(fallback_report)
+                continue
+
+            if not output.report.ok_status:
+                reason = _classify_runtime_failure(output.report.error)
+                app.state.runtime_fail_counters[reason] += 1
+            await _enqueue_callback(output.report)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(
+            "Compact-bench shared batch failed before reporting: batch_id=%s error=%s\n%s",
+            batch_id,
+            str(exc),
+            tb,
+        )
+        for request in requests:
+            fallback_report = CompactBenchReportRequest(
+                run_id=request.run_id,
+                ok_status=False,
+                error=f"{type(exc).__name__}: {exc}",
+                execution_time_seconds=None,
+                total_tokens=None,
+                agent_steps=None,
+                patch_capture_status=False,
+                patch_diff=None,
+                metadata={
+                    "benchmark": request.benchmark,
+                    "instance_id": request.instance_id,
+                    "batch_id": batch_id,
+                    "traceback": tb,
+                },
+            )
+            app.state.runtime_fail_counters[_classify_runtime_failure(fallback_report.error)] += 1
+            await _enqueue_callback(fallback_report)
+    finally:
+        active_runs: set[int] = app.state.active_runs
+        for request in requests:
+            active_runs.discard(request.run_id)
+            logger.info("Releasing compact-bench capacity slot: run_id=%s batch_id=%s", request.run_id, batch_id)
+            _release_capacity_slot()
+
+
+def _build_single_task_from_batch_item(
+    *,
+    item: CompactBenchRunTaskBatchItem,
+    script_presigned_url: str,
+    batch_id: str,
+) -> CompactBenchRunTaskRequest:
+    metadata = dict(item.metadata)
+    metadata.setdefault("batch_id", batch_id)
+    return CompactBenchRunTaskRequest(
+        benchmark=item.benchmark,
+        instance_id=item.instance_id,
+        run_id=item.run_id,
+        script_presigned_url=script_presigned_url,
+        agent_name=item.agent_name,
+        model=item.model,
+        openclaw_timeout=item.openclaw_timeout,
+        openclaw_disable_somarizer=item.openclaw_disable_somarizer,
+        metadata=metadata,
+    )
 
 
 @app.post("/run_compact_bench_task", response_model=CompactBenchRunTaskResponse)
@@ -510,6 +624,80 @@ async def run_compact_bench_task(
     )
     asyncio.create_task(_execute_compact_bench_task_in_background(request))
     return CompactBenchRunTaskResponse(success=True)
+
+
+@app.post("/run_compact_bench_task_batch", response_model=CompactBenchRunTaskBatchResponse)
+async def run_compact_bench_task_batch(
+    request: CompactBenchRunTaskBatchRequest,
+) -> CompactBenchRunTaskBatchResponse:
+    """Accept a compact-bench task batch for asynchronous execution and callback reporting."""
+
+    _get_compact_bench_report_url()
+    if not request.tasks:
+        return CompactBenchRunTaskBatchResponse(
+            success=False,
+            batch_id=request.batch_id,
+            failed_run_ids=[],
+            error="Batch contains no tasks",
+        )
+
+    accepted_requests: list[CompactBenchRunTaskRequest] = []
+    failed_run_ids: list[int] = []
+
+    for item in request.tasks:
+        try:
+            await _acquire_capacity_slot(
+                operation_kind="Compact-bench-batch",
+                operation_id=str(item.run_id),
+            )
+        except HTTPException:
+            failed_run_ids.append(item.run_id)
+            continue
+
+        rejected_by_run_id: dict[int, int] = app.state.rejected_by_run_id
+        previous_rejects = rejected_by_run_id.pop(item.run_id, 0)
+        if previous_rejects > 0:
+            app.state.accepted_after_reject += 1
+
+        app.state.active_runs.add(item.run_id)
+        accepted_requests.append(
+            _build_single_task_from_batch_item(
+                item=item,
+                script_presigned_url=request.script_presigned_url,
+                batch_id=request.batch_id,
+            )
+        )
+        logger.info(
+            "Accepted compact-bench batch item: batch_id=%s run_id=%s benchmark=%s instance_id=%s previous_rejects=%s accepted_after_reject=%s",
+            request.batch_id,
+            item.run_id,
+            item.benchmark,
+            item.instance_id,
+            previous_rejects,
+            app.state.accepted_after_reject,
+        )
+
+    if not accepted_requests:
+        return CompactBenchRunTaskBatchResponse(
+            success=False,
+            batch_id=request.batch_id,
+            failed_run_ids=failed_run_ids,
+            error="Compact-bench service rejected all batch tasks due to capacity limits",
+        )
+
+    asyncio.create_task(
+        _execute_compact_bench_batch_in_background(
+            batch_id=request.batch_id,
+            requests=accepted_requests,
+        )
+    )
+
+    return CompactBenchRunTaskBatchResponse(
+        success=True,
+        batch_id=request.batch_id,
+        failed_run_ids=failed_run_ids,
+        error=None,
+    )
 
 
 @app.get("/health")
