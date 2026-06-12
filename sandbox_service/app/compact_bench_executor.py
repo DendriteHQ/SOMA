@@ -88,6 +88,23 @@ def _step_count(value: Any) -> int | None:
     return None
 
 
+def _normalize_model_name(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _resolve_batch_model(tasks: list[CompactBenchRunTaskRequest]) -> str | None:
+    batch_models = {_normalize_model_name(task.model) for task in tasks}
+    batch_models.discard(None)
+    if len(batch_models) > 1:
+        raise RuntimeError(
+            "Batch execution requires a single shared model across all tasks"
+        )
+    return next(iter(batch_models), None)
+
+
 def _coerce_positive_int(value: Any, default: int) -> int:
     if value is None:
         return default
@@ -227,6 +244,7 @@ def _build_nginx_config(*, upstream_base_url: str, listen_port: int) -> str:
             f"      send_timeout {send_timeout}s;",
             "      proxy_set_header Connection \"\";",
             "      proxy_set_header Host $proxy_host;",
+            "      proxy_set_header X-Batch-Id $http_x_batch_id;",
             "      proxy_set_header X-Run-Id $http_x_run_id;",
             "      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
             "      proxy_set_header X-Forwarded-Proto $scheme;",
@@ -683,6 +701,7 @@ class CompactBenchExecutor:
         self._maybe_cleanup_stale_output_dirs()
         output_dir = self._output_root / _slug(batch_id, default="batch")
         output_dir.mkdir(parents=True, exist_ok=True)
+        batch_model = _resolve_batch_model(tasks)
 
         shared_script_url = tasks[0].script_presigned_url
         if any(task.script_presigned_url != shared_script_url for task in tasks):
@@ -711,6 +730,8 @@ class CompactBenchExecutor:
                 proxy_handle = self._ensure_llm_proxy(llm_base_url)
                 env["LLM_BASE_URL"] = proxy_handle.proxy_base_url
                 env["SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"] = proxy_handle.private_network_name
+            if batch_model:
+                env["LLM_MODEL"] = batch_model
             env.pop("SOMA_OPENCLAW_RUN_ID_HEADER_VALUE", None)
             env["SOMA_OPENCLAW_BATCH_ID_HEADER_VALUE"] = str(batch_id)
             env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)

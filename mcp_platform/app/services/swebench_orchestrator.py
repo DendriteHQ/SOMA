@@ -833,6 +833,7 @@ async def _dispatch_due_runs(
 
         dispatch_rows: list[dict] = []
         deferred_by_cooldown = 0
+        target_group_key: tuple[int | None, int | None] | None = None
         for row in due_rows:
             run_id = int(row["run_id"])
             retry_at = retry_not_before.get(run_id)
@@ -842,6 +843,19 @@ async def _dispatch_due_runs(
                     # Preserve strict queue order: do not bypass a cooling head run.
                     break
                 continue
+
+            row_group_key = (
+                int(row["miner_fk"]) if row.get("miner_fk") is not None else None,
+                int(row["script_fk"]) if row.get("script_fk") is not None else None,
+            )
+            if target_group_key is None:
+                # Anchor dispatch to the first eligible miner/script to avoid mixed-group bursts.
+                target_group_key = row_group_key
+            if row_group_key != target_group_key:
+                if strict_fifo_dispatch:
+                    break
+                continue
+
             dispatch_rows.append(row)
             if strict_fifo_dispatch or len(dispatch_rows) >= batch_size:
                 break
