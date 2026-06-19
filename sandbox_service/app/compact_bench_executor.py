@@ -41,12 +41,20 @@ class NginxProxyHandle:
     private_network_name: str
 
 
+@dataclass(slots=True)
+class CopilotCompressionHandle:
+    container_name: str
+    run_id: int
+
+
 PLUGIN_VENV_DIRNAME = ".soma-openclaw-venv"
 PLUGIN_BACKEND_FILENAME = "base_miner.py"
 PLUGIN_COPY_IGNORE_NAMES = {".git", PLUGIN_VENV_DIRNAME, "logs"}
 TIKTOKEN_CACHE_DIRNAME = "tiktoken-cache"
 COMPRESSION_SERVICE_IMAGE_NAME = "soma-compression-service:latest"
 COMPRESSION_SERVICE_CONTEXT_DIRNAME = "compression_service"
+COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT = "soma-copilot-sandbox-shared"
+COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT = "http://compression-run-{run_id}:8000/"
 TIKTOKEN_CL100K_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 TIKTOKEN_CL100K_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
 BENCHMARK_PACKAGE_NAME = "soma_bench"
@@ -106,8 +114,20 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, check=False)
+def _run_command(
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        cwd=str(cwd) if cwd is not None else None,
+    )
 
 
 def _docker_container_running(name: str) -> bool:
@@ -197,6 +217,53 @@ def _build_compression_service_image() -> None:
 
 def _build_proxy_container_name() -> str:
     return "soma-benchmark-nginx"
+
+
+def _resolve_copilot_shared_proxy_enabled() -> bool:
+    raw = os.getenv("COMPACT_BENCH_COPILOT_SHARED_PROXY", "true").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _resolve_copilot_shared_compose_project() -> str:
+    value = os.getenv("COMPACT_BENCH_COPILOT_COMPOSE_PROJECT", COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT).strip()
+    return value or COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT
+
+
+def _resolve_copilot_compose_file() -> Path:
+    configured = os.getenv("COMPACT_BENCH_COPILOT_COMPOSE_FILE", "").strip()
+    if configured:
+        compose_file = Path(configured).expanduser().resolve()
+        if compose_file.is_file():
+            return compose_file
+        raise RuntimeError(f"Configured COMPACT_BENCH_COPILOT_COMPOSE_FILE not found: {compose_file}")
+
+    try:
+        from soma_bench.benchmark.backends.copilot.copilot import COPILOT_DEFAULT_COMPOSE_FILE
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Unable to resolve Copilot compose file from installed soma_bench package. "
+            "Set COMPACT_BENCH_COPILOT_COMPOSE_FILE explicitly."
+        ) from exc
+
+    compose_file = Path(COPILOT_DEFAULT_COMPOSE_FILE).expanduser().resolve()
+    if not compose_file.is_file():
+        raise RuntimeError(f"Resolved Copilot compose file does not exist: {compose_file}")
+    return compose_file
+
+
+def _resolve_copilot_compression_url_template() -> str:
+    value = os.getenv("COMPACT_BENCH_COPILOT_COMPRESSION_URL_TEMPLATE", "").strip()
+    if value:
+        return value
+    return COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT
+
+
+def _resolve_copilot_sandbox_network_name(*, compose_project: str) -> str:
+    return f"{compose_project}_copilot-sandbox"
+
+
+def _resolve_copilot_compression_container_name(*, run_id: int) -> str:
+    return f"compression-run-{run_id}"
 
 
 def _resolve_private_network_name() -> str:
@@ -372,6 +439,10 @@ class CompactBenchExecutor:
         self._last_output_cleanup_monotonic = 0.0
         self._benchmark_package_spec = _resolve_benchmark_package_spec()
         self._plugin_repository_url = _resolve_plugin_repository_url()
+        self._copilot_shared_proxy_enabled = _resolve_copilot_shared_proxy_enabled()
+        self._copilot_compose_project = _resolve_copilot_shared_compose_project()
+        self._copilot_compose_file: Path | None = None
+        self._copilot_compression_url_template = _resolve_copilot_compression_url_template()
         self._output_root.mkdir(parents=True, exist_ok=True)
         self._maybe_cleanup_stale_output_dirs(force=True)
 
@@ -386,6 +457,108 @@ class CompactBenchExecutor:
 
         self._preload_plugin_template()
         self._preload_tiktoken_cache()
+        self._ensure_copilot_shared_proxy_stack()
+
+    def _ensure_copilot_shared_proxy_stack(self) -> None:
+        if not self._copilot_shared_proxy_enabled:
+            logger.info("Copilot shared proxy disabled via COMPACT_BENCH_COPILOT_SHARED_PROXY")
+            return
+
+        compose_file = _resolve_copilot_compose_file()
+        env = os.environ.copy()
+        env["COMPOSE_PROFILES"] = "copilot-sidecars"
+        env["PROXY_COMPRESSION_BASE_URL_TEMPLATE"] = self._copilot_compression_url_template
+        env["PROXY_COMPRESSION_ENABLED"] = "true"
+        logger.info(
+            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s",
+            compose_file,
+            self._copilot_compose_project,
+        )
+        result = _run_command(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "--project-name",
+                self._copilot_compose_project,
+                "up",
+                "-d",
+                "proxy",
+            ],
+            env=env,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"Failed to ensure shared Copilot proxy stack: {message}")
+        self._copilot_compose_file = compose_file
+
+    def _start_copilot_run_compression_service(
+        self,
+        *,
+        run_id: int,
+        miner_module_path: Path,
+    ) -> CopilotCompressionHandle:
+        if not self._copilot_shared_proxy_enabled:
+            raise RuntimeError("Per-run Copilot compression container requires shared Copilot proxy to be enabled")
+
+        image_name = _get_compression_service_image_name()
+        if not _docker_image_exists(image_name):
+            raise RuntimeError(
+                f"Compression service Docker image not found: {image_name}. "
+                "Build it first or set COMPACT_BENCH_COMPRESSION_SERVICE_IMAGE."
+            )
+
+        network_name = _resolve_copilot_sandbox_network_name(compose_project=self._copilot_compose_project)
+        container_name = _resolve_copilot_compression_container_name(run_id=run_id)
+        miner_module_path = miner_module_path.resolve()
+        if not miner_module_path.is_file():
+            raise RuntimeError(f"Missing miner module for compression container: {miner_module_path}")
+
+        _run_command(["docker", "rm", "-f", "-v", container_name])
+
+        run_result = _run_command(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                container_name,
+                "--network",
+                network_name,
+                "--network-alias",
+                container_name,
+                "-e",
+                "MINER_MODULE_PATH=/app/miner/base_miner.py",
+                "-e",
+                "COMPRESSION_MUTATE_REQUEST=true",
+                "-v",
+                f"{miner_module_path}:/app/miner/base_miner.py:ro",
+                image_name,
+            ]
+        )
+        if run_result.returncode != 0:
+            message = (run_result.stderr or run_result.stdout or "").strip()
+            raise RuntimeError(
+                f"Failed to start per-run compression container {container_name!r}: {message}"
+            )
+
+        logger.info(
+            "Per-run Copilot compression container started: run_id=%s container=%s network=%s",
+            run_id,
+            container_name,
+            network_name,
+        )
+        return CopilotCompressionHandle(container_name=container_name, run_id=run_id)
+
+    def _stop_copilot_run_compression_service(self, handle: CopilotCompressionHandle) -> None:
+        _run_command(["docker", "rm", "-f", "-v", handle.container_name])
+        logger.info(
+            "Per-run Copilot compression container stopped: run_id=%s container=%s",
+            handle.run_id,
+            handle.container_name,
+        )
 
     def _preload_plugin_template(self) -> None:
         template = self._ensure_plugin_template_checkout()
@@ -511,15 +684,28 @@ class CompactBenchExecutor:
         )
 
         try:
-            plugin_path = self._materialize_plugin_checkout(
-                output_dir=output_dir,
-                script_presigned_url=task.script_presigned_url,
-            )
-            logger.info(
-                "Benchmark plugin prepared: run_id=%s plugin_path=%s",
-                task.run_id,
-                plugin_path,
-            )
+            plugin_path: Path | None = None
+            miner_module_path: Path | None = None
+            if task.agent_name == "openclaw":
+                plugin_path = self._materialize_plugin_checkout(
+                    output_dir=output_dir,
+                    script_presigned_url=task.script_presigned_url,
+                )
+                logger.info(
+                    "Benchmark plugin prepared: run_id=%s plugin_path=%s",
+                    task.run_id,
+                    plugin_path,
+                )
+            else:
+                miner_module_path = self._materialize_copilot_miner_module(
+                    output_dir=output_dir,
+                    script_presigned_url=task.script_presigned_url,
+                )
+                logger.info(
+                    "Copilot miner module prepared: run_id=%s miner_module_path=%s",
+                    task.run_id,
+                    miner_module_path,
+                )
             effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
             timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
             openclaw_agent_timeout_seconds = int(timeout) if timeout is not None else None
@@ -531,25 +717,51 @@ class CompactBenchExecutor:
                 openclaw_agent_timeout_seconds=openclaw_agent_timeout_seconds,
             )
             env = os.environ.copy()
+            copilot_compression_handle: CopilotCompressionHandle | None = None
             llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
             proxy_handle: NginxProxyHandle | None = None
             if llm_base_url:
-                logger.info(
-                    "Ensuring benchmark LLM proxy: run_id=%s upstream_host=%s",
-                    task.run_id,
-                    urlsplit(llm_base_url).netloc,
-                )
-                proxy_handle = self._ensure_llm_proxy(llm_base_url)
-                env["LLM_BASE_URL"] = proxy_handle.proxy_base_url
-                env["SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"] = proxy_handle.private_network_name
-                logger.info(
-                    "Benchmark LLM proxy ready: run_id=%s proxy_base_url=%s private_network=%s",
-                    task.run_id,
-                    proxy_handle.proxy_base_url,
-                    proxy_handle.private_network_name,
-                )
-            env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
-            env["SOMA_OPENCLAW_PLUGIN_PATH"] = str(plugin_path)
+                if task.agent_name == "openclaw":
+                    logger.info(
+                        "Ensuring benchmark LLM proxy: run_id=%s upstream_host=%s",
+                        task.run_id,
+                        urlsplit(llm_base_url).netloc,
+                    )
+                    proxy_handle = self._ensure_llm_proxy(llm_base_url)
+                    env["LLM_BASE_URL"] = proxy_handle.proxy_base_url
+                    env["SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"] = proxy_handle.private_network_name
+                    logger.info(
+                        "Benchmark LLM proxy ready: run_id=%s proxy_base_url=%s private_network=%s",
+                        task.run_id,
+                        proxy_handle.proxy_base_url,
+                        proxy_handle.private_network_name,
+                    )
+                else:
+                    # Copilot path uses benchmark-side proxy/middleware and should target upstream directly.
+                    env["LLM_BASE_URL"] = llm_base_url
+                    env.pop("SOMA_OPENCLAW_PRIVATE_NETWORK_NAME", None)
+                    if self._copilot_shared_proxy_enabled:
+                        env["SOMA_COPILOT_COMPOSE_PROJECT"] = self._copilot_compose_project
+                        env["SOMA_COPILOT_KEEP_STACK"] = "true"
+                        env["SOMA_COPILOT_SHARED_PROXY"] = "true"
+                        env["SOMA_COPILOT_SHARED_PROXY_TEARDOWN"] = "false"
+                        if self._copilot_compose_file is not None:
+                            env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
+                        if miner_module_path is None:
+                            raise RuntimeError("Copilot miner module path is not prepared")
+                        copilot_compression_handle = self._start_copilot_run_compression_service(
+                            run_id=int(task.run_id),
+                            miner_module_path=miner_module_path,
+                        )
+                    logger.info(
+                        "Using direct LLM base URL without sandbox nginx proxy: run_id=%s agent=%s upstream_host=%s",
+                        task.run_id,
+                        task.agent_name,
+                        urlsplit(llm_base_url).netloc,
+                    )
+            if plugin_path is not None:
+                env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
+                env["SOMA_OPENCLAW_PLUGIN_PATH"] = str(plugin_path)
 
             started_at = time.monotonic()
             logger.info(
@@ -664,7 +876,8 @@ class CompactBenchExecutor:
                     "command": shlex.join(command),
                     "returncode": process.returncode,
                     "output_dir": str(output_dir),
-                    "plugin_path": str(plugin_path),
+                    "plugin_path": str(plugin_path) if plugin_path is not None else "",
+                    "compression_miner_module_path": str(miner_module_path) if miner_module_path is not None else "",
                     "total_tokens": total_tokens,
                     "input_tokens": input_tokens,
                     "cached_input_tokens": cached_input_tokens,
@@ -688,6 +901,8 @@ class CompactBenchExecutor:
             )
             return CompactBenchExecutionOutput(report=report, patch_text=patch_text)
         finally:
+            if 'copilot_compression_handle' in locals() and copilot_compression_handle is not None:
+                self._stop_copilot_run_compression_service(copilot_compression_handle)
             shutil.rmtree(output_dir, ignore_errors=True)
 
     def _ensure_benchmark_installed(self) -> None:
@@ -773,7 +988,7 @@ class CompactBenchExecutor:
         *,
         task: CompactBenchRunTaskRequest,
         output_dir: Path,
-        plugin_path: Path,
+        plugin_path: Path | None,
         openclaw_agent_timeout_seconds: int | None = None,
     ) -> list[str]:
         # TODO: define the executable command and runtime flags directly in this service
@@ -803,6 +1018,8 @@ class CompactBenchExecutor:
                 ]
             )
             if not task.openclaw_disable_somarizer:
+                if plugin_path is None:
+                    raise RuntimeError("OpenClaw run requires plugin_path when plugin is enabled")
                 command.extend(["--openclaw-plugin-path", str(plugin_path)])
             if openclaw_agent_timeout_seconds is not None:
                 command.extend(["--openclaw-command", f"--timeout {openclaw_agent_timeout_seconds}"])
@@ -839,6 +1056,19 @@ class CompactBenchExecutor:
         )
 
         return plugin_path
+
+    def _materialize_copilot_miner_module(self, *, output_dir: Path, script_presigned_url: str) -> Path:
+        miner_dir = output_dir / "copilot-miner"
+        miner_dir.mkdir(parents=True, exist_ok=True)
+        miner_code = _download_miner_code(script_presigned_url)
+        module_path = miner_dir / PLUGIN_BACKEND_FILENAME
+        module_path.write_text(miner_code, encoding="utf-8")
+        logger.info(
+            "Wrote Copilot miner module: path=%s code_bytes=%s",
+            module_path,
+            len(miner_code.encode("utf-8")),
+        )
+        return module_path
 
     def _ensure_llm_proxy(self, upstream_base_url: str) -> NginxProxyHandle:
         normalized_upstream_base_url = _normalize_proxy_upstream_base_url(upstream_base_url)
@@ -1047,3 +1277,26 @@ class CompactBenchExecutor:
                 self._stop_llm_proxy(self._llm_proxy_handle)
                 _docker_remove_network(self._llm_proxy_handle.private_network_name)
                 self._llm_proxy_handle = None
+
+        if self._copilot_shared_proxy_enabled and self._copilot_compose_file is not None:
+            env = os.environ.copy()
+            env["COMPOSE_PROFILES"] = "copilot-sidecars"
+            logger.info(
+                "Tearing down shared Copilot proxy stack: compose_file=%s project=%s",
+                self._copilot_compose_file,
+                self._copilot_compose_project,
+            )
+            _run_command(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    str(self._copilot_compose_file),
+                    "--project-name",
+                    self._copilot_compose_project,
+                    "down",
+                    "--remove-orphans",
+                    "--volumes",
+                ],
+                env=env,
+            )
