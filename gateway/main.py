@@ -187,6 +187,22 @@ def _extract_forward_headers(request: Request) -> dict[str, str]:
     return headers
 
 
+def _extract_run_id_from_authorization(request: Request) -> int | None:
+    raw_auth = request.headers.get("authorization")
+    if not isinstance(raw_auth, str) or not raw_auth.strip():
+        return None
+    parts = raw_auth.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    token = parts[1].strip()
+    if not token:
+        return None
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "healthy", "service": "gateway"}
@@ -271,12 +287,19 @@ async def proxy_openai_compatible(
     request: Request,
     x_run_id: str | None = Header(default=None, alias="X-Run-Id"),
 ) -> Response:
-    if not x_run_id:
-        raise HTTPException(status_code=400, detail="Missing required header: X-Run-Id")
-    try:
-        run_id = int(x_run_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="X-Run-Id must be an integer") from exc
+    run_id: int | None = None
+    if x_run_id:
+        try:
+            run_id = int(x_run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="X-Run-Id must be an integer") from exc
+    if run_id is None:
+        run_id = _extract_run_id_from_authorization(request)
+    if run_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing run identifier. Provide X-Run-Id header or Authorization: Bearer <run_id>",
+        )
 
     method = request.method.upper()
     logger.info("gateway_request_received run_id=%s method=%s path=/v1/%s", run_id, method, path)
