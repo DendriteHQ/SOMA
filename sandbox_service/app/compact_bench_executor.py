@@ -55,9 +55,6 @@ COMPRESSION_SERVICE_IMAGE_NAME = "soma-copilot-compression-service:latest"
 COMPRESSION_SERVICE_CONTEXT_DIRNAME = "compression_service"
 COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT = "soma-copilot-sandbox-shared"
 COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT = "http://compression-run-{run_id}:8000/"
-COPILOT_SHARED_PROXY_BIND_HOST_DEFAULT = "127.0.0.1"
-COPILOT_SHARED_PROXY_BIND_PORT_DEFAULT = 18080
-COPILOT_SHARED_PROXY_HOST_ALIAS_DEFAULT = "host.docker.internal"
 TIKTOKEN_CL100K_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 TIKTOKEN_CL100K_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
 BENCHMARK_PACKAGE_NAME = "soma_bench"
@@ -247,19 +244,9 @@ def _build_proxy_container_name() -> str:
     return "soma-benchmark-nginx"
 
 
-def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _resolve_copilot_shared_proxy_enabled() -> bool:
-    return _env_flag_enabled("COMPACT_BENCH_COPILOT_SHARED_PROXY", default=False)
-
-
-def _resolve_debug_preserve_outputs_enabled() -> bool:
-    return _env_flag_enabled(COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV, default=False)
+    raw = os.getenv("COMPACT_BENCH_COPILOT_SHARED_PROXY", "true").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _resolve_copilot_shared_compose_project() -> str:
@@ -294,28 +281,6 @@ def _resolve_copilot_compression_url_template() -> str:
     if value:
         return value
     return COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT
-
-
-def _resolve_copilot_shared_proxy_bind_host() -> str:
-    value = os.getenv("COMPACT_BENCH_COPILOT_PROXY_BIND_HOST", "").strip()
-    return value or COPILOT_SHARED_PROXY_BIND_HOST_DEFAULT
-
-
-def _resolve_copilot_shared_proxy_bind_port() -> int:
-    raw = os.getenv("COMPACT_BENCH_COPILOT_PROXY_BIND_PORT", "").strip()
-    if raw:
-        try:
-            value = int(raw)
-            if value > 0:
-                return value
-        except ValueError:
-            pass
-    return COPILOT_SHARED_PROXY_BIND_PORT_DEFAULT
-
-
-def _resolve_copilot_shared_proxy_host_alias() -> str:
-    value = os.getenv("COMPACT_BENCH_COPILOT_PROXY_HOST_ALIAS", "").strip()
-    return value or COPILOT_SHARED_PROXY_HOST_ALIAS_DEFAULT
 
 
 def _resolve_copilot_sandbox_network_name(*, compose_project: str) -> str:
@@ -549,10 +514,7 @@ class CompactBenchExecutor:
         self._copilot_compose_project = _resolve_copilot_shared_compose_project()
         self._copilot_compose_file: Path | None = None
         self._copilot_compression_url_template = _resolve_copilot_compression_url_template()
-        self._copilot_shared_proxy_bind_host = _resolve_copilot_shared_proxy_bind_host()
-        self._copilot_shared_proxy_bind_port = _resolve_copilot_shared_proxy_bind_port()
-        self._copilot_shared_proxy_host_alias = _resolve_copilot_shared_proxy_host_alias()
-        self._debug_preserve_outputs = _resolve_debug_preserve_outputs_enabled()
+        self._debug_preserve_outputs = False
         self._output_root.mkdir(parents=True, exist_ok=True)
         if self._debug_preserve_outputs:
             logger.warning(
@@ -580,22 +542,14 @@ class CompactBenchExecutor:
             return
 
         compose_file = _resolve_copilot_compose_file()
-        compression_image = _get_compression_service_image_name()
         env = os.environ.copy()
         env["COMPOSE_PROFILES"] = "copilot-sidecars"
         env["PROXY_COMPRESSION_BASE_URL_TEMPLATE"] = self._copilot_compression_url_template
         env["PROXY_COMPRESSION_ENABLED"] = "true"
-        env["COPILOT_PROXY_IMAGE"] = compression_image
-        env["COPILOT_COMPRESSION_SERVICE_IMAGE"] = compression_image
-        env["COPILOT_PROXY_BIND_HOST"] = self._copilot_shared_proxy_bind_host
-        env["COPILOT_PROXY_BIND_PORT"] = str(self._copilot_shared_proxy_bind_port)
         logger.info(
-            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s image=%s bind=%s:%s",
+            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s",
             compose_file,
             self._copilot_compose_project,
-            compression_image,
-            self._copilot_shared_proxy_bind_host,
-            self._copilot_shared_proxy_bind_port,
         )
         result = _run_command(
             [

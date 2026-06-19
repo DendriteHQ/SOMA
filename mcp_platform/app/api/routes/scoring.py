@@ -355,7 +355,6 @@ def build_swe_miner_penalty_summary(
     task_categories: dict[str, str],
 ) -> dict[str, object]:
     _, category_penalties, _ = _build_category_score_context(
-    _, category_penalties, _ = _build_category_score_context(
         task_groups,
         task_categories,
     )
@@ -376,7 +375,6 @@ def build_swe_category_scores(
     task_groups: dict[int, dict[str, object]],
     task_categories: dict[str, str],
 ) -> dict[str, float | None]:
-    category_scores, _, _ = _build_category_score_context(task_groups, task_categories)
     category_scores, _, _ = _build_category_score_context(task_groups, task_categories)
     return category_scores
 
