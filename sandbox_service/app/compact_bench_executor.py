@@ -542,14 +542,18 @@ class CompactBenchExecutor:
             return
 
         compose_file = _resolve_copilot_compose_file()
+        compression_image = _get_compression_service_image_name()
         env = os.environ.copy()
         env["COMPOSE_PROFILES"] = "copilot-sidecars"
         env["PROXY_COMPRESSION_BASE_URL_TEMPLATE"] = self._copilot_compression_url_template
         env["PROXY_COMPRESSION_ENABLED"] = "true"
+        env["COPILOT_PROXY_IMAGE"] = compression_image
+        env["COPILOT_COMPRESSION_SERVICE_IMAGE"] = compression_image
         logger.info(
-            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s",
+            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s image=%s",
             compose_file,
             self._copilot_compose_project,
+            compression_image,
         )
         result = _run_command(
             [
