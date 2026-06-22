@@ -51,7 +51,7 @@ PLUGIN_VENV_DIRNAME = ".soma-openclaw-venv"
 PLUGIN_BACKEND_FILENAME = "base_miner.py"
 PLUGIN_COPY_IGNORE_NAMES = {".git", PLUGIN_VENV_DIRNAME, "logs"}
 TIKTOKEN_CACHE_DIRNAME = "tiktoken-cache"
-COMPRESSION_SERVICE_IMAGE_NAME = "soma-compression-service:latest"
+COMPRESSION_SERVICE_IMAGE_NAME = "soma-copilot-compression-service:latest"
 COMPRESSION_SERVICE_CONTEXT_DIRNAME = "compression_service"
 COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT = "soma-copilot-sandbox-shared"
 COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT = "http://compression-run-{run_id}:8000/"
@@ -184,11 +184,35 @@ def _resolve_compression_service_context() -> Path:
     configured = os.getenv("COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT", "").strip()
     if configured:
         path = Path(configured).expanduser().resolve()
-    else:
-        path = (Path(__file__).resolve().parents[1] / COMPRESSION_SERVICE_CONTEXT_DIRNAME).resolve()
-    if not path.is_dir():
-        raise RuntimeError(f"Compression service build context not found: {path}")
-    return path
+        if not path.is_dir():
+            raise RuntimeError(f"Compression service build context not found: {path}")
+        return path
+
+    candidates: list[Path] = []
+
+    # Preferred source of truth: SOMA-benchmark compression service (contains proxy + transform).
+    try:
+        import soma_bench  # type: ignore
+
+        candidates.append((Path(soma_bench.__file__).resolve().parents[1] / COMPRESSION_SERVICE_CONTEXT_DIRNAME).resolve())
+    except Exception:  # noqa: BLE001
+        pass
+
+    workspace_root = Path(__file__).resolve().parents[3]
+    candidates.append((workspace_root / "SOMA-benchmark" / "src" / COMPRESSION_SERVICE_CONTEXT_DIRNAME).resolve())
+    # Legacy fallback for local-only development setups.
+    candidates.append((Path(__file__).resolve().parents[1] / COMPRESSION_SERVICE_CONTEXT_DIRNAME).resolve())
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+
+    searched = ", ".join(str(path) for path in candidates)
+    raise RuntimeError(
+        "Compression service build context not found. "
+        "Set COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT explicitly. "
+        f"Checked: {searched}"
+    )
 
 
 def _get_compression_service_image_name() -> str:
@@ -465,14 +489,18 @@ class CompactBenchExecutor:
             return
 
         compose_file = _resolve_copilot_compose_file()
+        compression_image = _get_compression_service_image_name()
         env = os.environ.copy()
         env["COMPOSE_PROFILES"] = "copilot-sidecars"
         env["PROXY_COMPRESSION_BASE_URL_TEMPLATE"] = self._copilot_compression_url_template
         env["PROXY_COMPRESSION_ENABLED"] = "true"
+        env["COPILOT_PROXY_IMAGE"] = compression_image
+        env["COPILOT_COMPRESSION_SERVICE_IMAGE"] = compression_image
         logger.info(
-            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s",
+            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s image=%s",
             compose_file,
             self._copilot_compose_project,
+            compression_image,
         )
         result = _run_command(
             [
@@ -740,6 +768,7 @@ class CompactBenchExecutor:
                     # Copilot path uses benchmark-side proxy/middleware and should target upstream directly.
                     env["LLM_BASE_URL"] = llm_base_url
                     env.pop("SOMA_OPENCLAW_PRIVATE_NETWORK_NAME", None)
+                    env["SOMA_COPILOT_COMPRESSION_SERVICE_IMAGE"] = _get_compression_service_image_name()
                     if self._copilot_shared_proxy_enabled:
                         env["SOMA_COPILOT_COMPOSE_PROJECT"] = self._copilot_compose_project
                         env["SOMA_COPILOT_KEEP_STACK"] = "true"
