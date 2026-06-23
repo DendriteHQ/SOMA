@@ -355,9 +355,11 @@ def build_swe_miner_penalty_summary(
     task_categories: dict[str, str],
 ) -> dict[str, object]:
     _, category_penalties, _ = _build_category_score_context(
+    _, category_penalties, _ = _build_category_score_context(
         task_groups,
         task_categories,
     )
+    raw_total_score, _ = _build_swe_raw_scores(task_groups)
     raw_total_score, _ = _build_swe_raw_scores(task_groups)
     applied_total_score, _ = build_swe_miner_scores(task_groups)
     return {
@@ -375,7 +377,33 @@ def build_swe_category_scores(
     task_categories: dict[str, str],
 ) -> dict[str, float | None]:
     category_scores, _, _ = _build_category_score_context(task_groups, task_categories)
+    category_scores, _, _ = _build_category_score_context(task_groups, task_categories)
     return category_scores
+
+
+def _build_swe_raw_scores(
+    task_groups: dict[int, dict[str, object]],
+) -> tuple[float | None, float | None]:
+    total_run_scores: list[float] = []
+    screener_run_scores: list[float] = []
+
+    for group in task_groups.values():
+        run_scores = [
+            float(run["platform_score"])
+            for run in group["runs"]
+            if run["platform_score"] is not None
+        ]
+        total_run_scores.extend(run_scores)
+        if bool(group["is_screener"]):
+            screener_run_scores.extend(run_scores)
+
+    raw_total_score = sum(total_run_scores) / len(total_run_scores) if total_run_scores else None
+    raw_screener_score = (
+        sum(screener_run_scores) / len(screener_run_scores)
+        if screener_run_scores
+        else None
+    )
+    return raw_total_score, raw_screener_score
 
 
 def _build_swe_raw_scores(
@@ -492,6 +520,7 @@ def build_swe_miner_category_scores_with_penalty(
         if required_tasks and set(task_scores_by_name) != required_tasks:
             continue
 
+        category_scores, _, _ = _build_category_score_context(task_groups, category_by_task)
         category_scores, _, _ = _build_category_score_context(task_groups, category_by_task)
         miner_category_scores[hotkey] = {
             category: float(score) if score is not None else score
