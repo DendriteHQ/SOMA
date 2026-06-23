@@ -239,10 +239,11 @@ def build_swe_miner_penalty_summary(
     task_groups: dict[int, dict[str, object]],
     task_categories: dict[str, str],
 ) -> dict[str, object]:
-    category_scores, category_penalties, _, raw_total_score = _build_category_score_context(
+    _, category_penalties, _ = _build_category_score_context(
         task_groups,
         task_categories,
     )
+    raw_total_score, _ = _build_swe_raw_scores(task_groups)
     applied_total_score, _ = build_swe_miner_scores(task_groups)
     return {
         "categories": category_penalties,
@@ -258,8 +259,33 @@ def build_swe_category_scores(
     task_groups: dict[int, dict[str, object]],
     task_categories: dict[str, str],
 ) -> dict[str, float | None]:
-    category_scores, _, _, _ = _build_category_score_context(task_groups, task_categories)
+    category_scores, _, _ = _build_category_score_context(task_groups, task_categories)
     return category_scores
+
+
+def _build_swe_raw_scores(
+    task_groups: dict[int, dict[str, object]],
+) -> tuple[float | None, float | None]:
+    total_run_scores: list[float] = []
+    screener_run_scores: list[float] = []
+
+    for group in task_groups.values():
+        run_scores = [
+            float(run["platform_score"])
+            for run in group["runs"]
+            if run["platform_score"] is not None
+        ]
+        total_run_scores.extend(run_scores)
+        if bool(group["is_screener"]):
+            screener_run_scores.extend(run_scores)
+
+    raw_total_score = sum(total_run_scores) / len(total_run_scores) if total_run_scores else None
+    raw_screener_score = (
+        sum(screener_run_scores) / len(screener_run_scores)
+        if screener_run_scores
+        else None
+    )
+    return raw_total_score, raw_screener_score
 
 
 def _build_category_score_context(
@@ -269,12 +295,10 @@ def _build_category_score_context(
     dict[str, float | None],
     dict[str, float | None],
     dict[str, float | None],
-    float | None,
 ]:
     category_scores: dict[str, float | None] = {}
     category_penalties: dict[str, float | None] = {}
     category_raw_scores: dict[str, float | None] = {}
-    total_raw_scores: list[float] = []
 
     for category in ("Easy", "Medium", "Hard"):
         raw_scores: list[float] = []
@@ -312,11 +336,7 @@ def _build_category_score_context(
             if category_raw_score is not None and category_applied_score is not None
             else None
         )
-        if category_raw_score is not None:
-            total_raw_scores.append(category_raw_score)
-
-    raw_total_score = sum(total_raw_scores) / len(total_raw_scores) if total_raw_scores else None
-    return category_scores, category_penalties, category_raw_scores, raw_total_score
+    return category_scores, category_penalties, category_raw_scores
 
 
 def build_swe_miner_category_scores_with_penalty(
@@ -358,7 +378,7 @@ def build_swe_miner_category_scores_with_penalty(
         if required_tasks and set(task_scores_by_name) != required_tasks:
             continue
 
-        category_scores, _, _, _ = _build_category_score_context(task_groups, category_by_task)
+        category_scores, _, _ = _build_category_score_context(task_groups, category_by_task)
         miner_category_scores[hotkey] = {
             category: float(score) if score is not None else score
             for category, score in category_scores.items()
@@ -376,23 +396,13 @@ def build_swe_miner_category_scores_with_penalty(
 def build_swe_miner_scores(
     task_groups: dict[int, dict[str, object]],
 ) -> tuple[float | None, float | None]:
-    total_run_scores: list[float] = []
-    screener_run_scores: list[float] = []
+    raw_total_score, raw_screener_score = _build_swe_raw_scores(task_groups)
     total_baseline_tokens = 0
     total_compressed_tokens = 0
     has_baseline_tokens = False
     has_compressed_tokens = False
 
     for group in task_groups.values():
-        run_scores = [
-            float(run["platform_score"])
-            for run in group["runs"]
-            if run["platform_score"] is not None
-        ]
-        total_run_scores.extend(run_scores)
-        if bool(group["is_screener"]):
-            screener_run_scores.extend(run_scores)
-
         for baseline in group["baseline_runs"].values():
             baseline_tokens = baseline["tokens_used"]
             if baseline_tokens is None or baseline_tokens <= 0:
@@ -406,13 +416,6 @@ def build_swe_miner_scores(
                 continue
             total_compressed_tokens += int(compressed_tokens)
             has_compressed_tokens = True
-
-    raw_total_score = sum(total_run_scores) / len(total_run_scores) if total_run_scores else None
-    raw_screener_score = (
-        sum(screener_run_scores) / len(screener_run_scores)
-        if screener_run_scores
-        else None
-    )
 
     baseline_token_total = total_baseline_tokens if has_baseline_tokens else None
     compressed_token_total = total_compressed_tokens if has_compressed_tokens else None
