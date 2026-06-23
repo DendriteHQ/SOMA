@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -148,9 +149,33 @@ def _mark_last_transport_error(
     }
 
 
+def _prune_stale_copilot_networks() -> None:
+    try:
+        result = subprocess.run(
+            ["docker", "network", "ls", "--format", "{{.Name}}", "--filter", "name=soma-copilot-"],
+            capture_output=True, text=True, timeout=10,
+        )
+        networks = [n.strip() for n in result.stdout.splitlines() if n.strip()]
+        if not networks:
+            return
+        rm = subprocess.run(
+            ["docker", "network", "rm", *networks],
+            capture_output=True, text=True, timeout=30,
+        )
+        removed = [n for n in networks if n in (rm.stdout or "")]
+        skipped = len(networks) - len(removed)
+        logger.info(
+            "Startup network prune: found=%d removed=%d skipped_in_use=%d",
+            len(networks), len(removed), skipped,
+        )
+    except Exception as exc:
+        logger.warning("Startup network prune failed: %s", exc)
+
+
 @app.on_event("startup")
 async def startup() -> None:
     """Initialize compact-bench executor and shared capacity controls."""
+    _prune_stale_copilot_networks()
     get_compact_bench_executor()
     max_concurrent = _get_max_concurrent()
     app.state.sandbox_semaphore = asyncio.Semaphore(max_concurrent)
