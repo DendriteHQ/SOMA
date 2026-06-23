@@ -359,7 +359,7 @@ def build_swe_miner_penalty_summary(
         task_categories,
     )
     raw_total_score, _ = _build_swe_raw_scores(task_groups)
-    raw_total_score, _ = _build_swe_raw_scores(task_groups)
+
     applied_total_score, _ = build_swe_miner_scores(task_groups)
     return {
         "categories": category_penalties,
