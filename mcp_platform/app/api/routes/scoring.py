@@ -511,22 +511,25 @@ def build_swe_miner_scores(
     task_groups: dict[int, dict[str, object]],
 ) -> tuple[float | None, float | None]:
     raw_total_score, raw_screener_score = _build_swe_raw_scores(task_groups)
-    total_baseline_tokens = 0.0
-    total_compressed_tokens = 0.0
+    total_baseline_tokens = 0
+    total_compressed_tokens = 0
     has_baseline_tokens = False
     has_compressed_tokens = False
 
     for group in task_groups.values():
-        baseline_wt = group.get("baseline_weighted_tokens")
-        if baseline_wt is not None and baseline_wt > 0:
-            total_baseline_tokens += float(baseline_wt)
+        for baseline in group["baseline_runs"].values():
+            baseline_tokens = baseline["tokens_used"]
+            if baseline_tokens is None or baseline_tokens <= 0:
+                continue
+            total_baseline_tokens += int(baseline_tokens)
             has_baseline_tokens = True
 
         for run in group["runs"]:
-            compressed_wt = run.get("weighted_tokens_with_compression")
-            if compressed_wt is not None and compressed_wt > 0:
-                total_compressed_tokens += float(compressed_wt)
-                has_compressed_tokens = True
+            compressed_tokens = run["tokens_with_compression"]
+            if compressed_tokens is None or compressed_tokens <= 0:
+                continue
+            total_compressed_tokens += int(compressed_tokens)
+            has_compressed_tokens = True
 
     baseline_token_total = total_baseline_tokens if has_baseline_tokens else None
     compressed_token_total = total_compressed_tokens if has_compressed_tokens else None
