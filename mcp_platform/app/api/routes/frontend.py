@@ -801,6 +801,27 @@ def _weighted_token_savings_ratio(
     return (baseline_weighted_total - miner_weighted_total) / baseline_weighted_total
 
 
+def _screener_passed_from_status(
+    *,
+    status_value: str,
+    fallback: bool,
+) -> bool:
+    normalized = str(status_value or "").strip().lower()
+    if normalized in {"scored", "evaluating", "qualified"}:
+        return True
+    if normalized in {
+        "not qualified",
+        "screening",
+        "failed review",
+        "no api key",
+        "in queue",
+        "idle",
+        "banned",
+    }:
+        return False
+    return bool(fallback)
+
+
 async def _build_swe_status_overrides(
     db: AsyncSession,
     *,
@@ -1565,7 +1586,10 @@ async def _get_competition_aggregate_impl(
                 miner=SweMinerSummary(
                     hotkey=hotkey,
                     total_score=miner_snapshot.total_score,
-                    screener_passed=miner_snapshot.screener_passed,
+                    screener_passed=_screener_passed_from_status(
+                        status_value=miner_status,
+                        fallback=miner_snapshot.screener_passed,
+                    ),
                     category_scores=miner_snapshot.category_scores,
                     task_count=miner_snapshot.task_count,
                     screener_task_count=miner_snapshot.screener_task_count,

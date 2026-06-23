@@ -414,31 +414,39 @@ async def _build_best_miners_payload(
         now=now,
     )
 
-    top_miner_weight_total = sum(w for w in top_miner_ss58_weights.values() if w > 0.0)
-    combined_weight = screener_weight_total + top_miner_weight_total
-    if combined_weight > 1.0 + 1e-6:
+    screener_used = sum(screener_weights_by_uid.values())
+    if screener_used > 1.0 + 1e-6:
         logger.warning(
-            "get_best_miners_combined_weight_exceeds_1",
+            "get_best_miners_screener_weight_exceeds_1",
             extra={
                 "request_id": request_id,
                 "screener_weight_total": screener_weight_total,
-                "top_miner_weight_total": top_miner_weight_total,
-                "combined_weight": combined_weight,
+                "screener_used": screener_used,
             },
         )
         return _burn_only_payload()
 
-    screener_used = sum(screener_weights_by_uid.values())
+    top_miner_weight_total = sum(w for w in top_miner_ss58_weights.values() if w > 0.0)
+    remaining_for_top_miners = max(0.0, 1.0 - screener_used)
+    top_miner_scale = (
+        (remaining_for_top_miners / top_miner_weight_total)
+        if top_miner_weight_total > 0.0
+        else 0.0
+    )
+
     top_miners_assigned = 0.0
     for ss58, weight in top_miner_ss58_weights.items():
         if weight <= 0.0:
             continue
+        normalized_weight = weight * top_miner_scale
+        if normalized_weight <= 0.0:
+            continue
         uid = hotkey_to_uid.get(ss58)
         if uid is None:
-            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + weight
+            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + normalized_weight
         else:
-            miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + weight
-        top_miners_assigned += weight
+            miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + normalized_weight
+        top_miners_assigned += normalized_weight
 
     burn = max(0.0, 1.0 - screener_used - top_miners_assigned)
     if burn > 0.0:
@@ -459,6 +467,9 @@ async def _build_best_miners_payload(
             "top_screener_miners": top_screener_miners,
             "screener_weight_total": screener_weight_total,
             "screener_weight_per_miner": screener_weight_per_miner,
+            "remaining_for_top_miners": remaining_for_top_miners,
+            "top_miner_weight_total_raw": top_miner_weight_total,
+            "top_miner_scale": top_miner_scale,
             "top_miners_assigned": top_miners_assigned,
             "burn": burn,
             "miners": _miners_log(miners),
