@@ -55,6 +55,9 @@ COMPRESSION_SERVICE_IMAGE_NAME = "soma-copilot-compression-service:latest"
 COMPRESSION_SERVICE_CONTEXT_DIRNAME = "compression_service"
 COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT = "soma-copilot-sandbox-shared"
 COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT = "http://compression-run-{run_id}:8000/"
+COPILOT_SHARED_PROXY_BIND_HOST_DEFAULT = "127.0.0.1"
+COPILOT_SHARED_PROXY_BIND_PORT_DEFAULT = 18080
+COPILOT_SHARED_PROXY_HOST_ALIAS_DEFAULT = "host.docker.internal"
 TIKTOKEN_CL100K_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
 TIKTOKEN_CL100K_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
 BENCHMARK_PACKAGE_NAME = "soma_bench"
@@ -62,6 +65,7 @@ DEFAULT_BENCHMARK_PACKAGE_SPEC = "git+https://github.com/DendriteHQ/SOMA-benchma
 DEFAULT_PLUGIN_REPOSITORY_URL = "https://github.com/DendriteHQ/SOMA-plugin.git"
 COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_RETENTION_SECONDS"
 COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS"
+COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV = "COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS"
 COMPACT_BENCH_DEFAULT_OUTPUT_RETENTION_SECONDS = 24 * 60 * 60
 COMPACT_BENCH_DEFAULT_OUTPUT_CLEANUP_INTERVAL_SECONDS = 5 * 60
 
@@ -243,9 +247,19 @@ def _build_proxy_container_name() -> str:
     return "soma-benchmark-nginx"
 
 
+def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _resolve_copilot_shared_proxy_enabled() -> bool:
-    raw = os.getenv("COMPACT_BENCH_COPILOT_SHARED_PROXY", "true").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return _env_flag_enabled("COMPACT_BENCH_COPILOT_SHARED_PROXY", default=False)
+
+
+def _resolve_debug_preserve_outputs_enabled() -> bool:
+    return _env_flag_enabled(COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV, default=False)
 
 
 def _resolve_copilot_shared_compose_project() -> str:
@@ -280,6 +294,28 @@ def _resolve_copilot_compression_url_template() -> str:
     if value:
         return value
     return COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT
+
+
+def _resolve_copilot_shared_proxy_bind_host() -> str:
+    value = os.getenv("COMPACT_BENCH_COPILOT_PROXY_BIND_HOST", "").strip()
+    return value or COPILOT_SHARED_PROXY_BIND_HOST_DEFAULT
+
+
+def _resolve_copilot_shared_proxy_bind_port() -> int:
+    raw = os.getenv("COMPACT_BENCH_COPILOT_PROXY_BIND_PORT", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return COPILOT_SHARED_PROXY_BIND_PORT_DEFAULT
+
+
+def _resolve_copilot_shared_proxy_host_alias() -> str:
+    value = os.getenv("COMPACT_BENCH_COPILOT_PROXY_HOST_ALIAS", "").strip()
+    return value or COPILOT_SHARED_PROXY_HOST_ALIAS_DEFAULT
 
 
 def _resolve_copilot_sandbox_network_name(*, compose_project: str) -> str:
@@ -467,7 +503,16 @@ class CompactBenchExecutor:
         self._copilot_compose_project = _resolve_copilot_shared_compose_project()
         self._copilot_compose_file: Path | None = None
         self._copilot_compression_url_template = _resolve_copilot_compression_url_template()
+        self._copilot_shared_proxy_bind_host = _resolve_copilot_shared_proxy_bind_host()
+        self._copilot_shared_proxy_bind_port = _resolve_copilot_shared_proxy_bind_port()
+        self._copilot_shared_proxy_host_alias = _resolve_copilot_shared_proxy_host_alias()
+        self._debug_preserve_outputs = _resolve_debug_preserve_outputs_enabled()
         self._output_root.mkdir(parents=True, exist_ok=True)
+        if self._debug_preserve_outputs:
+            logger.warning(
+                "Debug preserve outputs enabled via %s=true: output directories will not be deleted automatically",
+                COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV,
+            )
         self._maybe_cleanup_stale_output_dirs(force=True)
 
         # self._ensure_benchmark_installed()
@@ -496,11 +541,15 @@ class CompactBenchExecutor:
         env["PROXY_COMPRESSION_ENABLED"] = "true"
         env["COPILOT_PROXY_IMAGE"] = compression_image
         env["COPILOT_COMPRESSION_SERVICE_IMAGE"] = compression_image
+        env["COPILOT_PROXY_BIND_HOST"] = self._copilot_shared_proxy_bind_host
+        env["COPILOT_PROXY_BIND_PORT"] = str(self._copilot_shared_proxy_bind_port)
         logger.info(
-            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s image=%s",
+            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s image=%s bind=%s:%s",
             compose_file,
             self._copilot_compose_project,
             compression_image,
+            self._copilot_shared_proxy_bind_host,
+            self._copilot_shared_proxy_bind_port,
         )
         result = _run_command(
             [
@@ -643,6 +692,9 @@ class CompactBenchExecutor:
         return cache_path
 
     def _maybe_cleanup_stale_output_dirs(self, *, force: bool = False) -> None:
+        if self._debug_preserve_outputs:
+            return
+
         retention_seconds = _coerce_positive_int(
             os.getenv(COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV),
             COMPACT_BENCH_DEFAULT_OUTPUT_RETENTION_SECONDS,
@@ -765,25 +817,22 @@ class CompactBenchExecutor:
                         proxy_handle.private_network_name,
                     )
                 else:
-                    # Copilot path uses benchmark-side proxy/middleware and should target upstream directly.
+                    # Copilot per-run mode: backend starts compose sidecars (proxy + compression-service)
+                    # inside one isolated run network, with proxy as the only egress path to gateway.
                     env["LLM_BASE_URL"] = llm_base_url
                     env.pop("SOMA_OPENCLAW_PRIVATE_NETWORK_NAME", None)
                     env["SOMA_COPILOT_COMPRESSION_SERVICE_IMAGE"] = _get_compression_service_image_name()
-                    if self._copilot_shared_proxy_enabled:
-                        env["SOMA_COPILOT_COMPOSE_PROJECT"] = self._copilot_compose_project
-                        env["SOMA_COPILOT_KEEP_STACK"] = "true"
-                        env["SOMA_COPILOT_SHARED_PROXY"] = "true"
-                        env["SOMA_COPILOT_SHARED_PROXY_TEARDOWN"] = "false"
-                        if self._copilot_compose_file is not None:
-                            env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
-                        if miner_module_path is None:
-                            raise RuntimeError("Copilot miner module path is not prepared")
-                        copilot_compression_handle = self._start_copilot_run_compression_service(
-                            run_id=int(task.run_id),
-                            miner_module_path=miner_module_path,
-                        )
+                    env["SOMA_COPILOT_SHARED_PROXY"] = "false"
+                    env["SOMA_COPILOT_SHARED_PROXY_TEARDOWN"] = "false"
+                    env["SOMA_COPILOT_NETWORK_ISOLATION"] = "true"
+                    env["SOMA_COPILOT_USE_COMPOSE_COMPRESSION_SERVICE"] = "true"
+                    if self._copilot_compose_file is not None:
+                        env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
+                    if miner_module_path is None:
+                        raise RuntimeError("Copilot miner module path is not prepared")
+                    env["SOMA_COPILOT_COMPRESSION_SCRIPT_PATH"] = str(miner_module_path)
                     logger.info(
-                        "Using direct LLM base URL without sandbox nginx proxy: run_id=%s agent=%s upstream_host=%s",
+                        "Using per-run Copilot proxy/compression sidecars: run_id=%s agent=%s upstream_host=%s",
                         task.run_id,
                         task.agent_name,
                         urlsplit(llm_base_url).netloc,
@@ -848,6 +897,9 @@ class CompactBenchExecutor:
             )
             row = self._read_result_row(output_dir)
             row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            trajectory_path = row_metadata.get("trajectory_path") if isinstance(row_metadata.get("trajectory_path"), str) else ""
+            tmp_run_dir = row_metadata.get("tmp_run_dir") if isinstance(row_metadata.get("tmp_run_dir"), str) else ""
+            stream_log_path = row_metadata.get("stream_log_path") if isinstance(row_metadata.get("stream_log_path"), str) else ""
             patch_capture = row_metadata.get("patch_capture") if isinstance(row_metadata.get("patch_capture"), dict) else {}
             patch_path = patch_capture.get("patch_path") if isinstance(patch_capture, dict) else None
             patch_capture_status = False
@@ -882,6 +934,23 @@ class CompactBenchExecutor:
                 output_tokens,
                 agent_steps,
             )
+            if trajectory_path:
+                logger.info(
+                    "Copilot trajectory location: run_id=%s instance_id=%s trajectory_path=%s tmp_run_dir=%s stream_log_path=%s",
+                    task.run_id,
+                    task.instance_id,
+                    trajectory_path,
+                    tmp_run_dir,
+                    stream_log_path,
+                )
+            elif tmp_run_dir or stream_log_path:
+                logger.info(
+                    "Copilot run artifacts location: run_id=%s instance_id=%s tmp_run_dir=%s stream_log_path=%s trajectory_path_missing=true",
+                    task.run_id,
+                    task.instance_id,
+                    tmp_run_dir,
+                    stream_log_path,
+                )
             if stderr_text:
                 logger.info(
                     "Benchmark emitted stderr output: run_id=%s ok_status=%s stderr=%s",
@@ -932,7 +1001,14 @@ class CompactBenchExecutor:
         finally:
             if 'copilot_compression_handle' in locals() and copilot_compression_handle is not None:
                 self._stop_copilot_run_compression_service(copilot_compression_handle)
-            shutil.rmtree(output_dir, ignore_errors=True)
+            if self._debug_preserve_outputs:
+                logger.info(
+                    "Keeping benchmark output directory for debug inspection: run_id=%s output_dir=%s",
+                    task.run_id,
+                    output_dir,
+                )
+            else:
+                shutil.rmtree(output_dir, ignore_errors=True)
 
     def _ensure_benchmark_installed(self) -> None:
         logger.info(
@@ -1053,7 +1129,7 @@ class CompactBenchExecutor:
             if openclaw_agent_timeout_seconds is not None:
                 command.extend(["--openclaw-command", f"--timeout {openclaw_agent_timeout_seconds}"])
         if task.model:
-            command.extend(["--model", task.model])
+            command.extend(["--model", "qwen/qwen3.7-plus"])
         if task.openclaw_disable_somarizer:
             command.append("--openclaw-disable-plugin")
         return command
