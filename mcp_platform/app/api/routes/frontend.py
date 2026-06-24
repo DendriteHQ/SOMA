@@ -842,6 +842,15 @@ def _group_weighted_token_totals(
     )
 
 
+def _weighted_tokens_for_run_item(run: dict[str, object]) -> float | None:
+    return _weighted_tokens_for_screening(
+        total_tokens=run.get("tokens_with_compression"),
+        input_tokens=run.get("input_tokens_with_compression"),
+        cached_input_tokens=run.get("cached_input_tokens_with_compression"),
+        output_tokens=run.get("output_tokens_with_compression"),
+    )
+
+
 def _round_optional_1dp(value: float | None) -> float | None:
     if value is None:
         return None
@@ -1634,6 +1643,18 @@ async def _get_competition_aggregate_impl(
                     attempt_no=int(run["attempt_no"]),
                     pass_with_compression=run["pass_with_compression"],
                     tokens_with_compression=run["tokens_with_compression"],
+                    input_tokens_with_compression=run[
+                        "input_tokens_with_compression"
+                    ],
+                    cached_input_tokens_with_compression=run[
+                        "cached_input_tokens_with_compression"
+                    ],
+                    output_tokens_with_compression=run[
+                        "output_tokens_with_compression"
+                    ],
+                    weighted_tokens_with_compression=_round_optional_1dp(
+                        _weighted_tokens_for_run_item(run)
+                    ),
                     platform_score=(
                         float(run["platform_score"])
                         if run["platform_score"] is not None
@@ -2970,6 +2991,18 @@ async def get_swe_miner_task_runs(
                 attempt_no=int(run["attempt_no"]),
                 pass_with_compression=run["pass_with_compression"],
                 tokens_with_compression=run["tokens_with_compression"],
+                input_tokens_with_compression=run[
+                    "input_tokens_with_compression"
+                ],
+                cached_input_tokens_with_compression=run[
+                    "cached_input_tokens_with_compression"
+                ],
+                output_tokens_with_compression=run[
+                    "output_tokens_with_compression"
+                ],
+                weighted_tokens_with_compression=_round_optional_1dp(
+                    _weighted_tokens_for_run_item(run)
+                ),
                 platform_score=(
                     float(run["platform_score"])
                     if run["platform_score"] is not None
