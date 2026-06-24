@@ -842,6 +842,13 @@ def _group_weighted_token_totals(
     )
 
 
+def _round_optional_1dp(value: float | None) -> float | None:
+    if value is None:
+        return None
+    rounded = round(float(value), 1)
+    return 0.0 if rounded == -0.0 else rounded
+
+
 def _weighted_token_savings_ratio(
     *,
     baseline_weighted_total: float,
@@ -1642,8 +1649,12 @@ async def _get_competition_aggregate_impl(
                     task=task_item,
                     runs=run_items,
                     total_runs=len(run_items),
-                    baseline_weighted_tokens=baseline_weighted_tokens,
-                    miner_weighted_tokens=miner_weighted_tokens,
+                    baseline_weighted_tokens=_round_optional_1dp(
+                        baseline_weighted_tokens
+                    ),
+                    miner_weighted_tokens=_round_optional_1dp(
+                        miner_weighted_tokens
+                    ),
                 )
             )
 
@@ -1675,15 +1686,11 @@ async def _get_competition_aggregate_impl(
                 ),
                 tasks=task_aggregate_items,
                 total_tasks=len(task_aggregate_items),
-                baseline_weighted_tokens_total=(
-                    miner_baseline_weighted_total
-                    if miner_has_baseline_weighted
-                    else None
+                baseline_weighted_tokens_total=_round_optional_1dp(
+                    miner_baseline_weighted_total if miner_has_baseline_weighted else None
                 ),
-                miner_weighted_tokens_total=(
-                    miner_weighted_total
-                    if miner_has_weighted
-                    else None
+                miner_weighted_tokens_total=_round_optional_1dp(
+                    miner_weighted_total if miner_has_weighted else None
                 ),
             )
         )
