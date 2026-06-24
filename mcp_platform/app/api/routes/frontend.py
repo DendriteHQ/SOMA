@@ -1148,9 +1148,8 @@ async def _build_swe_status_overrides(
                             screening_passed = False
                             break
                         # For failed attempts (e.g. timeout) with missing token metrics,
-                        # use baseline-weighted tokens so screening can complete without
-                        # granting any token-saving advantage.
-                        miner_weighted_tokens = baseline_weighted_tokens
+                        # treat miner weighted tokens as zero so screening can complete.
+                        miner_weighted_tokens = 0.0
                     miner_weighted_total += miner_weighted_tokens
                     baseline_weighted_total += baseline_weighted_tokens
                     attempt_resolved.append(bool(resolved_value))
