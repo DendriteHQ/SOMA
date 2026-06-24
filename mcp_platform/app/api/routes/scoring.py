@@ -144,6 +144,15 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
             group["baseline_runs"][baseline_run_id] = {
                 "resolved": row.baseline_resolved,
                 "tokens_used": _to_optional_int(row.baseline_tokens_used),
+                "input_tokens": _to_optional_int(
+                    getattr(row, "baseline_input_tokens", None)
+                ),
+                "cached_input_tokens": _to_optional_int(
+                    getattr(row, "baseline_cached_input_tokens", None)
+                ),
+                "output_tokens": _to_optional_int(
+                    getattr(row, "baseline_output_tokens", None)
+                ),
             }
 
         run_id = _to_optional_int(row.run_id)
@@ -157,6 +166,15 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
                 "attempt_no": _to_optional_int(row.attempt_no) or 0,
                 "pass_with_compression": row.run_resolved,
                 "tokens_with_compression": _to_optional_int(row.run_tokens_used),
+                "input_tokens_with_compression": _to_optional_int(
+                    getattr(row, "run_input_tokens", None)
+                ),
+                "cached_input_tokens_with_compression": _to_optional_int(
+                    getattr(row, "run_cached_input_tokens", None)
+                ),
+                "output_tokens_with_compression": _to_optional_int(
+                    getattr(row, "run_output_tokens", None)
+                ),
                 "time_taken_seconds": _to_optional_float(row.time_taken_seconds),
                 "agent_steps": _to_optional_int(row.agent_steps),
                 "baseline_scores": [],

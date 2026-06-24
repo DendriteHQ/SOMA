@@ -506,10 +506,16 @@ async def _fetch_swe_rows_live(
             Miner.ss58.label("hotkey"),
             baseline_runs.c.id.label("baseline_run_id"),
             baseline_runs.c.tokens_used.label("baseline_tokens_used"),
+            baseline_runs.c.input_tokens.label("baseline_input_tokens"),
+            baseline_runs.c.cached_input_tokens.label("baseline_cached_input_tokens"),
+            baseline_runs.c.output_tokens.label("baseline_output_tokens"),
             baseline_validations.c.resolved.label("baseline_resolved"),
             miner_runs.c.id.label("run_id"),
             miner_runs.c.attempt_no.label("attempt_no"),
             miner_runs.c.tokens_used.label("run_tokens_used"),
+            miner_runs.c.input_tokens.label("run_input_tokens"),
+            miner_runs.c.cached_input_tokens.label("run_cached_input_tokens"),
+            miner_runs.c.output_tokens.label("run_output_tokens"),
             miner_runs.c.time_taken_seconds.label("time_taken_seconds"),
             miner_runs.c.agent_steps.label("agent_steps"),
             miner_validations.c.resolved.label("run_resolved"),
@@ -789,6 +795,51 @@ def _weighted_tokens_for_screening(
     if parsed_total is None or parsed_total < 0:
         return None
     return float(parsed_total)
+
+
+def _group_weighted_token_totals(
+    group: dict[str, object],
+) -> tuple[float | None, float | None]:
+    baseline_total = 0.0
+    baseline_has_value = False
+    baseline_runs = group.get("baseline_runs")
+    if isinstance(baseline_runs, dict):
+        for baseline in baseline_runs.values():
+            if not isinstance(baseline, dict):
+                continue
+            weighted = _weighted_tokens_for_screening(
+                total_tokens=baseline.get("tokens_used"),
+                input_tokens=baseline.get("input_tokens"),
+                cached_input_tokens=baseline.get("cached_input_tokens"),
+                output_tokens=baseline.get("output_tokens"),
+            )
+            if weighted is None:
+                continue
+            baseline_total += weighted
+            baseline_has_value = True
+
+    miner_total = 0.0
+    miner_has_value = False
+    runs = group.get("runs")
+    if isinstance(runs, list):
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            weighted = _weighted_tokens_for_screening(
+                total_tokens=run.get("tokens_with_compression"),
+                input_tokens=run.get("input_tokens_with_compression"),
+                cached_input_tokens=run.get("cached_input_tokens_with_compression"),
+                output_tokens=run.get("output_tokens_with_compression"),
+            )
+            if weighted is None:
+                continue
+            miner_total += weighted
+            miner_has_value = True
+
+    return (
+        baseline_total if baseline_has_value else None,
+        miner_total if miner_has_value else None,
+    )
 
 
 def _weighted_token_savings_ratio(
@@ -1547,6 +1598,10 @@ async def _get_competition_aggregate_impl(
             }
 
         task_aggregate_items: list[SweMinerTaskAggregateItem] = []
+        miner_baseline_weighted_total = 0.0
+        miner_has_baseline_weighted = False
+        miner_weighted_total = 0.0
+        miner_has_weighted = False
         for group in sorted(task_groups.values(), key=lambda group: int(group["task_id"])):
             task_item = build_swe_task_result_item(group).model_copy(
                 update={
@@ -1557,6 +1612,15 @@ async def _get_competition_aggregate_impl(
                 group["runs"],
                 key=lambda run: (run["attempt_no"], run["run_id"] or 0),
             )
+            baseline_weighted_tokens, miner_weighted_tokens = _group_weighted_token_totals(
+                group
+            )
+            if baseline_weighted_tokens is not None:
+                miner_baseline_weighted_total += baseline_weighted_tokens
+                miner_has_baseline_weighted = True
+            if miner_weighted_tokens is not None:
+                miner_weighted_total += miner_weighted_tokens
+                miner_has_weighted = True
             run_items = [
                 SweMinerTaskRunItem(
                     run_id=int(run["run_id"] or 0),
@@ -1578,6 +1642,8 @@ async def _get_competition_aggregate_impl(
                     task=task_item,
                     runs=run_items,
                     total_runs=len(run_items),
+                    baseline_weighted_tokens=baseline_weighted_tokens,
+                    miner_weighted_tokens=miner_weighted_tokens,
                 )
             )
 
@@ -1609,6 +1675,16 @@ async def _get_competition_aggregate_impl(
                 ),
                 tasks=task_aggregate_items,
                 total_tasks=len(task_aggregate_items),
+                baseline_weighted_tokens_total=(
+                    miner_baseline_weighted_total
+                    if miner_has_baseline_weighted
+                    else None
+                ),
+                miner_weighted_tokens_total=(
+                    miner_weighted_total
+                    if miner_has_weighted
+                    else None
+                ),
             )
         )
 
