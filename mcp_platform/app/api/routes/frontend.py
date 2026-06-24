@@ -1138,10 +1138,19 @@ async def _build_swe_status_overrides(
                         screening_passed = False
                         break
                     baseline_weighted_tokens = baseline_weighted_by_attempt.get((task_id, attempt_no))
-                    if miner_weighted_tokens is None or baseline_weighted_tokens is None:
+                    if baseline_weighted_tokens is None:
                         screening_complete = False
                         screening_passed = False
                         break
+                    if miner_weighted_tokens is None:
+                        if bool(resolved_value):
+                            screening_complete = False
+                            screening_passed = False
+                            break
+                        # For failed attempts (e.g. timeout) with missing token metrics,
+                        # use baseline-weighted tokens so screening can complete without
+                        # granting any token-saving advantage.
+                        miner_weighted_tokens = baseline_weighted_tokens
                     miner_weighted_total += miner_weighted_tokens
                     baseline_weighted_total += baseline_weighted_tokens
                     attempt_resolved.append(bool(resolved_value))
