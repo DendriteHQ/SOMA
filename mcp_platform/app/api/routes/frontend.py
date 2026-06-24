@@ -842,6 +842,86 @@ def _group_weighted_token_totals(
     )
 
 
+def _group_baseline_token_component_totals(
+    group: dict[str, object],
+) -> tuple[int | None, int | None, int | None]:
+    baseline_runs = group.get("baseline_runs")
+
+    input_total = 0
+    input_has_value = False
+    cached_total = 0
+    cached_has_value = False
+    output_total = 0
+    output_has_value = False
+
+    if isinstance(baseline_runs, dict):
+        for baseline in baseline_runs.values():
+            if not isinstance(baseline, dict):
+                continue
+
+            input_tokens = _to_optional_int(baseline.get("input_tokens"))
+            if input_tokens is not None:
+                input_total += input_tokens
+                input_has_value = True
+
+            cached_input_tokens = _to_optional_int(baseline.get("cached_input_tokens"))
+            if cached_input_tokens is not None:
+                cached_total += cached_input_tokens
+                cached_has_value = True
+
+            output_tokens = _to_optional_int(baseline.get("output_tokens"))
+            if output_tokens is not None:
+                output_total += output_tokens
+                output_has_value = True
+
+    return (
+        input_total if input_has_value else None,
+        cached_total if cached_has_value else None,
+        output_total if output_has_value else None,
+    )
+
+
+def _group_miner_token_component_totals(
+    group: dict[str, object],
+) -> tuple[int | None, int | None, int | None]:
+    runs = group.get("runs")
+
+    input_total = 0
+    input_has_value = False
+    cached_total = 0
+    cached_has_value = False
+    output_total = 0
+    output_has_value = False
+
+    if isinstance(runs, list):
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+
+            input_tokens = _to_optional_int(run.get("input_tokens_with_compression"))
+            if input_tokens is not None:
+                input_total += input_tokens
+                input_has_value = True
+
+            cached_input_tokens = _to_optional_int(
+                run.get("cached_input_tokens_with_compression")
+            )
+            if cached_input_tokens is not None:
+                cached_total += cached_input_tokens
+                cached_has_value = True
+
+            output_tokens = _to_optional_int(run.get("output_tokens_with_compression"))
+            if output_tokens is not None:
+                output_total += output_tokens
+                output_has_value = True
+
+    return (
+        input_total if input_has_value else None,
+        cached_total if cached_has_value else None,
+        output_total if output_has_value else None,
+    )
+
+
 def _weighted_tokens_for_run_item(run: dict[str, object]) -> float | None:
     return _weighted_tokens_for_screening(
         total_tokens=run.get("tokens_with_compression"),
@@ -1626,6 +1706,18 @@ async def _get_competition_aggregate_impl(
         miner_has_baseline_weighted = False
         miner_weighted_total = 0.0
         miner_has_weighted = False
+        miner_baseline_input_total = 0
+        miner_has_baseline_input = False
+        miner_baseline_cached_input_total = 0
+        miner_has_baseline_cached_input = False
+        miner_baseline_output_total = 0
+        miner_has_baseline_output = False
+        miner_input_total = 0
+        miner_has_input = False
+        miner_cached_input_total = 0
+        miner_has_cached_input = False
+        miner_output_total = 0
+        miner_has_output = False
         for group in sorted(task_groups.values(), key=lambda group: int(group["task_id"])):
             task_item = build_swe_task_result_item(group).model_copy(
                 update={
@@ -1639,12 +1731,40 @@ async def _get_competition_aggregate_impl(
             baseline_weighted_tokens, miner_weighted_tokens = _group_weighted_token_totals(
                 group
             )
+            (
+                baseline_input_tokens,
+                baseline_cached_input_tokens,
+                baseline_output_tokens,
+            ) = _group_baseline_token_component_totals(group)
+            (
+                miner_input_tokens,
+                miner_cached_input_tokens,
+                miner_output_tokens,
+            ) = _group_miner_token_component_totals(group)
             if baseline_weighted_tokens is not None:
                 miner_baseline_weighted_total += baseline_weighted_tokens
                 miner_has_baseline_weighted = True
             if miner_weighted_tokens is not None:
                 miner_weighted_total += miner_weighted_tokens
                 miner_has_weighted = True
+            if baseline_input_tokens is not None:
+                miner_baseline_input_total += baseline_input_tokens
+                miner_has_baseline_input = True
+            if baseline_cached_input_tokens is not None:
+                miner_baseline_cached_input_total += baseline_cached_input_tokens
+                miner_has_baseline_cached_input = True
+            if baseline_output_tokens is not None:
+                miner_baseline_output_total += baseline_output_tokens
+                miner_has_baseline_output = True
+            if miner_input_tokens is not None:
+                miner_input_total += miner_input_tokens
+                miner_has_input = True
+            if miner_cached_input_tokens is not None:
+                miner_cached_input_total += miner_cached_input_tokens
+                miner_has_cached_input = True
+            if miner_output_tokens is not None:
+                miner_output_total += miner_output_tokens
+                miner_has_output = True
             run_items = [
                 SweMinerTaskRunItem(
                     run_id=int(run["run_id"] or 0),
@@ -1684,6 +1804,12 @@ async def _get_competition_aggregate_impl(
                     miner_weighted_tokens=_round_optional_1dp(
                         miner_weighted_tokens
                     ),
+                    baseline_input_tokens=baseline_input_tokens,
+                    baseline_cached_input_tokens=baseline_cached_input_tokens,
+                    baseline_output_tokens=baseline_output_tokens,
+                    miner_input_tokens=miner_input_tokens,
+                    miner_cached_input_tokens=miner_cached_input_tokens,
+                    miner_output_tokens=miner_output_tokens,
                 )
             )
 
@@ -1720,6 +1846,26 @@ async def _get_competition_aggregate_impl(
                 ),
                 miner_weighted_tokens_total=_round_optional_1dp(
                     miner_weighted_total if miner_has_weighted else None
+                ),
+                baseline_input_tokens_total=(
+                    miner_baseline_input_total if miner_has_baseline_input else None
+                ),
+                baseline_cached_input_tokens_total=(
+                    miner_baseline_cached_input_total
+                    if miner_has_baseline_cached_input
+                    else None
+                ),
+                baseline_output_tokens_total=(
+                    miner_baseline_output_total if miner_has_baseline_output else None
+                ),
+                miner_input_tokens_total=(
+                    miner_input_total if miner_has_input else None
+                ),
+                miner_cached_input_tokens_total=(
+                    miner_cached_input_total if miner_has_cached_input else None
+                ),
+                miner_output_tokens_total=(
+                    miner_output_total if miner_has_output else None
                 ),
             )
         )
