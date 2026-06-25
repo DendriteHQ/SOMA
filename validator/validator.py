@@ -115,6 +115,119 @@ class Validator(AbstractValidator):
         tmp_path.write_text(json.dumps(payload, sort_keys=True))
         tmp_path.replace(path)
 
+    def _weights_cache_path(self) -> Path:
+        return Path(self.settings.weights_cache_file)
+
+    def _write_weights_cache(
+        self,
+        *,
+        uids: np.ndarray,
+        weights: np.ndarray,
+        source: str,
+    ) -> None:
+        path = self._weights_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+            "validator_hotkey": self.settings.wallet.hotkey.ss58_address,
+            "netuid": int(self.settings.netuid),
+            "uids": [int(uid) for uid in uids.tolist()],
+            "weights": [float(weight) for weight in weights.tolist()],
+        }
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True))
+        tmp_path.replace(path)
+        logging.info(
+            "Saved validator weights cache",
+            extra={
+                "path": str(path),
+                "source": source,
+                "count": len(payload["uids"]),
+            },
+        )
+
+    def _load_weights_cache(self) -> tuple[np.ndarray, np.ndarray] | None:
+        path = self._weights_cache_path()
+        max_age_seconds = max(0.0, float(self.settings.weights_cache_max_age_seconds))
+        try:
+            if not path.exists():
+                logging.warning(
+                    "Weights cache file does not exist",
+                    extra={"path": str(path)},
+                )
+                return None
+
+            raw = json.loads(path.read_text())
+            saved_at_raw = raw.get("saved_at")
+            if not isinstance(saved_at_raw, str) or not saved_at_raw.strip():
+                logging.warning(
+                    "Weights cache file is missing saved_at",
+                    extra={"path": str(path)},
+                )
+                return None
+
+            saved_at = datetime.fromisoformat(saved_at_raw.replace("Z", "+00:00"))
+            if saved_at.tzinfo is None:
+                saved_at = saved_at.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - saved_at).total_seconds()
+            if age_seconds > max_age_seconds:
+                logging.warning(
+                    "Cached weights are too old for fallback",
+                    extra={
+                        "path": str(path),
+                        "age_seconds": age_seconds,
+                        "max_age_seconds": max_age_seconds,
+                    },
+                )
+                return None
+
+            uids_raw = raw.get("uids")
+            weights_raw = raw.get("weights")
+            if not isinstance(uids_raw, list) or not isinstance(weights_raw, list):
+                logging.warning(
+                    "Weights cache file has invalid schema",
+                    extra={"path": str(path)},
+                )
+                return None
+            if len(uids_raw) == 0 or len(uids_raw) != len(weights_raw):
+                logging.warning(
+                    "Weights cache file has invalid array lengths",
+                    extra={
+                        "path": str(path),
+                        "uids_len": len(uids_raw),
+                        "weights_len": len(weights_raw),
+                    },
+                )
+                return None
+
+            uids = np.array([int(uid) for uid in uids_raw], dtype=np.int64)
+            weights = np.array([float(weight) for weight in weights_raw], dtype=np.float32)
+            if np.any(weights < 0) or float(np.sum(weights)) <= 0:
+                logging.warning(
+                    "Weights cache file has invalid weight values",
+                    extra={"path": str(path)},
+                )
+                return None
+
+            logging.info(
+                "Loaded validator weights from cache",
+                extra={
+                    "path": str(path),
+                    "count": len(uids),
+                    "age_seconds": age_seconds,
+                    "max_age_seconds": max_age_seconds,
+                },
+            )
+            return uids, weights
+        except Exception as exc:
+            logging.warning(
+                "Failed to read weights cache file",
+                extra={"path": str(path), "error": str(exc)},
+                exc_info=True,
+            )
+            return None
+
     async def _note_evaluation_started(self) -> None:
         with self._state_lock:
             self._active_evaluations += 1
@@ -318,28 +431,59 @@ class Validator(AbstractValidator):
                 f"set_weights: Got best_miners_response: {best_miners_response}"
             )
 
-            if not best_miners_response or not best_miners_response.miners:
+            should_persist_cache = False
+            cache_source = "platform"
+            if best_miners_response is not None and best_miners_response.miners:
+                # Extract UIDs and weights into numpy arrays
+                uids = np.array(
+                    [m.uid for m in best_miners_response.miners], dtype=np.int64
+                )
+                weights = np.array(
+                    [m.weight for m in best_miners_response.miners], dtype=np.float32
+                )
+                should_persist_cache = True
+                cache_source = "platform"
+            elif best_miners_response is None:
+                cached_weights = self._load_weights_cache()
+                if cached_weights is not None:
+                    uids, weights = cached_weights
+                    cache_source = "cached_fallback"
+                    logging.warning(
+                        "Platform unavailable; using cached weights",
+                        extra={
+                            "count": len(uids),
+                            "max_age_seconds": float(
+                                self.settings.weights_cache_max_age_seconds
+                            ),
+                        },
+                    )
+                else:
+                    logging.warning(
+                        "Platform unavailable and no valid cached weights; setting burn weight to uid 0"
+                    )
+                    uids = np.array([0], dtype=np.int64)
+                    weights = np.array([1.0], dtype=np.float32)
+                    cache_source = "burn_fallback"
+            else:
                 logging.warning(
-                    "No miners returned from platform setting weight to uid 0"
+                    "No miners returned from platform; setting burn weight to uid 0"
                 )
-                await self.weight_setter.set_weights(
-                    np.array([0], dtype=np.int64), np.array([1.0], dtype=np.float32)
-                )
-                return
-
-            # Extract UIDs and weights into numpy arrays
-            uids = np.array(
-                [m.uid for m in best_miners_response.miners], dtype=np.int64
-            )
-            weights = np.array(
-                [m.weight for m in best_miners_response.miners], dtype=np.float32
-            )
+                uids = np.array([0], dtype=np.int64)
+                weights = np.array([1.0], dtype=np.float32)
+                should_persist_cache = True
+                cache_source = "platform_empty"
 
             logging.info(
                 f"Setting weights for {len(uids)} miners: UIDs={uids.tolist()}, weights={weights.tolist()}"
             )
 
             await self.weight_setter.set_weights(uids, weights)
+            if should_persist_cache:
+                self._write_weights_cache(
+                    uids=uids,
+                    weights=weights,
+                    source=cache_source,
+                )
 
         except Exception as e:
             logging.error(f"Exception during setting weights: {e}", exc_info=True)

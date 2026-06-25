@@ -2,6 +2,8 @@ import os
 import sys
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
 
@@ -32,13 +34,19 @@ def _make_validator():
     validator.settings = SimpleNamespace(
         platform_url="http://platform:8000",
         platform_signer_ss58="expected-signer",
-        wallet=object(),
+        wallet=SimpleNamespace(
+            hotkey=SimpleNamespace(ss58_address="validator-test-ss58")
+        ),
         scoring_error_cooldown_seconds=600.0,
         hf_rate_limit_cooldown_seconds=120.0,
         swebench_validation_request_path="/validator/get_swebench_validation",
         swebench_validation_submit_path="/validator/submit_swebench_validation_score",
+        weights_cache_file="/tmp/test_validator_weights_cache.json",
+        weights_cache_max_age_seconds=86400.0,
+        netuid=114,
     )
     validator.evaluator = Mock()
+    validator.weight_setter = SimpleNamespace(set_weights=AsyncMock())
     validator.client = Mock()
     validator.client.post = AsyncMock()
     return validator
@@ -141,6 +149,71 @@ def test_resolve_scoring_error_cooldown_seconds():
         validator._resolve_scoring_error_cooldown_seconds("validator_scoring_failed")
         == 30.0
     )
+
+
+@pytest.mark.asyncio
+async def test_set_weights_uses_cached_file_when_platform_unavailable(tmp_path):
+    validator = _make_validator()
+    validator.settings.weights_cache_file = str(tmp_path / "weights_cache.json")
+    validator.get_best_miners = AsyncMock(return_value=None)
+
+    cache_payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "uids": [11, 12],
+        "weights": [0.6, 0.4],
+    }
+    Path(validator.settings.weights_cache_file).write_text(json.dumps(cache_payload))
+
+    await validator.set_weights()
+
+    validator.weight_setter.set_weights.assert_awaited_once()
+    args, _kwargs = validator.weight_setter.set_weights.call_args
+    assert args[0].tolist() == [11, 12]
+    assert pytest.approx(args[1].tolist(), rel=1e-6) == [0.6, 0.4]
+
+
+@pytest.mark.asyncio
+async def test_set_weights_uses_burn_when_cached_file_expired(tmp_path):
+    validator = _make_validator()
+    validator.settings.weights_cache_file = str(tmp_path / "weights_cache_expired.json")
+    validator.settings.weights_cache_max_age_seconds = 86400.0
+    validator.get_best_miners = AsyncMock(return_value=None)
+
+    cache_payload = {
+        "saved_at": (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(),
+        "uids": [21, 22],
+        "weights": [0.7, 0.3],
+    }
+    Path(validator.settings.weights_cache_file).write_text(json.dumps(cache_payload))
+
+    await validator.set_weights()
+
+    validator.weight_setter.set_weights.assert_awaited_once()
+    args, _kwargs = validator.weight_setter.set_weights.call_args
+    assert args[0].tolist() == [0]
+    assert pytest.approx(args[1].tolist(), rel=1e-6) == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_set_weights_persists_platform_weights_to_cache(tmp_path):
+    validator = _make_validator()
+    validator.settings.weights_cache_file = str(tmp_path / "weights_cache_saved.json")
+    validator.get_best_miners = AsyncMock(
+        return_value=SimpleNamespace(
+            miners=[
+                SimpleNamespace(uid=31, weight=0.55),
+                SimpleNamespace(uid=32, weight=0.45),
+            ]
+        )
+    )
+
+    await validator.set_weights()
+
+    cache_path = Path(validator.settings.weights_cache_file)
+    assert cache_path.exists()
+    cache_payload = json.loads(cache_path.read_text())
+    assert cache_payload["uids"] == [31, 32]
+    assert pytest.approx(cache_payload["weights"], rel=1e-6) == [0.55, 0.45]
 
 
 @pytest.mark.asyncio
