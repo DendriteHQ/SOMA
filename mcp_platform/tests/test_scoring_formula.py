@@ -37,6 +37,19 @@ def _load_scoring_module():
     )
     sys.modules["soma_shared.contracts.api.v1.frontend"] = frontend_module
 
+    # Stub app.core.config so scoring.py can read token weight settings.
+    config_module = types.ModuleType("app.core.config")
+    config_module.settings = SimpleNamespace(
+        swebench_screening_input_tokens_weight=1.0,
+        swebench_screening_cached_input_tokens_weight=1.0 / 3.0,
+        swebench_screening_output_tokens_weight=3.0,
+    )
+    app_module = types.ModuleType("app")
+    core_module = types.ModuleType("app.core")
+    sys.modules.setdefault("app", app_module)
+    sys.modules.setdefault("app.core", core_module)
+    sys.modules["app.core.config"] = config_module
+
     scoring_path = (
         Path(__file__).resolve().parents[1] / "app" / "api" / "routes" / "scoring.py"
     )
@@ -125,24 +138,29 @@ def test_adjusted_score_keeps_raw_score_when_token_totals_are_invalid():
 def test_build_swe_miner_scores_applies_global_token_multiplier():
     scoring = _load_scoring_module()
 
+    # No split token columns — weighted tokens fall back to tokens_used totals.
     task_groups = {
         "task-a": {
             "is_screener": True,
             "baseline_runs": {1: {"tokens_used": 100}},
+            "baseline_weighted_tokens": 100.0,
             "runs": [
                 {
                     "platform_score": 2.0,
                     "tokens_with_compression": 80,
+                    "weighted_tokens_with_compression": 80.0,
                 }
             ],
         },
         "task-b": {
             "is_screener": False,
             "baseline_runs": {2: {"tokens_used": 100}},
+            "baseline_weighted_tokens": 100.0,
             "runs": [
                 {
                     "platform_score": 0.0,
                     "tokens_with_compression": 120,
+                    "weighted_tokens_with_compression": 120.0,
                 }
             ],
         },
@@ -157,16 +175,20 @@ def test_build_swe_miner_scores_applies_global_token_multiplier():
 def test_build_swe_miner_scores_leaves_total_raw_when_tokens_are_missing():
     scoring = _load_scoring_module()
 
+    # Missing tokens: task-a has no baseline tokens, task-b run has no compressed tokens.
+    # Neither group can form a valid pair, so no multiplier is applied.
     task_groups = {
         "task-a": {
             "is_screener": True,
             "baseline_runs": {1: {"tokens_used": None}},
-            "runs": [{"platform_score": 2.0, "tokens_with_compression": 80}],
+            "baseline_weighted_tokens": None,
+            "runs": [{"platform_score": 2.0, "tokens_with_compression": 80, "weighted_tokens_with_compression": 80.0}],
         },
         "task-b": {
             "is_screener": False,
             "baseline_runs": {2: {"tokens_used": 100}},
-            "runs": [{"platform_score": 0.0, "tokens_with_compression": None}],
+            "baseline_weighted_tokens": 100.0,
+            "runs": [{"platform_score": 0.0, "tokens_with_compression": None, "weighted_tokens_with_compression": None}],
         },
     }
 
@@ -183,12 +205,14 @@ def test_build_swe_category_scores_uses_platform_scores_without_run_baseline_fie
         "task-a": {
             "task_name": "task-a",
             "baseline_runs": {1: {"tokens_used": 100}},
-            "runs": [{"platform_score": 2.0, "tokens_with_compression": 80}],
+            "baseline_weighted_tokens": 100.0,
+            "runs": [{"platform_score": 2.0, "tokens_with_compression": 80, "weighted_tokens_with_compression": 80.0}],
         },
         "task-b": {
             "task_name": "task-b",
             "baseline_runs": {2: {"tokens_used": 100}},
-            "runs": [{"platform_score": 0.0, "tokens_with_compression": 100}],
+            "baseline_weighted_tokens": 100.0,
+            "runs": [{"platform_score": 0.0, "tokens_with_compression": 100, "weighted_tokens_with_compression": 100.0}],
         },
     }
 

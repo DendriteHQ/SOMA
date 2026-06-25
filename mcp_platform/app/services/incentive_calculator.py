@@ -6,7 +6,7 @@ from itertools import combinations
 from math import isclose
 from typing import Mapping, Sequence
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -218,6 +218,13 @@ def calculate_incentive_weights(
     )
 
 
+def _nullable_col(model: type, attr: str, alias: object) -> object:
+    """Return the column from *alias* if *model* has it, otherwise a NULL literal."""
+    if hasattr(model, attr):
+        return getattr(alias, attr)
+    return literal(None)
+
+
 async def load_competition_incentive_inputs(
     db: AsyncSession,
     *,
@@ -239,10 +246,16 @@ async def load_competition_incentive_inputs(
                 Miner.ss58.label("hotkey"),
                 baseline_runs.id.label("baseline_run_id"),
                 baseline_runs.tokens_used.label("baseline_tokens_used"),
+                _nullable_col(SweBenchRun, "input_tokens", baseline_runs).label("baseline_input_tokens"),
+                _nullable_col(SweBenchRun, "cached_input_tokens", baseline_runs).label("baseline_cached_input_tokens"),
+                _nullable_col(SweBenchRun, "output_tokens", baseline_runs).label("baseline_output_tokens"),
                 baseline_validations.resolved.label("baseline_resolved"),
                 miner_runs.id.label("run_id"),
                 miner_runs.attempt_no.label("attempt_no"),
                 miner_runs.tokens_used.label("run_tokens_used"),
+                _nullable_col(SweBenchRun, "input_tokens", miner_runs).label("run_input_tokens"),
+                _nullable_col(SweBenchRun, "cached_input_tokens", miner_runs).label("run_cached_input_tokens"),
+                _nullable_col(SweBenchRun, "output_tokens", miner_runs).label("run_output_tokens"),
                 miner_runs.time_taken_seconds.label("time_taken_seconds"),
                 miner_runs.agent_steps.label("agent_steps"),
                 miner_validations.resolved.label("run_resolved"),

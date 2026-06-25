@@ -5,7 +5,29 @@ This document explains how SWE miner scores are computed. This logic is implemen
 The scoring has two layers:
 
 1. A raw score is computed from the current run-vs-baseline formula.
-2. The final total score adds one extra multiplier based on total token savings.
+2. The final total score adds one extra multiplier based on total weighted token savings.
+
+## Token counting — weighted totals
+
+Token counts used throughout this document ($Tok_A$ and $Tok_B$) are **weighted token totals**, not plain token counts. When a run reports a breakdown of token types, the effective token count is:
+
+$$
+Tok = w_{\text{input}} \cdot T_{\text{input}} + w_{\text{cached}} \cdot T_{\text{cached}} + w_{\text{output}} \cdot T_{\text{output}}
+$$
+
+where the default weights are:
+
+| Token type | Weight |
+|---|---|
+| Input (non-cached) | $1.0$ |
+| Cached input | $\frac{1}{3}$ |
+| Output | $3.0$ |
+
+Cached tokens are cheaper, so they count less. Output tokens are more expensive, so they count more.
+
+If a run does not report the token-type breakdown (only a single `tokens_used` total is available), the plain total is used as-is.
+
+The weights are configurable via environment variables `SWEBENCH_SCREENING_INPUT_TOKENS_WEIGHT`, `SWEBENCH_SCREENING_CACHED_INPUT_TOKENS_WEIGHT`, and `SWEBENCH_SCREENING_OUTPUT_TOKENS_WEIGHT` (shared with the screener gate).
 
 ## 1. Raw Run Score
 
@@ -17,11 +39,11 @@ $$
 
 where:
 
-- $Tok_B$ is the number of tokens used by the baseline run,
-- $Tok_A$ is the number of tokens used by the miner run,
+- $Tok_B$ is the **weighted** token total for the baseline run,
+- $Tok_A$ is the **weighted** token total for the miner run,
 - $Trim(x, -2, 2)$ keeps $x$ in the interval $[-2, 2]$.
 
-2. If either token count is missing, non-positive, or otherwise invalid, the token component is treated as `0`.
+2. If either weighted token total is missing, non-positive, or otherwise invalid, the token component is treated as `0`.
 
 3. The base score and the coefficient $\lambda$ depend on the pass/fail outcome
 of the baseline run and the miner run:
@@ -86,16 +108,18 @@ where $S_m$ is the number of scored screener runs of miner $m$.
 
 ## 2. Miner-Level Token Savings Multiplier
 
-1. After the raw total score is computed, one extra multiplier is applied from the miner's total token usage across the whole dataset. This is meant to penalize miners who do not compress, or who use more tokens than the baseline:
+1. After the raw total score is computed, one extra multiplier is applied from the miner's total **weighted** token usage across the whole dataset. This is meant to penalize miners who do not compress, or who use more tokens than the baseline:
 
 $$
-s = 1 - \frac{Tok_C}{Tok_B}
+s = 1 - \frac{Tok_A^{\text{total}}}{Tok_B^{\text{total}}}
 $$
 
 where:
 
-- $Tok_C$ is the total number of tokens over all compressed runs by that miner,
-- $Tok_B$ is the total number of tokens over all baseline runs for the same miner dataset slice.
+- $Tok_A^{\text{total}}$ is the sum of **weighted** token totals over all miner runs,
+- $Tok_B^{\text{total}}$ is the sum of **weighted** token totals over all baseline runs for the same miner dataset slice.
+
+Both totals use the same weighted formula described above — output-heavy runs are penalized more than cached-token-heavy runs.
 
 2. The savings ratio is then normalized and clamped:
 
@@ -111,8 +135,8 @@ $$
 
 4. This means:
 
-- if the miner saves at least $20\%$, then $m(s)=1$ and the raw total score stays the same,
-- if the miner increases token usage by at least $20\%$, then $m(s)=0$ and the final score becomes $-4$,
+- if the miner saves at least $20\%$ of weighted tokens, then $m(s)=1$ and the raw total score stays the same,
+- if the miner increases weighted token usage by at least $20\%$, then $m(s)=0$ and the final score becomes $-4$,
 - between those points, the score is adjusted smoothly toward $-4$.
 
 5. The final total score is:
@@ -127,4 +151,4 @@ $$
 ScreenerScore(m) = RawScreenerScore(m)
 $$
 
-7. If the token totals are missing or invalid, the multiplier is $1$, so the raw total score stays unchanged.
+7. If the weighted token totals are missing or invalid, the multiplier is $1$, so the raw total score stays unchanged.

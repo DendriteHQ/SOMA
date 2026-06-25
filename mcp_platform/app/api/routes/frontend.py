@@ -89,7 +89,6 @@ from app.api.routes.scoring import (
 )
 from app.services.swe_difficulty_calculator import (
     build_baseline_task_data,
-    build_miner_category_scores,
     derive_task_difficulties,
 )
 from app.services.dash_rows_cache import DashRowsFrozenCache
@@ -506,10 +505,16 @@ async def _fetch_swe_rows_live(
             Miner.ss58.label("hotkey"),
             baseline_runs.c.id.label("baseline_run_id"),
             baseline_runs.c.tokens_used.label("baseline_tokens_used"),
+            baseline_runs.c.input_tokens.label("baseline_input_tokens"),
+            baseline_runs.c.cached_input_tokens.label("baseline_cached_input_tokens"),
+            baseline_runs.c.output_tokens.label("baseline_output_tokens"),
             baseline_validations.c.resolved.label("baseline_resolved"),
             miner_runs.c.id.label("run_id"),
             miner_runs.c.attempt_no.label("attempt_no"),
             miner_runs.c.tokens_used.label("run_tokens_used"),
+            miner_runs.c.input_tokens.label("run_input_tokens"),
+            miner_runs.c.cached_input_tokens.label("run_cached_input_tokens"),
+            miner_runs.c.output_tokens.label("run_output_tokens"),
             miner_runs.c.time_taken_seconds.label("time_taken_seconds"),
             miner_runs.c.agent_steps.label("agent_steps"),
             miner_validations.c.resolved.label("run_resolved"),
