@@ -1728,6 +1728,30 @@ async def _get_competition_aggregate_impl(
                 group["runs"],
                 key=lambda run: (run["attempt_no"], run["run_id"] or 0),
             )
+            baseline_task_tokens_values = [
+                _to_optional_int(baseline.get("tokens_used"))
+                for baseline in (
+                    group.get("baseline_runs", {}).values()
+                    if isinstance(group.get("baseline_runs"), dict)
+                    else []
+                )
+                if _to_optional_int(baseline.get("tokens_used")) is not None
+            ]
+            baseline_task_tokens = (
+                sum(baseline_task_tokens_values)
+                if baseline_task_tokens_values
+                else None
+            )
+            miner_task_tokens_values = [
+                _to_optional_int(run.get("tokens_with_compression"))
+                for run in runs
+                if _to_optional_int(run.get("tokens_with_compression")) is not None
+            ]
+            miner_task_tokens = (
+                sum(miner_task_tokens_values)
+                if miner_task_tokens_values
+                else None
+            )
             baseline_weighted_tokens, miner_weighted_tokens = _group_weighted_token_totals(
                 group
             )
@@ -1741,6 +1765,31 @@ async def _get_competition_aggregate_impl(
                 miner_cached_input_tokens,
                 miner_output_tokens,
             ) = _group_miner_token_component_totals(group)
+            task_item = task_item.model_copy(
+                update={
+                    "tokens_without_compression": baseline_task_tokens,
+                    "tokens_with_compression": (
+                        float(miner_task_tokens)
+                        if miner_task_tokens is not None
+                        else None
+                    ),
+                    "input_tokens_with_compression": (
+                        float(miner_input_tokens)
+                        if miner_input_tokens is not None
+                        else None
+                    ),
+                    "cached_input_tokens_with_compression": (
+                        float(miner_cached_input_tokens)
+                        if miner_cached_input_tokens is not None
+                        else None
+                    ),
+                    "output_tokens_with_compression": (
+                        float(miner_output_tokens)
+                        if miner_output_tokens is not None
+                        else None
+                    ),
+                }
+            )
             if baseline_weighted_tokens is not None:
                 miner_baseline_weighted_total += baseline_weighted_tokens
                 miner_has_baseline_weighted = True
