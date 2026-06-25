@@ -119,7 +119,7 @@ class SWEExplorerEvaluator:
         instance_id: str,
         regions_json: str,
     ) -> SWEExplorerEvaluationResult:
-        from eval import ExploreEvaluator  # installed from /root/SWE-Explore-Bench
+        from validator.evaluation._swe_explore_eval import ExploreEvaluator
 
         bench_path = self._ensure_bench_data()
         regions = _parse_regions(regions_json)
