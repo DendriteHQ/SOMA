@@ -30,7 +30,6 @@ from soma_shared.db.session import get_db_session, get_engine
 logger = get_logger(__name__)
 
 _BENCHMARK_TYPES = ("swebench_verified", "swe_explorer_explore", "swe_explorer_edit")
-_SWE_EXPLORER_BENCHMARK_NAME = "SWE-Explore-Bench/SWE-Explore-Bench"
 
 
 def _all_types_resolved_joins_and_expr():
@@ -1052,11 +1051,7 @@ async def _dispatch_due_runs(
                 continue
 
             run_benchmark_type = str(row.get("benchmark_type") or "swebench_verified")
-            benchmark_name = (
-                _SWE_EXPLORER_BENCHMARK_NAME
-                if run_benchmark_type in ("swe_explorer_explore", "swe_explorer_edit")
-                else str(settings.swebench_benchmark_name)
-            )
+            benchmark_name = str(settings.swebench_benchmark_name)
             ok, error, retryable = await manager.dispatch_swebench_run(
                 run_id=run_id,
                 benchmark=benchmark_name,
