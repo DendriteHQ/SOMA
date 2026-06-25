@@ -1111,6 +1111,8 @@ class CompactBenchExecutor:
             task.instance_id,
             "--output-dir",
             str(output_dir),
+            "--benchmark-type",
+            task.benchmark_type,
             "--execute",
             "--openclaw-run-id-header-value",
             str(task.run_id),
