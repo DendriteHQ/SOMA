@@ -135,7 +135,7 @@ def base_swe_score(
     if baseline_pass and not compressed_pass:
         return -4.0, 0.0
     if not baseline_pass and compressed_pass:
-        return 4.0, 0.5
+        return 2.0, 0.5
     return 0.0, 0.1
 
 

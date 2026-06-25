@@ -63,7 +63,7 @@ $$
 Case C: the baseline run fails and the miner run passes.
 
 $$
-Score(T_{type}) = 4.0, \qquad \lambda(T_{type}) = 0.5
+Score(T_{type}) = 2.0, \qquad \lambda(T_{type}) = 0.5
 $$
 
 Case D: the baseline run fails and the miner run fails.
