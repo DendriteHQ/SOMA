@@ -131,3 +131,4 @@ xxhash==3.6.0
 yarl==1.22.0
 git+https://github.com/SWE-rebench/SWE-bench-fork.git@main
 git+https://github.com/DendriteHQ/SOMA-shared.git@main
+git+https://github.com/Qiushao-E/SWE-Explore-Bench.git@main
