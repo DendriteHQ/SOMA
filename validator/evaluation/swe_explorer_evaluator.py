@@ -11,7 +11,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 SWE_EXPLORER_BENCHMARK = "SWE-Explore-Bench/SWE-Explore-Bench"
-SWE_EXPLORER_SPLIT = "test"
+SWE_EXPLORER_SPLIT = "train"
 
 ALL_METRICS = [
     "precision",
