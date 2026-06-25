@@ -1140,11 +1140,20 @@ async def _get_baseline_script_presigned_url(
 ) -> str:
     key = getattr(app.state, "swebench_baseline_script_key", None)
     if not key:
-        key = "hot/miner_solutions/__baseline__/baseline_default.py"
+        key = "hot/miner_solutions/__baseline__/baseline_default_v3.py"
         script = (
-            "from typing import Optional\n\n"
-            "def main(task: str, compression_ratio: Optional[float]) -> str:\n"
-            "    return task or ''\n"
+            "from __future__ import annotations\n\n"
+            "from typing import Any\n\n"
+            "def compress_messages(\n"
+            "    messages: list[Any] | None = None,\n"
+            "    path: str | None = None,\n"
+            "    metadata: dict[str, Any] | None = None,\n"
+            ") -> list[Any]:\n"
+            "    \"\"\"Identity compressor: return incoming messages unchanged.\"\"\"\n"
+            "    del path, metadata\n"
+            "    if isinstance(messages, list):\n"
+            "        return messages\n"
+            "    return []\n"
         )
         await s3_storage.put_bytes(
             key,
