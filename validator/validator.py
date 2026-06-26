@@ -74,7 +74,11 @@ class Validator(AbstractValidator):
         resp = asyncio.run(self.register_to_platform())
         self.registered = bool(resp and getattr(resp, "ok", False))
         if not self.registered:
-            raise RuntimeError("Validator registration to platform failed.")
+            logging.warning(
+                "Validator registration to platform failed; "
+                "task fetching is disabled until re-registration succeeds. "
+                "Weight setting and other operations will continue normally."
+            )
 
     def init_settings(self) -> Settings:
         return Settings.from_env()
@@ -490,6 +494,15 @@ class Validator(AbstractValidator):
             raise  # Re-raise to see if this is causing the crash
 
     async def get_tasks_for_eval(self) -> SweBenchValidationTask | None:
+        if not self.registered:
+            logging.warning("get_tasks_for_eval: not registered, attempting re-registration")
+            resp = await self.register_to_platform()
+            self.registered = bool(resp and getattr(resp, "ok", False))
+            if not self.registered:
+                logging.warning("get_tasks_for_eval: re-registration failed, skipping task fetch")
+                self._last_fetch_cause = "not_registered"
+                return None
+            logging.info("get_tasks_for_eval: re-registration succeeded, proceeding with task fetch")
         try:
             payload = GetSweBenchValidationRequest()
             nonce = generate_nonce()
