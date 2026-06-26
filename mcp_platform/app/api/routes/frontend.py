@@ -89,6 +89,7 @@ from app.api.routes.scoring import (
 )
 from app.services.swe_difficulty_calculator import (
     build_baseline_task_data,
+    build_miner_category_scores,
     derive_task_difficulties,
 )
 from app.services.dash_rows_cache import DashRowsFrozenCache
@@ -796,6 +797,147 @@ def _weighted_tokens_for_screening(
     return float(parsed_total)
 
 
+def _group_weighted_token_totals(
+    group: dict[str, object],
+) -> tuple[float | None, float | None]:
+    baseline_total = 0.0
+    baseline_has_value = False
+    baseline_runs = group.get("baseline_runs")
+    if isinstance(baseline_runs, dict):
+        for baseline in baseline_runs.values():
+            if not isinstance(baseline, dict):
+                continue
+            weighted = _weighted_tokens_for_screening(
+                total_tokens=baseline.get("tokens_used"),
+                input_tokens=baseline.get("input_tokens"),
+                cached_input_tokens=baseline.get("cached_input_tokens"),
+                output_tokens=baseline.get("output_tokens"),
+            )
+            if weighted is None:
+                continue
+            baseline_total += weighted
+            baseline_has_value = True
+
+    miner_total = 0.0
+    miner_has_value = False
+    runs = group.get("runs")
+    if isinstance(runs, list):
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            weighted = _weighted_tokens_for_screening(
+                total_tokens=run.get("tokens_with_compression"),
+                input_tokens=run.get("input_tokens_with_compression"),
+                cached_input_tokens=run.get("cached_input_tokens_with_compression"),
+                output_tokens=run.get("output_tokens_with_compression"),
+            )
+            if weighted is None:
+                continue
+            miner_total += weighted
+            miner_has_value = True
+
+    return (
+        baseline_total if baseline_has_value else None,
+        miner_total if miner_has_value else None,
+    )
+
+
+def _group_baseline_token_component_totals(
+    group: dict[str, object],
+) -> tuple[int | None, int | None, int | None]:
+    baseline_runs = group.get("baseline_runs")
+
+    input_total = 0
+    input_has_value = False
+    cached_total = 0
+    cached_has_value = False
+    output_total = 0
+    output_has_value = False
+
+    if isinstance(baseline_runs, dict):
+        for baseline in baseline_runs.values():
+            if not isinstance(baseline, dict):
+                continue
+
+            input_tokens = _to_optional_int(baseline.get("input_tokens"))
+            if input_tokens is not None:
+                input_total += input_tokens
+                input_has_value = True
+
+            cached_input_tokens = _to_optional_int(baseline.get("cached_input_tokens"))
+            if cached_input_tokens is not None:
+                cached_total += cached_input_tokens
+                cached_has_value = True
+
+            output_tokens = _to_optional_int(baseline.get("output_tokens"))
+            if output_tokens is not None:
+                output_total += output_tokens
+                output_has_value = True
+
+    return (
+        input_total if input_has_value else None,
+        cached_total if cached_has_value else None,
+        output_total if output_has_value else None,
+    )
+
+
+def _group_miner_token_component_totals(
+    group: dict[str, object],
+) -> tuple[int | None, int | None, int | None]:
+    runs = group.get("runs")
+
+    input_total = 0
+    input_has_value = False
+    cached_total = 0
+    cached_has_value = False
+    output_total = 0
+    output_has_value = False
+
+    if isinstance(runs, list):
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+
+            input_tokens = _to_optional_int(run.get("input_tokens_with_compression"))
+            if input_tokens is not None:
+                input_total += input_tokens
+                input_has_value = True
+
+            cached_input_tokens = _to_optional_int(
+                run.get("cached_input_tokens_with_compression")
+            )
+            if cached_input_tokens is not None:
+                cached_total += cached_input_tokens
+                cached_has_value = True
+
+            output_tokens = _to_optional_int(run.get("output_tokens_with_compression"))
+            if output_tokens is not None:
+                output_total += output_tokens
+                output_has_value = True
+
+    return (
+        input_total if input_has_value else None,
+        cached_total if cached_has_value else None,
+        output_total if output_has_value else None,
+    )
+
+
+def _weighted_tokens_for_run_item(run: dict[str, object]) -> float | None:
+    return _weighted_tokens_for_screening(
+        total_tokens=run.get("tokens_with_compression"),
+        input_tokens=run.get("input_tokens_with_compression"),
+        cached_input_tokens=run.get("cached_input_tokens_with_compression"),
+        output_tokens=run.get("output_tokens_with_compression"),
+    )
+
+
+def _round_optional_1dp(value: float | None) -> float | None:
+    if value is None:
+        return None
+    rounded = round(float(value), 1)
+    return 0.0 if rounded == -0.0 else rounded
+
+
 def _weighted_token_savings_ratio(
     *,
     baseline_weighted_total: float,
@@ -1076,10 +1218,18 @@ async def _build_swe_status_overrides(
                         screening_passed = False
                         break
                     baseline_weighted_tokens = baseline_weighted_by_attempt.get((task_id, attempt_no))
-                    if miner_weighted_tokens is None or baseline_weighted_tokens is None:
+                    if baseline_weighted_tokens is None:
                         screening_complete = False
                         screening_passed = False
                         break
+                    if miner_weighted_tokens is None:
+                        if bool(resolved_value):
+                            screening_complete = False
+                            screening_passed = False
+                            break
+                        # For failed attempts (e.g. timeout) with missing token metrics,
+                        # treat miner weighted tokens as zero so screening can complete.
+                        miner_weighted_tokens = 0.0
                     miner_weighted_total += miner_weighted_tokens
                     baseline_weighted_total += baseline_weighted_tokens
                     attempt_resolved.append(bool(resolved_value))
@@ -1552,6 +1702,22 @@ async def _get_competition_aggregate_impl(
             }
 
         task_aggregate_items: list[SweMinerTaskAggregateItem] = []
+        miner_baseline_weighted_total = 0.0
+        miner_has_baseline_weighted = False
+        miner_weighted_total = 0.0
+        miner_has_weighted = False
+        miner_baseline_input_total = 0
+        miner_has_baseline_input = False
+        miner_baseline_cached_input_total = 0
+        miner_has_baseline_cached_input = False
+        miner_baseline_output_total = 0
+        miner_has_baseline_output = False
+        miner_input_total = 0
+        miner_has_input = False
+        miner_cached_input_total = 0
+        miner_has_cached_input = False
+        miner_output_total = 0
+        miner_has_output = False
         for group in sorted(task_groups.values(), key=lambda group: int(group["task_id"])):
             task_item = build_swe_task_result_item(group).model_copy(
                 update={
@@ -1562,12 +1728,110 @@ async def _get_competition_aggregate_impl(
                 group["runs"],
                 key=lambda run: (run["attempt_no"], run["run_id"] or 0),
             )
+            baseline_task_tokens_values = [
+                _to_optional_int(baseline.get("tokens_used"))
+                for baseline in (
+                    group.get("baseline_runs", {}).values()
+                    if isinstance(group.get("baseline_runs"), dict)
+                    else []
+                )
+                if _to_optional_int(baseline.get("tokens_used")) is not None
+            ]
+            baseline_task_tokens = (
+                sum(baseline_task_tokens_values)
+                if baseline_task_tokens_values
+                else None
+            )
+            miner_task_tokens_values = [
+                _to_optional_int(run.get("tokens_with_compression"))
+                for run in runs
+                if _to_optional_int(run.get("tokens_with_compression")) is not None
+            ]
+            miner_task_tokens = (
+                sum(miner_task_tokens_values)
+                if miner_task_tokens_values
+                else None
+            )
+            baseline_weighted_tokens, miner_weighted_tokens = _group_weighted_token_totals(
+                group
+            )
+            (
+                baseline_input_tokens,
+                baseline_cached_input_tokens,
+                baseline_output_tokens,
+            ) = _group_baseline_token_component_totals(group)
+            (
+                miner_input_tokens,
+                miner_cached_input_tokens,
+                miner_output_tokens,
+            ) = _group_miner_token_component_totals(group)
+            task_item = task_item.model_copy(
+                update={
+                    "tokens_without_compression": baseline_task_tokens,
+                    "tokens_with_compression": (
+                        float(miner_task_tokens)
+                        if miner_task_tokens is not None
+                        else None
+                    ),
+                    "input_tokens_with_compression": (
+                        float(miner_input_tokens)
+                        if miner_input_tokens is not None
+                        else None
+                    ),
+                    "cached_input_tokens_with_compression": (
+                        float(miner_cached_input_tokens)
+                        if miner_cached_input_tokens is not None
+                        else None
+                    ),
+                    "output_tokens_with_compression": (
+                        float(miner_output_tokens)
+                        if miner_output_tokens is not None
+                        else None
+                    ),
+                }
+            )
+            if baseline_weighted_tokens is not None:
+                miner_baseline_weighted_total += baseline_weighted_tokens
+                miner_has_baseline_weighted = True
+            if miner_weighted_tokens is not None:
+                miner_weighted_total += miner_weighted_tokens
+                miner_has_weighted = True
+            if baseline_input_tokens is not None:
+                miner_baseline_input_total += baseline_input_tokens
+                miner_has_baseline_input = True
+            if baseline_cached_input_tokens is not None:
+                miner_baseline_cached_input_total += baseline_cached_input_tokens
+                miner_has_baseline_cached_input = True
+            if baseline_output_tokens is not None:
+                miner_baseline_output_total += baseline_output_tokens
+                miner_has_baseline_output = True
+            if miner_input_tokens is not None:
+                miner_input_total += miner_input_tokens
+                miner_has_input = True
+            if miner_cached_input_tokens is not None:
+                miner_cached_input_total += miner_cached_input_tokens
+                miner_has_cached_input = True
+            if miner_output_tokens is not None:
+                miner_output_total += miner_output_tokens
+                miner_has_output = True
             run_items = [
                 SweMinerTaskRunItem(
                     run_id=int(run["run_id"] or 0),
                     attempt_no=int(run["attempt_no"]),
                     pass_with_compression=run["pass_with_compression"],
                     tokens_with_compression=run["tokens_with_compression"],
+                    input_tokens_with_compression=run[
+                        "input_tokens_with_compression"
+                    ],
+                    cached_input_tokens_with_compression=run[
+                        "cached_input_tokens_with_compression"
+                    ],
+                    output_tokens_with_compression=run[
+                        "output_tokens_with_compression"
+                    ],
+                    weighted_tokens_with_compression=_round_optional_1dp(
+                        _weighted_tokens_for_run_item(run)
+                    ),
                     platform_score=(
                         float(run["platform_score"])
                         if run["platform_score"] is not None
@@ -1583,6 +1847,18 @@ async def _get_competition_aggregate_impl(
                     task=task_item,
                     runs=run_items,
                     total_runs=len(run_items),
+                    baseline_weighted_tokens=_round_optional_1dp(
+                        baseline_weighted_tokens
+                    ),
+                    miner_weighted_tokens=_round_optional_1dp(
+                        miner_weighted_tokens
+                    ),
+                    baseline_input_tokens=baseline_input_tokens,
+                    baseline_cached_input_tokens=baseline_cached_input_tokens,
+                    baseline_output_tokens=baseline_output_tokens,
+                    miner_input_tokens=miner_input_tokens,
+                    miner_cached_input_tokens=miner_cached_input_tokens,
+                    miner_output_tokens=miner_output_tokens,
                 )
             )
 
@@ -1614,6 +1890,32 @@ async def _get_competition_aggregate_impl(
                 ),
                 tasks=task_aggregate_items,
                 total_tasks=len(task_aggregate_items),
+                baseline_weighted_tokens_total=_round_optional_1dp(
+                    miner_baseline_weighted_total if miner_has_baseline_weighted else None
+                ),
+                miner_weighted_tokens_total=_round_optional_1dp(
+                    miner_weighted_total if miner_has_weighted else None
+                ),
+                baseline_input_tokens_total=(
+                    miner_baseline_input_total if miner_has_baseline_input else None
+                ),
+                baseline_cached_input_tokens_total=(
+                    miner_baseline_cached_input_total
+                    if miner_has_baseline_cached_input
+                    else None
+                ),
+                baseline_output_tokens_total=(
+                    miner_baseline_output_total if miner_has_baseline_output else None
+                ),
+                miner_input_tokens_total=(
+                    miner_input_total if miner_has_input else None
+                ),
+                miner_cached_input_tokens_total=(
+                    miner_cached_input_total if miner_has_cached_input else None
+                ),
+                miner_output_tokens_total=(
+                    miner_output_total if miner_has_output else None
+                ),
             )
         )
 
@@ -2892,6 +3194,18 @@ async def get_swe_miner_task_runs(
                 attempt_no=int(run["attempt_no"]),
                 pass_with_compression=run["pass_with_compression"],
                 tokens_with_compression=run["tokens_with_compression"],
+                input_tokens_with_compression=run[
+                    "input_tokens_with_compression"
+                ],
+                cached_input_tokens_with_compression=run[
+                    "cached_input_tokens_with_compression"
+                ],
+                output_tokens_with_compression=run[
+                    "output_tokens_with_compression"
+                ],
+                weighted_tokens_with_compression=_round_optional_1dp(
+                    _weighted_tokens_for_run_item(run)
+                ),
                 platform_score=(
                     float(run["platform_score"])
                     if run["platform_score"] is not None

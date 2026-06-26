@@ -43,13 +43,17 @@ def compute_weighted_tokens(
 ) -> float | None:
     """Return a weighted token count using per-type weights from settings.
 
-    Requires all three split columns (input / cached / output).  Returns
-    ``None`` when any of them is missing or negative — the caller treats
-    that as "no token data available" and the run does not contribute to
-    token-based scoring.
+    By default this requires split columns. One compatibility exception applies:
+    when only ``cached_input_tokens`` is missing, it is treated as ``0``.
+
+    Returns ``None`` when token inputs are missing/invalid.
     """
-    if input_tokens is None or cached_input_tokens is None or output_tokens is None:
+    if input_tokens is None and cached_input_tokens is None and output_tokens is None:
         return None
+    if input_tokens is None or output_tokens is None:
+        return None
+    if cached_input_tokens is None:
+        cached_input_tokens = 0
     if input_tokens < 0 or cached_input_tokens < 0 or output_tokens < 0:
         return None
     input_weight, cached_weight, output_weight = _scoring_token_weights()
@@ -179,9 +183,15 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
             group["baseline_runs"][baseline_run_id] = {
                 "resolved": row.baseline_resolved,
                 "tokens_used": _to_optional_int(row.baseline_tokens_used),
-                "input_tokens": _to_optional_int(getattr(row, "baseline_input_tokens", None)),
-                "cached_input_tokens": _to_optional_int(getattr(row, "baseline_cached_input_tokens", None)),
-                "output_tokens": _to_optional_int(getattr(row, "baseline_output_tokens", None)),
+                "input_tokens": _to_optional_int(
+                    getattr(row, "baseline_input_tokens", None)
+                ),
+                "cached_input_tokens": _to_optional_int(
+                    getattr(row, "baseline_cached_input_tokens", None)
+                ),
+                "output_tokens": _to_optional_int(
+                    getattr(row, "baseline_output_tokens", None)
+                ),
             }
 
         run_id = _to_optional_int(row.run_id)
@@ -195,9 +205,15 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
                 "attempt_no": _to_optional_int(row.attempt_no) or 0,
                 "pass_with_compression": row.run_resolved,
                 "tokens_with_compression": _to_optional_int(row.run_tokens_used),
-                "input_tokens": _to_optional_int(getattr(row, "run_input_tokens", None)),
-                "cached_input_tokens": _to_optional_int(getattr(row, "run_cached_input_tokens", None)),
-                "output_tokens": _to_optional_int(getattr(row, "run_output_tokens", None)),
+                "input_tokens_with_compression": _to_optional_int(
+                    getattr(row, "run_input_tokens", None)
+                ),
+                "cached_input_tokens_with_compression": _to_optional_int(
+                    getattr(row, "run_cached_input_tokens", None)
+                ),
+                "output_tokens_with_compression": _to_optional_int(
+                    getattr(row, "run_output_tokens", None)
+                ),
                 "time_taken_seconds": _to_optional_float(row.time_taken_seconds),
                 "agent_steps": _to_optional_int(row.agent_steps),
                 "baseline_scores": [],
@@ -251,9 +267,9 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
         )
         for run in group["runs"]:
             run["weighted_tokens_with_compression"] = compute_weighted_tokens(
-                input_tokens=run["input_tokens"],
-                cached_input_tokens=run["cached_input_tokens"],
-                output_tokens=run["output_tokens"],
+                input_tokens=run["input_tokens_with_compression"],
+                cached_input_tokens=run["cached_input_tokens_with_compression"],
+                output_tokens=run["output_tokens_with_compression"],
             )
         group.pop("runs_by_id")
 
@@ -274,6 +290,21 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         int(run["tokens_with_compression"])
         for run in runs
         if run["tokens_with_compression"] is not None
+    ]
+    input_tokens_with_compression = [
+        int(run["input_tokens_with_compression"])
+        for run in runs
+        if run["input_tokens_with_compression"] is not None
+    ]
+    cached_input_tokens_with_compression = [
+        int(run["cached_input_tokens_with_compression"])
+        for run in runs
+        if run["cached_input_tokens_with_compression"] is not None
+    ]
+    output_tokens_with_compression = [
+        int(run["output_tokens_with_compression"])
+        for run in runs
+        if run["output_tokens_with_compression"] is not None
     ]
     passed_with_compression_values = [
     run["pass_with_compression"] for run in runs
@@ -297,6 +328,22 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         ),
         tokens_with_compression=(
             sum(compressed_tokens) / len(compressed_tokens) if compressed_tokens else None
+        ),
+        input_tokens_with_compression=(
+            sum(input_tokens_with_compression) / len(input_tokens_with_compression)
+            if input_tokens_with_compression
+            else None
+        ),
+        cached_input_tokens_with_compression=(
+            sum(cached_input_tokens_with_compression)
+            / len(cached_input_tokens_with_compression)
+            if cached_input_tokens_with_compression
+            else None
+        ),
+        output_tokens_with_compression=(
+            sum(output_tokens_with_compression) / len(output_tokens_with_compression)
+            if output_tokens_with_compression
+            else None
         ),
         platform_score=(sum(run_scores) / len(run_scores) if run_scores else None),
         run_count=len(runs),

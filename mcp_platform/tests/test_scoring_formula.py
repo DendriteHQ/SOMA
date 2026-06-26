@@ -135,6 +135,39 @@ def test_adjusted_score_keeps_raw_score_when_token_totals_are_invalid():
     ) < 1e-9
 
 
+def test_compute_weighted_tokens_treats_cached_null_as_zero_only():
+    scoring = _load_scoring_module()
+
+    # input=60, cached=NULL->0, output=10 with weights (1, 1/3, 3)
+    weighted = scoring.compute_weighted_tokens(
+        input_tokens=60,
+        cached_input_tokens=None,
+        output_tokens=10,
+    )
+    assert weighted is not None
+    assert abs(weighted - 90.0) < 1e-9
+
+    # All null stays unavailable.
+    assert (
+        scoring.compute_weighted_tokens(
+            input_tokens=None,
+            cached_input_tokens=None,
+            output_tokens=None,
+        )
+        is None
+    )
+
+    # Missing required non-cached/output still unavailable.
+    assert (
+        scoring.compute_weighted_tokens(
+            input_tokens=None,
+            cached_input_tokens=10,
+            output_tokens=5,
+        )
+        is None
+    )
+
+
 def test_build_swe_miner_scores_applies_global_token_multiplier():
     scoring = _load_scoring_module()
 
