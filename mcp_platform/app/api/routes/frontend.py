@@ -134,14 +134,20 @@ SWE_BENCH_RUNS = sa.table(
     sa.column("agent_steps"),
     sa.column("baseline_run"),
     sa.column("status"),
+    sa.column("benchmark_type"),
 )
 
 SWE_BENCH_RUN_VALIDATIONS = sa.table(
     "swe_bench_run_validations",
     sa.column("id"),
     sa.column("run_fk"),
-    sa.column("resolved"),
     sa.column("scored_at"),
+)
+
+SWE_BENCH_VERIFIED_VALIDATIONS = sa.table(
+    "swe_bench_verified_validations",
+    sa.column("validation_fk"),
+    sa.column("resolved"),
 )
 
 MINER_OPENROUTER_API_KEYS = sa.table(
@@ -705,8 +711,10 @@ async def _fetch_swe_rows_live(
 ) -> list[sa.Row]:
     baseline_runs = SWE_BENCH_RUNS.alias("baseline_runs")
     baseline_validations = SWE_BENCH_RUN_VALIDATIONS.alias("baseline_validations")
+    baseline_verified = SWE_BENCH_VERIFIED_VALIDATIONS.alias("baseline_verified")
     miner_runs = SWE_BENCH_RUNS.alias("miner_runs")
     miner_validations = SWE_BENCH_RUN_VALIDATIONS.alias("miner_validations")
+    miner_verified = SWE_BENCH_VERIFIED_VALIDATIONS.alias("miner_verified")
 
     query = (
         select(
@@ -719,7 +727,7 @@ async def _fetch_swe_rows_live(
             baseline_runs.c.input_tokens.label("baseline_input_tokens"),
             baseline_runs.c.cached_input_tokens.label("baseline_cached_input_tokens"),
             baseline_runs.c.output_tokens.label("baseline_output_tokens"),
-            baseline_validations.c.resolved.label("baseline_resolved"),
+            baseline_verified.c.resolved.label("baseline_resolved"),
             miner_runs.c.id.label("run_id"),
             miner_runs.c.attempt_no.label("attempt_no"),
             miner_runs.c.tokens_used.label("run_tokens_used"),
@@ -728,7 +736,7 @@ async def _fetch_swe_rows_live(
             miner_runs.c.output_tokens.label("run_output_tokens"),
             miner_runs.c.time_taken_seconds.label("time_taken_seconds"),
             miner_runs.c.agent_steps.label("agent_steps"),
-            miner_validations.c.resolved.label("run_resolved"),
+            miner_verified.c.resolved.label("run_resolved"),
         )
         .select_from(SWE_BENCH_TASKS)
         .join(
@@ -736,23 +744,33 @@ async def _fetch_swe_rows_live(
             and_(
                 baseline_runs.c.task_fk == SWE_BENCH_TASKS.c.id,
                 baseline_runs.c.baseline_run.is_(True),
+                baseline_runs.c.benchmark_type == "swebench_verified",
             ),
         )
         .outerjoin(
             baseline_validations,
             baseline_validations.c.run_fk == baseline_runs.c.id,
         )
+        .outerjoin(
+            baseline_verified,
+            baseline_verified.c.validation_fk == baseline_validations.c.id,
+        )
         .join(
             miner_runs,
             and_(
                 miner_runs.c.task_fk == SWE_BENCH_TASKS.c.id,
                 miner_runs.c.baseline_run.is_(False),
+                miner_runs.c.benchmark_type == "swebench_verified",
             ),
         )
         .join(Miner, Miner.id == miner_runs.c.miner_fk)
         .outerjoin(
             miner_validations,
             miner_validations.c.run_fk == miner_runs.c.id,
+        )
+        .outerjoin(
+            miner_verified,
+            miner_verified.c.validation_fk == miner_validations.c.id,
         )
         .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
         .order_by(
@@ -1301,7 +1319,7 @@ async def _build_swe_status_overrides(
                 SWE_BENCH_RUNS.c.cached_input_tokens,
                 SWE_BENCH_RUNS.c.output_tokens,
                 SWE_BENCH_TASKS.c.is_screener,
-                SWE_BENCH_RUN_VALIDATIONS.c.resolved,
+                SWE_BENCH_VERIFIED_VALIDATIONS.c.resolved,
                 SWE_BENCH_RUN_VALIDATIONS.c.scored_at,
             )
             .select_from(SWE_BENCH_RUNS)
@@ -1310,8 +1328,13 @@ async def _build_swe_status_overrides(
                 SWE_BENCH_RUN_VALIDATIONS,
                 SWE_BENCH_RUN_VALIDATIONS.c.run_fk == SWE_BENCH_RUNS.c.id,
             )
+            .outerjoin(
+                SWE_BENCH_VERIFIED_VALIDATIONS,
+                SWE_BENCH_VERIFIED_VALIDATIONS.c.validation_fk == SWE_BENCH_RUN_VALIDATIONS.c.id,
+            )
             .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
             .where(SWE_BENCH_RUNS.c.baseline_run.is_(False))
+            .where(SWE_BENCH_RUNS.c.benchmark_type == "swebench_verified")
             .where(pair_expr.in_(pairs))
         )
     ).all()
@@ -1332,6 +1355,7 @@ async def _build_swe_status_overrides(
                 .join(SWE_BENCH_TASKS, SWE_BENCH_TASKS.c.id == SWE_BENCH_RUNS.c.task_fk)
                 .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
                 .where(SWE_BENCH_RUNS.c.baseline_run.is_(True))
+                .where(SWE_BENCH_RUNS.c.benchmark_type == "swebench_verified")
                 .where(SWE_BENCH_RUNS.c.miner_fk.is_(None))
                 .where(SWE_BENCH_RUNS.c.script_fk.is_(None))
                 .where(SWE_BENCH_RUNS.c.task_fk.in_(screener_task_ids))

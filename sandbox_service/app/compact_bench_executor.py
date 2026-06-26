@@ -481,6 +481,52 @@ def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
     cache_path.write_bytes(payload)
     return cache_path
 
+def _extract_explore_regions_json(trajectory_path: str) -> str:
+    """Extract the JSON regions array from the last assistant message in a trajectory JSONL."""
+    import re as _re
+    if not trajectory_path:
+        return ""
+    path = Path(trajectory_path)
+    if not path.is_file():
+        return ""
+    last_text = ""
+    with path.open(encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "assistant.message":
+                continue
+            data = event.get("data") or {}
+            # Try common content shapes: plain string, content list, message key
+            text = data.get("message") or data.get("text") or ""
+            if not text:
+                content = data.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            parts.append(block.get("text", ""))
+                        elif isinstance(block, str):
+                            parts.append(block)
+                    text = "\n".join(parts)
+            if isinstance(text, str) and text.strip():
+                last_text = text.strip()
+    if not last_text:
+        return ""
+    # Extract the last JSON array from the message
+    matches = list(_re.finditer(r'\[[\s\S]*?\]', last_text))
+    if matches:
+        return matches[-1].group(0)
+    return ""
+
+
 class CompactBenchExecutor:
     """Runs benchmark solve commands and captures produced patches."""
 
@@ -904,7 +950,12 @@ class CompactBenchExecutor:
             patch_path = patch_capture.get("patch_path") if isinstance(patch_capture, dict) else None
             patch_capture_status = False
             patch_text = ""
-            if isinstance(patch_path, str) and patch_path.strip():
+            if task.benchmark_type == "swe_explorer_explore":
+                regions_json = _extract_explore_regions_json(trajectory_path)
+                if regions_json:
+                    patch_capture_status = True
+                    patch_text = regions_json
+            elif isinstance(patch_path, str) and patch_path.strip():
                 patch_file = Path(patch_path)
                 if patch_file.is_file():
                     patch_capture_status = True
@@ -1111,6 +1162,8 @@ class CompactBenchExecutor:
             task.instance_id,
             "--output-dir",
             str(output_dir),
+            "--benchmark-type",
+            task.benchmark_type,
             "--execute",
             "--openclaw-run-id-header-value",
             str(task.run_id),
@@ -1129,7 +1182,7 @@ class CompactBenchExecutor:
             if openclaw_agent_timeout_seconds is not None:
                 command.extend(["--openclaw-command", f"--timeout {openclaw_agent_timeout_seconds}"])
         if task.model:
-            command.extend(["--model", "qwen/qwen3.7-plus"])
+            command.extend(["--model", "z-ai/glm-5.2"])
         if task.openclaw_disable_somarizer:
             command.append("--openclaw-disable-plugin")
         return command

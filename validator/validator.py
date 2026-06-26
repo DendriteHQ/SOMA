@@ -710,9 +710,11 @@ class Validator(AbstractValidator):
             validation_id = self._task_validation_id(task)
             payload = SubmitSweBenchValidationScoreRequest(
                 validation_id=validation_id,
+                benchmark=str(getattr(task, "benchmark", "")),
                 instance_id=task.instance_id,
                 resolved=bool(results["resolved"]),
                 logs=str(results["logs"]),
+                metrics=results.get("metrics") or None,
             )
             nonce = generate_nonce()
             signature = sign_payload_model(
@@ -767,6 +769,7 @@ class Validator(AbstractValidator):
             validation_id = self._task_validation_id(task)
             payload = SubmitSweBenchValidationScoreRequest(
                 validation_id=validation_id,
+                benchmark=str(getattr(task, "benchmark", "")),
                 instance_id=task.instance_id,
                 resolved=False,
                 logs=self._format_error_logs(
