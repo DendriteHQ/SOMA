@@ -171,7 +171,7 @@ def test_compute_weighted_tokens_treats_cached_null_as_zero_only():
 def test_build_swe_miner_scores_applies_global_token_multiplier():
     scoring = _load_scoring_module()
 
-    # No split token columns — weighted tokens fall back to tokens_used totals.
+    # Provide precomputed weighted totals directly in task groups.
     task_groups = {
         "task-a": {
             "is_screener": True,
