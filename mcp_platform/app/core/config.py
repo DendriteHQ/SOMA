@@ -129,6 +129,18 @@ class Settings(BaseSettings):
         default=5000,
         alias="FRONTEND_API_KEY_DEFAULT_RPD",
     )
+    frontend_aggregate_snapshot_version: str = Field(
+        default="v1",
+        alias="FRONTEND_AGGREGATE_SNAPSHOT_VERSION",
+    )
+    frontend_aggregate_snapshot_dir: Path = Field(
+        default=Path("/tmp/soma/frontend_aggregate_snapshots"),
+        alias="FRONTEND_AGGREGATE_SNAPSHOT_DIR",
+    )
+    frontend_aggregate_snapshot_s3_prefix: str = Field(
+        default="frontend/competition_aggregate_snapshots",
+        alias="FRONTEND_AGGREGATE_SNAPSHOT_S3_PREFIX",
+    )
 
     # Batch cleanup
     batch_cleanup_interval_secs: int = Field(
@@ -356,6 +368,29 @@ class Settings(BaseSettings):
         raise ValueError(
             "COMPACT_BENCH_SERVICE_URLS must be a list or comma-separated string"
         )
+
+    @field_validator("frontend_aggregate_snapshot_dir", mode="before")
+    @classmethod
+    def _parse_frontend_aggregate_snapshot_dir(cls, value: Any) -> Path:
+        if value is None or value == "":
+            return Path("/tmp/soma/frontend_aggregate_snapshots")
+        if isinstance(value, Path):
+            return value
+        if isinstance(value, str):
+            return Path(value.strip())
+        raise ValueError("FRONTEND_AGGREGATE_SNAPSHOT_DIR must be a filesystem path")
+
+    @field_validator("frontend_aggregate_snapshot_s3_prefix", mode="before")
+    @classmethod
+    def _parse_frontend_aggregate_snapshot_s3_prefix(cls, value: Any) -> str:
+        if value is None or value == "":
+            return "frontend/competition_aggregate_snapshots"
+        if not isinstance(value, str):
+            raise ValueError("FRONTEND_AGGREGATE_SNAPSHOT_S3_PREFIX must be a string")
+        normalized = value.strip().strip("/")
+        if not normalized:
+            return "frontend/competition_aggregate_snapshots"
+        return normalized
 
     @field_validator("top_screener_scripts", mode="before")
     @classmethod
