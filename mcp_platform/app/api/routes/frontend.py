@@ -8,6 +8,8 @@ import sqlalchemy as sa
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import ceil
+from pathlib import Path
+from typing import Any
 
 from aiocache import Cache
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
@@ -93,6 +95,7 @@ from app.services.swe_difficulty_calculator import (
     derive_task_difficulties,
 )
 from app.services.dash_rows_cache import DashRowsFrozenCache
+from app.services.blob.s3 import S3BlobStorage
 from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.api.routes.utils import (
     _get_current_burn_state,
@@ -209,6 +212,213 @@ SWE_MINERS_SNAPSHOT_CACHE_VERSION = "v1"
 SWE_ROWS_SNAPSHOT_TTL_SECONDS = 300
 SWE_MINERS_SNAPSHOT_TTL_SECONDS = 300
 _swe_rows_snapshot_build_lock = asyncio.Lock()
+AGGREGATE_SNAPSHOT_VERSION = settings.frontend_aggregate_snapshot_version
+AGGREGATE_SNAPSHOT_LOCAL_DIR = settings.frontend_aggregate_snapshot_dir
+AGGREGATE_SNAPSHOT_S3_PREFIX = settings.frontend_aggregate_snapshot_s3_prefix
+_aggregate_snapshot_build_lock = asyncio.Lock()
+
+
+def _json_payload_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _aggregate_snapshot_local_path(competition_id: int) -> Path:
+    filename = (
+        f"competition_{competition_id}_{AGGREGATE_SNAPSHOT_VERSION}_aggregate.json"
+    )
+    return AGGREGATE_SNAPSHOT_LOCAL_DIR / filename
+
+
+def _aggregate_snapshot_s3_key(competition_id: int) -> str:
+    return (
+        f"{AGGREGATE_SNAPSHOT_S3_PREFIX}/"
+        f"competition_{competition_id}_{AGGREGATE_SNAPSHOT_VERSION}_aggregate.json"
+    )
+
+
+def _build_aggregate_snapshot_document(
+    competition_id: int,
+    payload: Any,
+) -> dict[str, Any]:
+    return {
+        "snapshot_type": "frontend_competition_aggregate",
+        "snapshot_version": AGGREGATE_SNAPSHOT_VERSION,
+        "competition_id": competition_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "payload": payload,
+    }
+
+
+def _extract_aggregate_snapshot_payload(
+    competition_id: int,
+    snapshot_document: Any,
+) -> Any:
+    if not isinstance(snapshot_document, dict):
+        return snapshot_document
+
+    if "payload" not in snapshot_document:
+        return snapshot_document
+
+    snapshot_competition_id = snapshot_document.get("competition_id")
+    if snapshot_competition_id is not None and int(snapshot_competition_id) != int(
+        competition_id
+    ):
+        raise ValueError(
+            "Snapshot competition id mismatch "
+            f"(expected={competition_id}, got={snapshot_competition_id})"
+        )
+    return snapshot_document.get("payload")
+
+
+def _get_snapshot_s3_storage(request: Request) -> S3BlobStorage | None:
+    if not settings.s3_bucket:
+        return None
+    s3_storage = getattr(request.app.state, "swebench_s3_storage", None)
+    if s3_storage is None:
+        s3_storage = S3BlobStorage()
+        request.app.state.swebench_s3_storage = s3_storage
+    return s3_storage
+
+
+async def _load_aggregate_snapshot_from_local(competition_id: int) -> Any | None:
+    local_path = _aggregate_snapshot_local_path(competition_id)
+    if not local_path.exists():
+        return None
+
+    try:
+        snapshot_bytes = await asyncio.to_thread(local_path.read_bytes)
+        snapshot_document = json.loads(snapshot_bytes.decode("utf-8"))
+        return _extract_aggregate_snapshot_payload(competition_id, snapshot_document)
+    except Exception:
+        logger.warning(
+            "[Frontend] Failed to read local aggregate snapshot: competition_id=%s path=%s",
+            competition_id,
+            local_path,
+            exc_info=True,
+        )
+        return None
+
+
+async def _save_aggregate_snapshot_to_local(
+    competition_id: int,
+    payload: Any,
+) -> None:
+    local_path = _aggregate_snapshot_local_path(competition_id)
+    temp_path = local_path.with_suffix(f"{local_path.suffix}.tmp")
+    snapshot_document = _build_aggregate_snapshot_document(competition_id, payload)
+    snapshot_bytes = _json_payload_bytes(snapshot_document)
+
+    def _write_snapshot() -> None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_bytes(snapshot_bytes)
+        temp_path.replace(local_path)
+
+    await asyncio.to_thread(_write_snapshot)
+
+
+async def _load_aggregate_snapshot_from_s3(
+    request: Request,
+    competition_id: int,
+) -> Any | None:
+    s3_storage = _get_snapshot_s3_storage(request)
+    if s3_storage is None:
+        return None
+
+    snapshot_key = _aggregate_snapshot_s3_key(competition_id)
+    try:
+        snapshot_bytes = await s3_storage.get_bytes(snapshot_key)
+    except Exception:
+        return None
+
+    try:
+        snapshot_document = json.loads(snapshot_bytes.decode("utf-8"))
+        return _extract_aggregate_snapshot_payload(competition_id, snapshot_document)
+    except Exception:
+        logger.warning(
+            "[Frontend] Failed to decode S3 aggregate snapshot: competition_id=%s key=%s",
+            competition_id,
+            snapshot_key,
+            exc_info=True,
+        )
+        return None
+
+
+async def _save_aggregate_snapshot_to_s3(
+    request: Request,
+    competition_id: int,
+    payload: Any,
+) -> None:
+    s3_storage = _get_snapshot_s3_storage(request)
+    if s3_storage is None:
+        return
+
+    snapshot_key = _aggregate_snapshot_s3_key(competition_id)
+    snapshot_document = _build_aggregate_snapshot_document(competition_id, payload)
+    try:
+        await s3_storage.put_bytes(
+            snapshot_key,
+            _json_payload_bytes(snapshot_document),
+            content_type="application/json",
+        )
+    except Exception:
+        logger.warning(
+            "[Frontend] Failed to save aggregate snapshot to S3: competition_id=%s key=%s",
+            competition_id,
+            snapshot_key,
+            exc_info=True,
+        )
+
+
+async def _get_latest_competition_id(db: AsyncSession) -> int | None:
+    latest_id = await db.scalar(select(func.max(Competition.id)))
+    if latest_id is None:
+        return None
+    return int(latest_id)
+
+
+async def _get_competition_aggregate_payload(
+    request: Request,
+    db: AsyncSession,
+    competition_id: int,
+) -> Any:
+    latest_competition_id = await _get_latest_competition_id(db)
+    is_latest_competition = (
+        latest_competition_id is not None and int(competition_id) == latest_competition_id
+    )
+    if is_latest_competition:
+        response_model = await _get_competition_aggregate_impl(
+            request=request,
+            db=db,
+            competition_id=competition_id,
+        )
+        return response_model.model_dump(mode="json")
+
+    local_snapshot_payload = await _load_aggregate_snapshot_from_local(competition_id)
+    if local_snapshot_payload is not None:
+        return local_snapshot_payload
+
+    async with _aggregate_snapshot_build_lock:
+        local_snapshot_payload = await _load_aggregate_snapshot_from_local(competition_id)
+        if local_snapshot_payload is not None:
+            return local_snapshot_payload
+
+        s3_snapshot_payload = await _load_aggregate_snapshot_from_s3(
+            request,
+            competition_id,
+        )
+        if s3_snapshot_payload is not None:
+            await _save_aggregate_snapshot_to_local(competition_id, s3_snapshot_payload)
+            return s3_snapshot_payload
+
+        response_model = await _get_competition_aggregate_impl(
+            request=request,
+            db=db,
+            competition_id=competition_id,
+        )
+        payload = response_model.model_dump(mode="json")
+        await _save_aggregate_snapshot_to_local(competition_id, payload)
+        await _save_aggregate_snapshot_to_s3(request, competition_id, payload)
+        return payload
 
 
 def _invalid_api_key_error() -> HTTPException:
@@ -3253,7 +3463,6 @@ router = APIRouter(
 
 @router.get(
     "/competition/{competition_id}/aggregate",
-    response_model=SweCompetitionAggregateResponse,
 )
 async def get_competition_aggregate(
     request: Request,
@@ -3264,17 +3473,17 @@ async def get_competition_aggregate(
         alias="gzip",
         description="When true, response body is returned as gzip-compressed JSON.",
     ),
-) -> SweCompetitionAggregateResponse | Response:
-    response = await _get_competition_aggregate_impl(
+) -> Response:
+    payload = await _get_competition_aggregate_payload(
         request=request,
         db=db,
         competition_id=competition_id,
     )
+    payload_bytes = _json_payload_bytes(payload)
     if not gzip_enabled:
-        return response
+        return Response(content=payload_bytes, media_type="application/json")
 
-    payload = response.model_dump_json().encode("utf-8")
-    compressed_payload = gzip.compress(payload)
+    compressed_payload = gzip.compress(payload_bytes)
     return Response(
         content=compressed_payload,
         media_type="application/json",

@@ -7,6 +7,24 @@ The scoring has two layers:
 1. A raw score is computed from the current run-vs-baseline formula.
 2. The final total score adds one extra multiplier based on total token savings.
 
+## Token counting
+
+Token counts ($Tok_A$ and $Tok_B$) are computed as weighted totals using the token-type breakdown:
+
+$$
+Tok = w_{\text{input}} \cdot T_{\text{input}} + w_{\text{cached}} \cdot T_{\text{cached}} + w_{\text{output}} \cdot T_{\text{output}}
+$$
+
+where the default weights are:
+
+| Token type | Weight |
+|---|---|
+| Input (non-cached) | $1.0$ |
+| Cached input | $\frac{1}{3}$ |
+| Output | $3.0$ |
+
+Cached tokens count less. Output tokens count more.
+
 ## 1. Raw Run Score
 
 1. Every miner run is compared against baseline runs of the same task. Each comparison uses:
@@ -17,8 +35,8 @@ $$
 
 where:
 
-- $Tok_B$ is the number of tokens used by the baseline run,
-- $Tok_A$ is the number of tokens used by the miner run,
+- $Tok_B$ is the weighted token total for the baseline run,
+- $Tok_A$ is the weighted token total for the miner run,
 - $Trim(x, -2, 2)$ keeps $x$ in the interval $[-2, 2]$.
 
 2. If either token count is missing, non-positive, or otherwise invalid, the token component is treated as `0`.
@@ -41,7 +59,7 @@ $$
 Case C: the baseline run fails and the miner run passes.
 
 $$
-Score(T_{type}) = 4.0, \qquad \lambda(T_{type}) = 0.5
+Score(T_{type}) = 2.0, \qquad \lambda(T_{type}) = 0.5
 $$
 
 Case D: the baseline run fails and the miner run fails.
@@ -94,8 +112,8 @@ $$
 
 where:
 
-- $Tok_C$ is the total number of tokens over all compressed runs by that miner,
-- $Tok_B$ is the total number of tokens over all baseline runs for the same miner dataset slice.
+- $Tok_C$ is the total weighted tokens over all compressed runs by that miner,
+- $Tok_B$ is the total weighted tokens over all baseline runs for the same miner dataset slice.
 
 2. The savings ratio is then normalized and clamped:
 
@@ -128,3 +146,5 @@ ScreenerScore(m) = RawScreenerScore(m)
 $$
 
 7. If the token totals are missing or invalid, the multiplier is $1$, so the raw total score stays unchanged.
+
+7. If the weighted token totals are missing or invalid, the multiplier is $1$, so the raw total score stays unchanged.

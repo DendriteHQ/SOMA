@@ -29,6 +29,8 @@ class Settings(BaseModel):
     hf_rate_limit_cooldown_seconds: float
     http_timeout_seconds: float
     weight_block_interval:int
+    weights_cache_file: Path
+    weights_cache_max_age_seconds: float
     swebench_dataset_name: str
     swebench_dataset_split: str
     swebench_eval_arch: str
@@ -96,6 +98,16 @@ class Settings(BaseModel):
             ),
             http_timeout_seconds = cls._get_float("HTTP_TIMEOUT_SECONDS", 240.0),
             weight_block_interval = 110,
+            weights_cache_file=Path(
+                os.getenv(
+                    "VALIDATOR_WEIGHTS_CACHE_FILE",
+                    "validator/.runtime/last_set_weights.json",
+                )
+            ),
+            weights_cache_max_age_seconds=cls._get_float(
+                "VALIDATOR_WEIGHTS_CACHE_MAX_AGE_SECONDS",
+                86400.0,
+            ),
             swebench_dataset_name=os.getenv(
                 "SWEBENCH_DATASET_NAME", "SWE-bench/SWE-bench_Verified"
             ),
