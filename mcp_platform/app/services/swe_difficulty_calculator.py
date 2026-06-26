@@ -54,7 +54,7 @@ def base_swe_score(
     if pass_without_compression and not pass_with_compression:
         return -4.0, 0.0
     if not pass_without_compression and pass_with_compression:
-        return 4.0, 0.5
+        return 2.0, 0.5
     return 0.0, 0.1
 
 
