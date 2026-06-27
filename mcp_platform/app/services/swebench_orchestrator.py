@@ -726,8 +726,14 @@ async def _evaluate_screening_for_script(
             if scored_at is None or resolved_value is None:
                 return False, False
             baseline_weighted_tokens = baseline_weighted_by_task_attempt.get((int(task_id), attempt_no))
-            if miner_weighted_tokens is None or baseline_weighted_tokens is None:
+            if baseline_weighted_tokens is None:
                 return False, False
+            if miner_weighted_tokens is None:
+                if bool(resolved_value):
+                    return False, False
+                # Keep screening behavior aligned with frontend status rules:
+                # failed attempts with missing token components count as zero.
+                miner_weighted_tokens = 0.0
             miner_weighted_total += miner_weighted_tokens
             baseline_weighted_total += baseline_weighted_tokens
             attempt_resolved.append(bool(resolved_value))
@@ -744,7 +750,7 @@ async def _evaluate_screening_for_script(
         miner_weighted_total=miner_weighted_total,
     )
     if weighted_savings_ratio is None:
-        return False, False
+        return True, False
 
     return True, weighted_savings_ratio >= _required_screening_weighted_token_saving_ratio()
 
