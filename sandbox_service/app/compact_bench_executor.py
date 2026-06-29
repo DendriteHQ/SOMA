@@ -531,11 +531,37 @@ def _read_explore_result_file(tmp_run_dir: str) -> str:
     return ""
 
 
+def _extract_text_from_event(event: dict) -> str:
+    """Return the human-readable text payload from a trajectory event, or ''."""
+    data = event.get("data") or {}
+    text = data.get("message") or data.get("text") or ""
+    if not text:
+        content = data.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            text = "\n".join(parts)
+    if not text:
+        result = data.get("result")
+        if isinstance(result, dict):
+            rc = result.get("content")
+            if isinstance(rc, str):
+                text = rc
+    return text if isinstance(text, str) else ""
+
+
 def _extract_explore_regions_json(trajectory_path: str) -> str:
     """Fallback: extract regions JSON from trajectory JSONL by scanning events.
 
     Prefers events whose full text IS a valid JSON list. Falls back to finding
     the last fenced or bare JSON array of objects within an event.
+    Scans both assistant.message and tool.execution_complete events.
     """
     import re as _re
     if not trajectory_path:
@@ -559,21 +585,7 @@ def _extract_explore_regions_json(trajectory_path: str) -> str:
                 continue
             if event.get("type") not in SCAN_TYPES:
                 continue
-            data = event.get("data") or {}
-            text = data.get("message") or data.get("text") or ""
-            if not text:
-                content = data.get("content")
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    parts = []
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            parts.append(block.get("text", ""))
-                        elif isinstance(block, str):
-                            parts.append(block)
-                    text = "\n".join(parts)
-            text = text.strip() if isinstance(text, str) else ""
+            text = _extract_text_from_event(event).strip()
             if not text:
                 continue
 
