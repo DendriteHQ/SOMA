@@ -1182,7 +1182,7 @@ class CompactBenchExecutor:
             if openclaw_agent_timeout_seconds is not None:
                 command.extend(["--openclaw-command", f"--timeout {openclaw_agent_timeout_seconds}"])
         if task.model:
-            command.extend(["--model", "qwen/qwen3.7-plus"])
+            command.extend(["--model", task.model])
         if task.openclaw_disable_somarizer:
             command.append("--openclaw-disable-plugin")
         return command

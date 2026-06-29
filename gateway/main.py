@@ -316,6 +316,12 @@ async def proxy_openai_compatible(
         except Exception:
             parsed = None
 
+    force_provider = (os.getenv("GATEWAY_FORCE_PROVIDER") or "").strip()
+    if force_provider and isinstance(parsed, dict) and method in ("POST", "PUT", "PATCH"):
+        if "provider" not in parsed:
+            parsed["provider"] = {"order": [force_provider], "allow_fallbacks": False}
+            body_bytes = json.dumps(parsed).encode()
+
     url = _build_upstream_url(path, request.url.query)
     timeout = httpx.Timeout(float(os.getenv("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", "180")))
 
