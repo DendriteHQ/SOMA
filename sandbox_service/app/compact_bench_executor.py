@@ -481,15 +481,49 @@ def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
     cache_path.write_bytes(payload)
     return cache_path
 
+def _extract_text_from_event(event: dict) -> str:
+    """Return the human-readable text payload from a trajectory event, or ''."""
+    data = event.get("data") or {}
+    text = data.get("message") or data.get("text") or ""
+    if not text:
+        content = data.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            text = "\n".join(parts)
+    if not text:
+        # tool.execution_complete stores output under data.result.content
+        result = data.get("result")
+        if isinstance(result, dict):
+            rc = result.get("content")
+            if isinstance(rc, str):
+                text = rc
+    return text if isinstance(text, str) else ""
+
+
 def _extract_explore_regions_json(trajectory_path: str) -> str:
-    """Extract the JSON regions array from the last assistant message in a trajectory JSONL."""
+    """Extract the JSON regions array from a trajectory JSONL.
+
+    Models sometimes emit the array as plain assistant text and sometimes via a
+    bash tool (e.g. ``cat << 'JSON' ... JSON``).  We scan both assistant.message
+    and tool.execution_complete events and return the last valid JSON array found.
+    """
     import re as _re
     if not trajectory_path:
         return ""
     path = Path(trajectory_path)
     if not path.is_file():
         return ""
-    last_text = ""
+
+    SCAN_TYPES = {"assistant.message", "tool.execution_complete"}
+    last_match = ""
+
     with path.open(encoding="utf-8") as fh:
         for raw_line in fh:
             line = raw_line.strip()
@@ -499,32 +533,16 @@ def _extract_explore_regions_json(trajectory_path: str) -> str:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") != "assistant.message":
+            if event.get("type") not in SCAN_TYPES:
                 continue
-            data = event.get("data") or {}
-            # Try common content shapes: plain string, content list, message key
-            text = data.get("message") or data.get("text") or ""
+            text = _extract_text_from_event(event).strip()
             if not text:
-                content = data.get("content")
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    parts = []
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            parts.append(block.get("text", ""))
-                        elif isinstance(block, str):
-                            parts.append(block)
-                    text = "\n".join(parts)
-            if isinstance(text, str) and text.strip():
-                last_text = text.strip()
-    if not last_text:
-        return ""
-    # Extract the last JSON array from the message
-    matches = list(_re.finditer(r'\[[\s\S]*?\]', last_text))
-    if matches:
-        return matches[-1].group(0)
-    return ""
+                continue
+            matches = list(_re.finditer(r'\[[\s\S]*\]', text))
+            if matches:
+                last_match = matches[-1].group(0)
+
+    return last_match
 
 
 class CompactBenchExecutor:
