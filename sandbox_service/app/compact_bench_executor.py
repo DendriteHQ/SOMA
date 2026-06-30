@@ -944,6 +944,9 @@ class CompactBenchExecutor:
                     env["SOMA_COPILOT_SHARED_PROXY_TEARDOWN"] = "false"
                     env["SOMA_COPILOT_NETWORK_ISOLATION"] = "true"
                     env["SOMA_COPILOT_USE_COMPOSE_COMPRESSION_SERVICE"] = "true"
+                    # Expose the run_id so copilot.py derives a deterministic compose project name,
+                    # allowing host-side cleanup to reconstruct it after a SIGKILL/timeout.
+                    env["SOMA_COPILOT_RUN_ID"] = str(task.run_id)
                     if self._copilot_compose_file is not None:
                         env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
                     if miner_module_path is None:
@@ -1124,6 +1127,8 @@ class CompactBenchExecutor:
         finally:
             if 'copilot_compression_handle' in locals() and copilot_compression_handle is not None:
                 self._stop_copilot_run_compression_service(copilot_compression_handle)
+            if task.agent_name != "openclaw":
+                self._cleanup_copilot_run_resources(run_id=task.run_id, output_dir=output_dir)
             if self._debug_preserve_outputs:
                 logger.info(
                     "Keeping benchmark output directory for debug inspection: run_id=%s output_dir=%s",
@@ -1132,6 +1137,52 @@ class CompactBenchExecutor:
                 )
             else:
                 shutil.rmtree(output_dir, ignore_errors=True)
+
+    def _cleanup_copilot_run_resources(self, *, run_id: int, output_dir: Path) -> None:
+        """Remove Docker compose resources for a copilot run.
+
+        Runs from the host side so cleanup happens even when the subprocess was SIGKILL'd
+        (e.g. on timeout) and copilot.py's own finally block never executed.
+        Idempotent: safe to call when copilot.py already cleaned up.
+        """
+        compose_project = (
+            f"soma-copilot-"
+            f"{hashlib.sha256(f'{output_dir.resolve()}::{run_id}'.encode()).hexdigest()[:10]}"
+        )
+        workspace_volume = f"{compose_project}_copilot-workspace"
+        try:
+            compose_file = _resolve_copilot_compose_file()
+            cleanup_env = os.environ.copy()
+            cleanup_env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
+            cleanup_env["COMPOSE_PROFILES"] = "copilot-sidecars"
+            result = _run_command(
+                [
+                    "docker", "compose",
+                    "-f", str(compose_file),
+                    "--project-name", compose_project,
+                    "down", "--remove-orphans", "--volumes",
+                ],
+                env=cleanup_env,
+            )
+            if result.returncode != 0:
+                details = (result.stderr or result.stdout or "").strip()
+                if details:
+                    logger.debug(
+                        "copilot host-side compose down: run_id=%s project=%s details=%s",
+                        run_id, compose_project, details,
+                    )
+        except Exception as exc:
+            logger.debug(
+                "copilot host-side cleanup could not resolve compose file: run_id=%s error=%s",
+                run_id, exc,
+            )
+        _run_command(["docker", "volume", "rm", "-f", workspace_volume])
+        for net_suffix in ("copilot-sandbox", "copilot-egress"):
+            _run_command(["docker", "network", "rm", f"{compose_project}_{net_suffix}"])
+        logger.debug(
+            "copilot host-side resource cleanup done: run_id=%s project=%s",
+            run_id, compose_project,
+        )
 
     def _ensure_benchmark_installed(self) -> None:
         logger.info(
