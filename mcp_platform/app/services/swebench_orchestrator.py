@@ -584,6 +584,7 @@ async def _seed_script_runs(
             task_ids=screener_task_ids,
             task_repeats=task_repeats,
             now=now,
+            benchmark_types=("swebench_verified",),
         )
 
     screening_complete, screening_passed = await _evaluate_screening_for_script(
@@ -614,6 +615,7 @@ async def _seed_script_task_subset(
     task_ids: list[int],
     task_repeats: dict[int, int],
     now: datetime,
+    benchmark_types: tuple[str, ...] = _BENCHMARK_TYPES,
 ) -> int:
     if not task_ids:
         return 0
@@ -635,7 +637,7 @@ async def _seed_script_task_subset(
     for task_id in task_ids:
         repeats = max(1, int(task_repeats.get(int(task_id), 1)))
         for attempt_no in range(1, repeats + 1):
-            for benchmark_type in _BENCHMARK_TYPES:
+            for benchmark_type in benchmark_types:
                 key = (int(task_id), attempt_no, benchmark_type)
                 if key in existing:
                     continue
@@ -738,7 +740,7 @@ async def _evaluate_screening_for_script(
         repeats = max(1, int(task_repeats.get(int(task_id), 1)))
         attempt_resolved: list[bool] = []
         for attempt_no in range(1, repeats + 1):
-            for benchmark_type in _BENCHMARK_TYPES:
+            for benchmark_type in ("swebench_verified",):
                 state = by_task_attempt.get((int(task_id), attempt_no, benchmark_type))
                 if state is None:
                     return False, False
