@@ -481,15 +481,73 @@ def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
     cache_path.write_bytes(payload)
     return cache_path
 
+_EXPLORE_RESULT_FILENAME = "explore-result.json"
+_WORKSPACE_PREFIX = "/workspace/"
+
+
+def _strip_workspace_prefix(regions_json: str) -> str:
+    """Remove /workspace/ prefix from path fields in a regions JSON array."""
+    try:
+        regions = json.loads(regions_json)
+        if not isinstance(regions, list):
+            return regions_json
+        changed = False
+        for region in regions:
+            if isinstance(region, dict):
+                path = region.get("path", "")
+                if isinstance(path, str) and path.startswith(_WORKSPACE_PREFIX):
+                    region["path"] = path[len(_WORKSPACE_PREFIX):]
+                    changed = True
+        return json.dumps(regions, ensure_ascii=False) if changed else regions_json
+    except (json.JSONDecodeError, TypeError):
+        return regions_json
+
+
+def _read_explore_result_file(tmp_run_dir: str) -> str:
+    """Read regions JSON written by the agent to /workspace/explore-result.json.
+
+    The copilot backend snapshots the workspace volume to
+    ``tmp_run_dir/patch-eval/workspace-snapshot/`` before cleanup, so the file
+    is accessible on the host at that path after the run completes.
+    Returns the raw JSON string if valid, empty string otherwise.
+    """
+    if not tmp_run_dir:
+        return ""
+    candidate = Path(tmp_run_dir) / "patch-eval" / "workspace-snapshot" / _EXPLORE_RESULT_FILENAME
+    if not candidate.is_file():
+        return ""
+    try:
+        text = candidate.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return text
+    except json.JSONDecodeError:
+        pass
+    return ""
+
+
 def _extract_explore_regions_json(trajectory_path: str) -> str:
-    """Extract the JSON regions array from the last assistant message in a trajectory JSONL."""
+    """Fallback: extract regions JSON from trajectory JSONL by scanning events.
+
+    Prefers events whose full text IS a valid JSON list. Falls back to finding
+    the last fenced or bare JSON array of objects within an event.
+    """
     import re as _re
     if not trajectory_path:
         return ""
     path = Path(trajectory_path)
     if not path.is_file():
         return ""
-    last_text = ""
+
+    SCAN_TYPES = {"assistant.message", "tool.execution_complete"}
+    last_exact: str = ""
+    last_embedded: str = ""
+
     with path.open(encoding="utf-8") as fh:
         for raw_line in fh:
             line = raw_line.strip()
@@ -499,10 +557,9 @@ def _extract_explore_regions_json(trajectory_path: str) -> str:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") != "assistant.message":
+            if event.get("type") not in SCAN_TYPES:
                 continue
             data = event.get("data") or {}
-            # Try common content shapes: plain string, content list, message key
             text = data.get("message") or data.get("text") or ""
             if not text:
                 content = data.get("content")
@@ -516,15 +573,30 @@ def _extract_explore_regions_json(trajectory_path: str) -> str:
                         elif isinstance(block, str):
                             parts.append(block)
                     text = "\n".join(parts)
-            if isinstance(text, str) and text.strip():
-                last_text = text.strip()
-    if not last_text:
-        return ""
-    # Extract the last JSON array from the message
-    matches = list(_re.finditer(r'\[[\s\S]*?\]', last_text))
-    if matches:
-        return matches[-1].group(0)
-    return ""
+            text = text.strip() if isinstance(text, str) else ""
+            if not text:
+                continue
+
+            # Best case: the entire event text is the JSON array
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    last_exact = text
+                    continue
+            except json.JSONDecodeError:
+                pass
+
+            # Second pass: find the last fenced or bare array of objects
+            for m in _re.finditer(r'```(?:json)?\s*(\[[\s\S]*?\])\s*```|(\[[\s\S]*?\])', text):
+                candidate = (m.group(1) or m.group(2) or "").strip()
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                        last_embedded = candidate
+                except (json.JSONDecodeError, IndexError):
+                    continue
+
+    return last_exact or last_embedded
 
 
 class CompactBenchExecutor:
@@ -951,10 +1023,10 @@ class CompactBenchExecutor:
             patch_capture_status = False
             patch_text = ""
             if task.benchmark_type == "swe_explorer_explore":
-                regions_json = _extract_explore_regions_json(trajectory_path)
+                regions_json = _read_explore_result_file(tmp_run_dir) or _extract_explore_regions_json(trajectory_path)
                 if regions_json:
                     patch_capture_status = True
-                    patch_text = regions_json
+                    patch_text = _strip_workspace_prefix(regions_json)
             elif isinstance(patch_path, str) and patch_path.strip():
                 patch_file = Path(patch_path)
                 if patch_file.is_file():
