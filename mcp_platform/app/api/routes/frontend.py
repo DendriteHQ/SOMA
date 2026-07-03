@@ -1363,7 +1363,7 @@ async def _build_swe_status_overrides(
                 stats["has_dispatched_screener"] = True
             else:
                 stats["has_dispatched_non_screener"] = True
-        if row.scored_at is not None and row.resolved is not None:
+        if row.resolved is not None:
             scored_ids = stats["scored_run_ids"]
             if isinstance(scored_ids, set):
                 scored_ids.add(int(row.run_id))
@@ -1422,8 +1422,8 @@ async def _build_swe_status_overrides(
                         screening_complete = False
                         screening_passed = False
                         break
-                    resolved_value, scored_at, miner_weighted_tokens = state
-                    if scored_at is None or resolved_value is None:
+                    resolved_value, _scored_at, miner_weighted_tokens = state
+                    if resolved_value is None:
                         screening_complete = False
                         screening_passed = False
                         break
