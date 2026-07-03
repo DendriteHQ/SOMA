@@ -89,6 +89,9 @@ from app.api.routes.scoring import (
     build_swe_task_groups,
     build_swe_task_result_item,
     compute_weighted_tokens,
+    compute_swe_run_score,
+    compute_explore_task_score,
+    compute_explore_miner_total_score,
 )
 from app.services.swe_difficulty_calculator import (
     build_baseline_task_data,
@@ -630,6 +633,10 @@ async def _fetch_baseline_explore_scores(
             "cached_input_tokens": cached_sums.get(task_id),
             "output_tokens": output_sums.get(task_id),
             "weighted_tokens": sum(weighted[task_id]) if weighted.get(task_id) else None,
+            "weighted_tokens_avg": (
+                sum(weighted[task_id]) / len(weighted[task_id])
+                if weighted.get(task_id) else None
+            ),
         }
         for task_id in all_task_ids
     }
@@ -697,6 +704,10 @@ async def _fetch_baseline_edit_data(
             "cached_input_tokens": cached_sums.get(task_id),
             "output_tokens": output_sums.get(task_id),
             "weighted_tokens": sum(weighted_vals[task_id]) if weighted_vals.get(task_id) else None,
+            "weighted_tokens_avg": (
+                sum(weighted_vals[task_id]) / len(weighted_vals[task_id])
+                if weighted_vals.get(task_id) else None
+            ),
         }
         for task_id in all_task_ids
     }
@@ -750,6 +761,7 @@ async def _fetch_benchmark_non_screener_data(
         task["baseline_cached_input_tokens"] = baseline_data.get("cached_input_tokens")
         task["baseline_output_tokens"] = baseline_data.get("output_tokens")
         task["baseline_weighted_tokens"] = baseline_data.get("weighted_tokens")
+        task["baseline_weighted_tokens_avg"] = baseline_data.get("weighted_tokens_avg")
 
     organized_edit = _organize_non_screener_rows(
         rows_edit,
@@ -763,6 +775,7 @@ async def _fetch_benchmark_non_screener_data(
         task["baseline_cached_input_tokens"] = baseline_data.get("cached_input_tokens")
         task["baseline_output_tokens"] = baseline_data.get("output_tokens")
         task["baseline_weighted_tokens"] = baseline_data.get("weighted_tokens")
+        task["baseline_weighted_tokens_avg"] = baseline_data.get("weighted_tokens_avg")
 
     return {
         "swebench_verified": _organize_non_screener_rows(rows_verified, extra_fields=["resolved"]),
@@ -793,6 +806,7 @@ def _inject_benchmark_tasks_per_miner(
                     "baseline_cached_input_tokens": task.get("baseline_cached_input_tokens"),
                     "baseline_output_tokens": task.get("baseline_output_tokens"),
                     "baseline_weighted_tokens": task.get("baseline_weighted_tokens"),
+                    "baseline_weighted_tokens_avg": task.get("baseline_weighted_tokens_avg"),
                     "runs": miner_entry["runs"],
                 })
 
@@ -800,11 +814,66 @@ def _inject_benchmark_tasks_per_miner(
         hotkey = miner_dict.get("miner", {}).get("hotkey", "")
         miner_benchmarks = by_hotkey.get(hotkey, {})
         for benchmark_type in ("swe_explorer_explore", "swe_explorer_edit"):
+            explore_task_scores: list[float] = []
+            explore_task_margins: list[float] = []
+            explore_miner_weighted_total = 0.0
+            explore_baseline_weighted_total = 0.0
+            explore_has_miner_weighted = False
+            explore_has_baseline_weighted = False
+
             for task in miner_benchmarks.get(benchmark_type, []):
                 runs = task["runs"]
                 if benchmark_type == "swe_explorer_explore":
-                    miner_scores = [r["platform_score"] for r in runs if r.get("platform_score") is not None]
-                    task_platform_score = sum(miner_scores) / len(miner_scores) if miner_scores else None
+                    for r in runs:
+                        r["pass_with_compression"] = None
+                        r["tokens_with_compression"] = r.get("tokens_used")
+                        r["weighted_tokens_with_compression"] = compute_weighted_tokens(
+                            input_tokens=r.get("input_tokens_with_compression"),
+                            cached_input_tokens=r.get("cached_input_tokens_with_compression"),
+                            output_tokens=r.get("output_tokens_with_compression"),
+                        )
+
+                    # Average the miner's own repeats on this task before comparing to
+                    # baseline (which is itself an average over its repeats) - keeps the
+                    # comparison symmetric instead of scoring each raw run against an
+                    # already-smoothed baseline.
+                    miner_quality_values = [r["platform_score"] for r in runs if r.get("platform_score") is not None]
+                    miner_quality_task = (
+                        sum(miner_quality_values) / len(miner_quality_values) if miner_quality_values else None
+                    )
+                    run_weighted_values = [
+                        r["weighted_tokens_with_compression"] for r in runs
+                        if r.get("weighted_tokens_with_compression") is not None
+                    ]
+                    miner_weighted_tokens_avg = (
+                        sum(run_weighted_values) / len(run_weighted_values) if run_weighted_values else None
+                    )
+
+                    baseline_quality_task = task.get("baseline_score")
+                    baseline_weighted_tokens_avg = task.get("baseline_weighted_tokens_avg")
+
+                    task_margin = (
+                        miner_quality_task - baseline_quality_task
+                        if miner_quality_task is not None and baseline_quality_task is not None
+                        else None
+                    )
+                    task_platform_score = compute_explore_task_score(
+                        miner_quality_task,
+                        baseline_quality_task,
+                        miner_weighted_tokens_avg,
+                        baseline_weighted_tokens_avg,
+                    )
+                    if task_platform_score is not None:
+                        explore_task_scores.append(task_platform_score)
+                    if task_margin is not None:
+                        explore_task_margins.append(task_margin)
+                    if miner_weighted_tokens_avg is not None:
+                        explore_miner_weighted_total += miner_weighted_tokens_avg
+                        explore_has_miner_weighted = True
+                    if baseline_weighted_tokens_avg is not None:
+                        explore_baseline_weighted_total += baseline_weighted_tokens_avg
+                        explore_has_baseline_weighted = True
+
                     miner_tokens_sum = sum(r["tokens_used"] for r in runs if r.get("tokens_used") is not None) or None
                     miner_input = sum(r["input_tokens_with_compression"] for r in runs if r.get("input_tokens_with_compression") is not None) or None
                     miner_cached = sum(r["cached_input_tokens_with_compression"] for r in runs if r.get("cached_input_tokens_with_compression") is not None) or None
@@ -816,14 +885,6 @@ def _inject_benchmark_tasks_per_miner(
                     )
                     baseline_weighted_tokens = task.get("baseline_weighted_tokens")
                     score_without_compression = task.get("baseline_score")
-                    for r in runs:
-                        r["pass_with_compression"] = None
-                        r["tokens_with_compression"] = r.get("tokens_used")
-                        r["weighted_tokens_with_compression"] = compute_weighted_tokens(
-                            input_tokens=r.get("input_tokens_with_compression"),
-                            cached_input_tokens=r.get("cached_input_tokens_with_compression"),
-                            output_tokens=r.get("output_tokens_with_compression"),
-                        )
                     miner_dict["tasks"].append({
                         "task": {
                             "task_id": task["task_id"],
@@ -834,6 +895,7 @@ def _inject_benchmark_tasks_per_miner(
                             "tokens_without_compression": task.get("baseline_tokens_sum"),
                             "tokens_with_compression": miner_tokens_sum,
                             "platform_score": task_platform_score,
+                            "quality_margin": task_margin,
                             "score_without_compression": score_without_compression,
                             "run_count": len(runs),
                         },
@@ -841,7 +903,9 @@ def _inject_benchmark_tasks_per_miner(
                         "total_runs": len(runs),
                         "benchmark_type": benchmark_type,
                         "baseline_weighted_tokens": baseline_weighted_tokens,
+                        "baseline_weighted_tokens_avg": baseline_weighted_tokens_avg,
                         "miner_weighted_tokens": miner_weighted_tokens,
+                        "miner_weighted_tokens_avg": miner_weighted_tokens_avg,
                         "baseline_input_tokens": task.get("baseline_input_tokens"),
                         "baseline_cached_input_tokens": task.get("baseline_cached_input_tokens"),
                         "baseline_output_tokens": task.get("baseline_output_tokens"),
@@ -849,13 +913,33 @@ def _inject_benchmark_tasks_per_miner(
                         "miner_cached_input_tokens": miner_cached,
                         "miner_output_tokens": miner_output,
                     })
-                else:  # swe_explorer_edit — same logic as swebench_verified (resolved bool)
-                    resolved_statuses = [r["resolved"] for r in runs if r.get("resolved") is not None]
-                    resolved_count = sum(1 for r in resolved_statuses if r)
-                    task_platform_score = resolved_count / len(resolved_statuses) if resolved_statuses else None
-                    pass_with_compression = bool(resolved_count * 2 >= len(resolved_statuses)) if resolved_statuses else None
+                else:  # swe_explorer_edit — same scoring logic as swebench_verified
                     baseline_score = task.get("baseline_score")
                     pass_without_compression = bool(baseline_score >= 0.5) if baseline_score is not None else None
+                    baseline_wt_avg = task.get("baseline_weighted_tokens_avg")
+                    run_scores = []
+                    for r in runs:
+                        r["pass_with_compression"] = r.get("resolved")
+                        r["tokens_with_compression"] = r.get("tokens_used")
+                        run_wt = compute_weighted_tokens(
+                            input_tokens=r.get("input_tokens_with_compression"),
+                            cached_input_tokens=r.get("cached_input_tokens_with_compression"),
+                            output_tokens=r.get("output_tokens_with_compression"),
+                        )
+                        r["weighted_tokens_with_compression"] = run_wt
+                        run_score = compute_swe_run_score(
+                            pass_without_compression,
+                            r.get("resolved"),
+                            baseline_wt_avg,
+                            run_wt,
+                        )
+                        r["platform_score"] = run_score
+                        if run_score is not None:
+                            run_scores.append(run_score)
+                    task_platform_score = sum(run_scores) / len(run_scores) if run_scores else None
+                    resolved_statuses = [r["resolved"] for r in runs if r.get("resolved") is not None]
+                    resolved_count = sum(1 for r in resolved_statuses if r)
+                    pass_with_compression = bool(resolved_count * 2 >= len(resolved_statuses)) if resolved_statuses else None
                     miner_tokens_sum = sum(r["tokens_used"] for r in runs if r.get("tokens_used") is not None) or None
                     miner_input = sum(r["input_tokens_with_compression"] for r in runs if r.get("input_tokens_with_compression") is not None) or None
                     miner_cached = sum(r["cached_input_tokens_with_compression"] for r in runs if r.get("cached_input_tokens_with_compression") is not None) or None
@@ -866,14 +950,6 @@ def _inject_benchmark_tasks_per_miner(
                         output_tokens=miner_output,
                     )
                     baseline_weighted_tokens = task.get("baseline_weighted_tokens")
-                    for r in runs:
-                        r["pass_with_compression"] = r.get("resolved")
-                        r["tokens_with_compression"] = r.get("tokens_used")
-                        r["weighted_tokens_with_compression"] = compute_weighted_tokens(
-                            input_tokens=r.get("input_tokens_with_compression"),
-                            cached_input_tokens=r.get("cached_input_tokens_with_compression"),
-                            output_tokens=r.get("output_tokens_with_compression"),
-                        )
                     miner_dict["tasks"].append({
                         "task": {
                             "task_id": task["task_id"],
@@ -898,6 +974,14 @@ def _inject_benchmark_tasks_per_miner(
                         "miner_cached_input_tokens": miner_cached,
                         "miner_output_tokens": miner_output,
                     })
+
+            if benchmark_type == "swe_explorer_explore":
+                miner_dict["swe_explorer_explore_score"] = compute_explore_miner_total_score(
+                    explore_task_scores,
+                    explore_task_margins,
+                    explore_miner_weighted_total if explore_has_miner_weighted else None,
+                    explore_baseline_weighted_total if explore_has_baseline_weighted else None,
+                )
         miner_dict["total_tasks"] = len(miner_dict["tasks"])
 
 
