@@ -296,6 +296,8 @@ class SWEBenchContainerEvaluator:
             "cap_drop": ["ALL"],
             "security_opt": ["no-new-privileges:true"],
             "pids_limit": DEFAULT_CONTAINER_PIDS_LIMIT,
+            "mem_limit": "5g",
+            "memswap_limit": "5g",
         }
 
     @classmethod
