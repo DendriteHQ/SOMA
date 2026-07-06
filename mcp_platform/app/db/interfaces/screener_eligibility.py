@@ -136,6 +136,8 @@ async def fetch_swebench_eligible_ss58_for_competition(
                 task_run_stats AS (
                     -- Per (miner, task): count total scored runs and resolved runs.
                     -- Eligibility is determined by swebench_verified runs only.
+                    -- `resolved` now lives in swe_bench_verified_validations, but
+                    -- older deployments may still have it on run validations.
                     SELECT
                         r.miner_fk,
                         r.task_fk,
@@ -143,8 +145,16 @@ async def fetch_swebench_eligible_ss58_for_competition(
                             WHERE v.scored_at IS NOT NULL
                         ) AS total_scored,
                         COUNT(*) FILTER (
-                            WHERE vv.resolved = TRUE
-                              AND v.scored_at IS NOT NULL
+                            WHERE v.scored_at IS NOT NULL
+                              AND COALESCE(
+                                  vv.resolved,
+                                  CASE
+                                      WHEN to_jsonb(v) ? 'resolved'
+                                      THEN (to_jsonb(v)->>'resolved')::boolean
+                                      ELSE NULL
+                                  END,
+                                  FALSE
+                              ) = TRUE
                         ) AS resolved_count
                     FROM swe_bench_runs r
                     JOIN swe_bench_run_validations v ON v.run_fk = r.id

@@ -5,6 +5,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import and_, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from soma_shared.contracts.common.signatures import SignedEnvelope
@@ -64,8 +65,8 @@ router = APIRouter(tags=["validator"])
 _EXPLORER_METRIC_KEYS = ("precision", "recall", "f1_score", "hit_file_rate", "noise_file_rate", "weighted_core_coverage")
 
 
-def _insert_benchmark_sub_row(
-    db,
+async def _insert_benchmark_sub_row(
+    db: AsyncSession,
     *,
     validation_fk: int,
     benchmark_type: str,
@@ -74,22 +75,47 @@ def _insert_benchmark_sub_row(
 ) -> None:
     if benchmark_type == "swe_explorer_explore":
         m = metrics or {}
-        db.add(SweExplorerValidation(
-            validation_fk=validation_fk,
+        values = {
+            "validation_fk": validation_fk,
             **{k: float(m.get(k, 0.0)) for k in _EXPLORER_METRIC_KEYS},
-        ))
+        }
+        stmt = (
+            pg_insert(SweExplorerValidation)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[SweExplorerValidation.validation_fk],
+                set_={k: values[k] for k in _EXPLORER_METRIC_KEYS},
+            )
+        )
+        await db.execute(stmt)
     elif benchmark_type == "swe_explorer_edit":
-        db.add(SweExplorerEditValidation(
-            validation_fk=validation_fk,
-            resolved=resolved,
-            details=None,
-        ))
+        stmt = (
+            pg_insert(SweExplorerEditValidation)
+            .values(
+                validation_fk=validation_fk,
+                resolved=resolved,
+                details=None,
+            )
+            .on_conflict_do_update(
+                index_elements=[SweExplorerEditValidation.validation_fk],
+                set_={"resolved": resolved, "details": None},
+            )
+        )
+        await db.execute(stmt)
     else:
-        db.add(SweBenchVerifiedValidation(
-            validation_fk=validation_fk,
-            resolved=resolved,
-            details=None,
-        ))
+        stmt = (
+            pg_insert(SweBenchVerifiedValidation)
+            .values(
+                validation_fk=validation_fk,
+                resolved=resolved,
+                details=None,
+            )
+            .on_conflict_do_update(
+                index_elements=[SweBenchVerifiedValidation.validation_fk],
+                set_={"resolved": resolved, "details": None},
+            )
+        )
+        await db.execute(stmt)
 
 
 def _model_attr(model: type, name: str):
@@ -396,6 +422,8 @@ async def _load_top_miner_ss58_weights(
                     + (float(row.weight) if row.weight else 0.0)
                 )
     except Exception as exc:
+        # Reset the session in case a prior statement aborted the transaction.
+        await db.rollback()
         logger.warning(
             "get_best_miners_top_miners_query_failed",
             extra={"request_id": request_id, "error": str(exc)},
@@ -421,6 +449,8 @@ async def _build_best_miners_payload(
             hotkey_to_uid=hotkey_to_uid,
         )
     except Exception as exc:
+        # Keep the session usable for subsequent queries in this request.
+        await db.rollback()
         logger.warning(
             "get_best_miners_screener_calculation_failed",
             extra={
@@ -779,7 +809,7 @@ async def get_swebench_validation(
 
         run_status = str(getattr(run_row, "status", "") or "").lower()
         if run_status == "failed":
-            _insert_benchmark_sub_row(
+            await _insert_benchmark_sub_row(
                 db,
                 validation_fk=int(validation_row.id),
                 benchmark_type=str(run_row.benchmark_type),
@@ -816,7 +846,7 @@ async def get_swebench_validation(
                 },
                 exc_info=exc,
             )
-            _insert_benchmark_sub_row(
+            await _insert_benchmark_sub_row(
                 db,
                 validation_fk=int(validation_row.id),
                 benchmark_type=str(run_row.benchmark_type),
@@ -968,7 +998,7 @@ async def submit_swebench_validation_score(
 
     if validator_fk_col is not None:
         validation_row.validator_fk = validator.id
-    _insert_benchmark_sub_row(
+    await _insert_benchmark_sub_row(
         db,
         validation_fk=int(validation_row.id),
         benchmark_type=str(_run_row.benchmark_type),
