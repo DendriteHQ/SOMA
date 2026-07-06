@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import log
+from math import log, log2
 from typing import Any
 
 from soma_shared.contracts.api.v1.frontend import SweMinerTaskResultItem
@@ -62,6 +62,80 @@ def compute_weighted_tokens(
         + (cached_weight * float(cached_input_tokens))
         + (output_weight * float(output_tokens))
     )
+
+
+EXPLORE_QUALITY_DELTA = 0.20
+EXPLORE_SCORE_FLOOR = -2.0
+
+
+def compute_explore_task_score(
+    miner_quality: float | None,
+    baseline_quality: float | None,
+    miner_weighted_tokens: float | None,
+    baseline_weighted_tokens: float | None,
+    *,
+    delta: float = EXPLORE_QUALITY_DELTA,
+    floor: float = EXPLORE_SCORE_FLOOR,
+) -> float | None:
+    """Per-task explore score: token savings gated by preserved exploration quality.
+
+    miner_quality/baseline_quality are the task-level averages of
+    (hit_file_rate - noise_file_rate) over the miner's own repeats and the
+    baseline's repeats respectively (averaged before comparing, not per-run).
+    """
+    if miner_quality is None or baseline_quality is None:
+        return None
+
+    margin = miner_quality - baseline_quality
+    if margin <= -delta:
+        return floor
+
+    if (
+        miner_weighted_tokens is None
+        or baseline_weighted_tokens is None
+        or miner_weighted_tokens <= 0
+        or baseline_weighted_tokens <= 0
+    ):
+        return None
+
+    r = max(0.0, min(1.0, (margin + delta) / (2 * delta)))
+    gate = (3 * r**2) - (2 * r**3)
+    tau = max(-2.0, min(2.0, 2 * log2(baseline_weighted_tokens / miner_weighted_tokens)))
+    return gate * tau
+
+
+def compute_explore_miner_total_score(
+    task_scores: list[float],
+    task_margins: list[float],
+    total_miner_weighted_tokens: float | None,
+    total_baseline_weighted_tokens: float | None,
+    *,
+    floor: float = EXPLORE_SCORE_FLOOR,
+) -> float | None:
+    """Aggregate explore score across all of a miner's scored tasks.
+
+    Applies a hard penalty (floor) when both the miner's average quality and
+    total token usage are worse than baseline; otherwise blends the average
+    per-task score toward the floor based on overall token savings, saturating
+    once total savings reach +/-20%.
+    """
+    if not task_scores:
+        return None
+
+    p_avg = sum(task_scores) / len(task_scores)
+
+    if total_miner_weighted_tokens is None or total_baseline_weighted_tokens is None or total_baseline_weighted_tokens <= 0:
+        return p_avg
+
+    margin_agg = sum(task_margins) / len(task_margins) if task_margins else None
+    s_ratio = 1.0 - (total_miner_weighted_tokens / total_baseline_weighted_tokens)
+
+    if margin_agg is not None and margin_agg < 0 and s_ratio < 0:
+        return floor
+
+    r = max(0.0, min(1.0, (s_ratio + 0.20) / 0.40))
+    m = (3 * r**2) - (2 * r**3)
+    return (m * p_avg) + ((1 - m) * floor)
 
 
 def _summarize_baseline_pass(baseline_runs: dict[int, dict[str, object]]) -> bool | None:
@@ -404,30 +478,6 @@ def _build_swe_raw_scores(
     return raw_total_score, raw_screener_score
 
 
-def _build_swe_raw_scores(
-    task_groups: dict[int, dict[str, object]],
-) -> tuple[float | None, float | None]:
-    total_run_scores: list[float] = []
-    screener_run_scores: list[float] = []
-
-    for group in task_groups.values():
-        run_scores = [
-            float(run["platform_score"])
-            for run in group["runs"]
-            if run["platform_score"] is not None
-        ]
-        total_run_scores.extend(run_scores)
-        if bool(group["is_screener"]):
-            screener_run_scores.extend(run_scores)
-
-    raw_total_score = sum(total_run_scores) / len(total_run_scores) if total_run_scores else None
-    raw_screener_score = (
-        sum(screener_run_scores) / len(screener_run_scores)
-        if screener_run_scores
-        else None
-    )
-    return raw_total_score, raw_screener_score
-
 
 def _build_category_score_context(
     task_groups: dict[int, dict[str, object]],
@@ -518,7 +568,6 @@ def build_swe_miner_category_scores_with_penalty(
         if required_tasks and set(task_scores_by_name) != required_tasks:
             continue
 
-        category_scores, _, _ = _build_category_score_context(task_groups, category_by_task)
         category_scores, _, _ = _build_category_score_context(task_groups, category_by_task)
         miner_category_scores[hotkey] = {
             category: float(score) if score is not None else score
