@@ -187,6 +187,22 @@ def _extract_forward_headers(request: Request) -> dict[str, str]:
     return headers
 
 
+def _extract_run_id_from_authorization(request: Request) -> int | None:
+    raw_auth = request.headers.get("authorization")
+    if not isinstance(raw_auth, str) or not raw_auth.strip():
+        return None
+    parts = raw_auth.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    token = parts[1].strip()
+    if not token:
+        return None
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "healthy", "service": "gateway"}
@@ -218,7 +234,7 @@ async def _stream_upstream_response(
     headers: dict[str, str],
     body_bytes: bytes,
     timeout: httpx.Timeout,
-) -> tuple[AsyncIterator[bytes], int, dict[str, str]]:
+) -> tuple[AsyncIterator[bytes], int, dict[str, str], httpx.Headers]:
     client = httpx.AsyncClient(timeout=timeout)
     stream_ctx = client.stream(method=method, url=url, headers=headers, content=body_bytes)
     response = await stream_ctx.__aenter__()
@@ -236,7 +252,22 @@ async def _stream_upstream_response(
         "content-type",
         response.headers.get("content-type", "text/event-stream"),
     )
-    return _iterator(), response.status_code, response_headers
+    return _iterator(), response.status_code, response_headers, response.headers
+
+
+def _extract_actual_provider(headers: httpx.Headers, body: bytes | None = None) -> str | None:
+    provider = headers.get("x-openrouter-provider") or headers.get("x-provider")
+    if provider:
+        return provider.strip()
+    if body:
+        try:
+            data = json.loads(body)
+            model = data.get("model") or ""
+            if "/" in model:
+                return model.split("/")[0]
+        except Exception:
+            pass
+    return None
 
 
 def _select_passthrough_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -271,12 +302,19 @@ async def proxy_openai_compatible(
     request: Request,
     x_run_id: str | None = Header(default=None, alias="X-Run-Id"),
 ) -> Response:
-    if not x_run_id:
-        raise HTTPException(status_code=400, detail="Missing required header: X-Run-Id")
-    try:
-        run_id = int(x_run_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="X-Run-Id must be an integer") from exc
+    run_id: int | None = None
+    if x_run_id:
+        try:
+            run_id = int(x_run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="X-Run-Id must be an integer") from exc
+    if run_id is None:
+        run_id = _extract_run_id_from_authorization(request)
+    if run_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing run identifier. Provide X-Run-Id header or Authorization: Bearer <run_id>",
+        )
 
     method = request.method.upper()
     logger.info("gateway_request_received run_id=%s method=%s path=/v1/%s", run_id, method, path)
@@ -293,17 +331,55 @@ async def proxy_openai_compatible(
         except Exception:
             parsed = None
 
+    force_provider = (os.getenv("GATEWAY_FORCE_PROVIDER") or "").strip()
+    provider_was_forced = False
+    if force_provider and isinstance(parsed, dict) and method in ("POST", "PUT", "PATCH"):
+        if "provider" not in parsed:
+            parsed["provider"] = {"order": [force_provider], "allow_fallbacks": False}
+            body_bytes = json.dumps(parsed).encode()
+            provider_was_forced = True
+            logger.info(
+                "gateway_provider_forced run_id=%s forced_provider=%s model=%s",
+                run_id,
+                force_provider,
+                parsed.get("model", "unknown"),
+            )
+        else:
+            logger.info(
+                "gateway_provider_not_forced run_id=%s forced_provider=%s reason=provider_already_set existing_provider=%s",
+                run_id,
+                force_provider,
+                parsed.get("provider"),
+            )
+
     url = _build_upstream_url(path, request.url.query)
     timeout = httpx.Timeout(float(os.getenv("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", "180")))
 
     if isinstance(parsed, dict) and bool(parsed.get("stream")):
-        stream, status_code, response_headers = await _stream_upstream_response(
+        stream, status_code, response_headers, upstream_headers = await _stream_upstream_response(
             method=method,
             url=url,
             headers=headers,
             body_bytes=body_bytes,
             timeout=timeout,
         )
+        if provider_was_forced:
+            actual_provider = _extract_actual_provider(upstream_headers)
+            match = actual_provider.lower() == force_provider.lower() if actual_provider else None
+            logger.info(
+                "gateway_provider_verification run_id=%s forced_provider=%s actual_provider=%s match=%s stream=true",
+                run_id,
+                force_provider,
+                actual_provider or "unknown",
+                match,
+            )
+            if match is False:
+                logger.warning(
+                    "gateway_provider_mismatch run_id=%s forced_provider=%s actual_provider=%s stream=true",
+                    run_id,
+                    force_provider,
+                    actual_provider,
+                )
         stream_response_headers = {
             key: value
             for key, value in response_headers.items()
@@ -338,6 +414,23 @@ async def proxy_openai_compatible(
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
     passthrough_headers = _select_passthrough_response_headers(resp.headers)
+    if provider_was_forced:
+        actual_provider = _extract_actual_provider(resp.headers, resp.content)
+        match = actual_provider.lower() == force_provider.lower() if actual_provider else None
+        logger.info(
+            "gateway_provider_verification run_id=%s forced_provider=%s actual_provider=%s match=%s",
+            run_id,
+            force_provider,
+            actual_provider or "unknown",
+            match,
+        )
+        if match is False:
+            logger.warning(
+                "gateway_provider_mismatch run_id=%s forced_provider=%s actual_provider=%s",
+                run_id,
+                force_provider,
+                actual_provider,
+            )
     logger.info(
         "gateway_request_completed run_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s",
         run_id,

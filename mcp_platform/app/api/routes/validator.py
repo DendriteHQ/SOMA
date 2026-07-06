@@ -23,6 +23,9 @@ from soma_shared.contracts.validator.v1.messages import (
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
+from soma_shared.db.models.swe_bench_verified_validation import SweBenchVerifiedValidation
+from soma_shared.db.models.swe_explorer_edit_validation import SweExplorerEditValidation
+from soma_shared.db.models.swe_explorer_validation import SweExplorerValidation
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
 from soma_shared.db.session import get_db_session
@@ -57,6 +60,36 @@ from app.services.blob.s3 import S3BlobStorage
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
+
+_EXPLORER_METRIC_KEYS = ("precision", "recall", "f1_score", "hit_file_rate", "noise_file_rate", "weighted_core_coverage")
+
+
+def _insert_benchmark_sub_row(
+    db,
+    *,
+    validation_fk: int,
+    benchmark_type: str,
+    resolved: bool,
+    metrics: dict | None,
+) -> None:
+    if benchmark_type == "swe_explorer_explore":
+        m = metrics or {}
+        db.add(SweExplorerValidation(
+            validation_fk=validation_fk,
+            **{k: float(m.get(k, 0.0)) for k in _EXPLORER_METRIC_KEYS},
+        ))
+    elif benchmark_type == "swe_explorer_edit":
+        db.add(SweExplorerEditValidation(
+            validation_fk=validation_fk,
+            resolved=resolved,
+            details=None,
+        ))
+    else:
+        db.add(SweBenchVerifiedValidation(
+            validation_fk=validation_fk,
+            resolved=resolved,
+            details=None,
+        ))
 
 
 def _model_attr(model: type, name: str):
@@ -696,7 +729,6 @@ async def get_swebench_validation(
             .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
             .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
             .where(SweBenchRunValidation.scored_at.is_(None))
-            .where(SweBenchRunValidation.resolved.is_(None))
         )
         if completed_condition is not None:
             query_unclaimed = query_unclaimed.where(completed_condition)
@@ -747,7 +779,13 @@ async def get_swebench_validation(
 
         run_status = str(getattr(run_row, "status", "") or "").lower()
         if run_status == "failed":
-            validation_row.resolved = False
+            _insert_benchmark_sub_row(
+                db,
+                validation_fk=int(validation_row.id),
+                benchmark_type=str(run_row.benchmark_type),
+                resolved=False,
+                metrics=None,
+            )
             validation_row.scored_at = now
             if logs_col is not None:
                 validation_row.logs = "Auto-scored false: run status is failed."
@@ -778,7 +816,13 @@ async def get_swebench_validation(
                 },
                 exc_info=exc,
             )
-            validation_row.resolved = False
+            _insert_benchmark_sub_row(
+                db,
+                validation_fk=int(validation_row.id),
+                benchmark_type=str(run_row.benchmark_type),
+                resolved=False,
+                metrics=None,
+            )
             validation_row.scored_at = now
             if logs_col is not None:
                 validation_row.logs = (
@@ -804,6 +848,8 @@ async def get_swebench_validation(
 
         task_payload = SweBenchValidationTask(
             validation_id=int(validation_row.id),
+            benchmark=str(task_row.benchmark_name),
+            benchmark_type=str(run_row.benchmark_type),
             instance_id=str(task_row.instance_id),
             diff=diff_text,
         )
@@ -922,7 +968,13 @@ async def submit_swebench_validation_score(
 
     if validator_fk_col is not None:
         validation_row.validator_fk = validator.id
-    validation_row.resolved = bool(payload.resolved)
+    _insert_benchmark_sub_row(
+        db,
+        validation_fk=int(validation_row.id),
+        benchmark_type=str(_run_row.benchmark_type),
+        resolved=bool(payload.resolved),
+        metrics=payload.metrics,
+    )
     if logs_col is not None:
         validation_row.logs = payload.logs
     validation_row.scored_at = now

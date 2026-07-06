@@ -161,7 +161,8 @@ class RemoteCompactBenchManager:
             instance_id=instance_id,
             run_id=run_id,
             script_presigned_url=script_presigned_url,
-            agent_name=str(task_context.get("agent_name") or "openclaw").strip() or "openclaw",
+            agent_name=str(task_context.get("agent_name") or "copilot").strip() or "copilot",
+            benchmark_type=str(task_context.get("benchmark_type") or "swebench_verified").strip() or "swebench_verified",
             model=model,
             openclaw_timeout=(
                 int(task_context["openclaw_timeout"])

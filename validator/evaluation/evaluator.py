@@ -5,6 +5,12 @@ import json
 import logging
 
 from .swebench_evaluator import SWEBenchContainerEvaluator, SWEBenchEvaluationResult
+from .swe_explorer_evaluator import (
+    SWEExplorerEvaluationError,
+    SWEExplorerEvaluationResult,
+    SWEExplorerEvaluator,
+    SWE_EXPLORER_BENCHMARK,
+)
 from soma_shared.contracts.validator.v1.messages import QuestionScore, SweBenchValidationTask
 
 
@@ -29,6 +35,7 @@ class Evaluator:
     def __init__(self, settings=None):
         self.settings = settings
         self._swebench_evaluator = SWEBenchContainerEvaluator(settings=settings)
+        self._swe_explorer_evaluator = SWEExplorerEvaluator(settings=settings)
         max_concurrent_evaluations = max(
             1,
             int(getattr(self.settings, "max_concurrent_evaluations", 1)),
@@ -58,8 +65,56 @@ class Evaluator:
             image_name=image_name,
         )
 
+    async def evaluate_swe_explorer_exploration(
+        self,
+        *,
+        instance_id: str,
+        regions_json: str,
+    ) -> SWEExplorerEvaluationResult:
+        return await asyncio.to_thread(
+            self._swe_explorer_evaluator.evaluate_instance,
+            instance_id=instance_id,
+            regions_json=regions_json,
+        )
+
     def cleanup_competition_cache(self) -> dict[str, int]:
         return self._swebench_evaluator.cleanup_competition_cache()
+
+    @staticmethod
+    def _is_swe_explorer_explore_task(task: SweBenchValidationTask) -> bool:
+        return (getattr(task, "benchmark_type", "") or "") == "swe_explorer_explore"
+
+    @staticmethod
+    def _is_swe_explorer_edit_task(task: SweBenchValidationTask) -> bool:
+        return (getattr(task, "benchmark_type", "") or "") == "swe_explorer_edit"
+
+    async def _evaluate_swe_explorer_task(
+        self,
+        *,
+        validation_id: str,
+        instance_id: str,
+        regions_json: str,
+    ) -> tuple[str, QuestionScore, dict[str, object]]:
+        result = await self.evaluate_swe_explorer_exploration(
+            instance_id=instance_id,
+            regions_json=regions_json,
+        )
+        question_score = QuestionScore(
+            batch_challenge_id=validation_id,
+            question_id=validation_id,
+            produced_answer=str(round(result.score, 6)),
+            score=float(result.score),
+            details={
+                "primary_metric": result.primary_metric,
+                **{k: round(v, 6) for k, v in result.metrics.items()},
+            },
+        )
+        return validation_id, question_score, {
+            "resolved": result.score > 0.0,
+            "metrics": result.metrics,
+            "primary_metric": result.primary_metric,
+            "logs": f"instance_id={instance_id} {result.primary_metric}={result.score:.6f}",
+        }
 
     async def _evaluate_task(
         self,
@@ -79,6 +134,14 @@ class Evaluator:
                 task,
                 aliases=("diff",),
             )
+
+            if self._is_swe_explorer_explore_task(task):
+                return await self._evaluate_swe_explorer_task(
+                    validation_id=validation_id,
+                    instance_id=instance_id,
+                    regions_json=diff,
+                )
+
             arch = self._get_optional_str(
                 task,
                 aliases=("arch",),

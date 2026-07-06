@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, literal, select, text
+from sqlalchemy import and_, case, func, literal, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -18,6 +18,9 @@ from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBench
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
+from soma_shared.db.models.swe_bench_verified_validation import SweBenchVerifiedValidation
+from soma_shared.db.models.swe_explorer_edit_validation import SweExplorerEditValidation
+from soma_shared.db.models.swe_explorer_validation import SweExplorerValidation
 from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.competition_config import CompetitionConfig
 from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
@@ -25,6 +28,27 @@ from soma_shared.db.session import get_db_session, get_engine
 
 
 logger = get_logger(__name__)
+
+_BENCHMARK_TYPES = ("swebench_verified", "swe_explorer_explore", "swe_explorer_edit")
+
+
+def _all_types_resolved_joins_and_expr():
+    """Return (outerjoin_targets, resolved_case_expr) for querying resolved across all benchmark types."""
+    vv = SweBenchVerifiedValidation
+    ev = SweExplorerEditValidation
+    sev = SweExplorerValidation
+    resolved_expr = case(
+        (SweBenchRun.benchmark_type == "swebench_verified", vv.resolved),
+        (SweBenchRun.benchmark_type == "swe_explorer_edit", ev.resolved),
+        (SweBenchRun.benchmark_type == "swe_explorer_explore", sev.f1_score > 0),
+        else_=None,
+    ).label("resolved")
+    joins = [
+        (vv, and_(vv.validation_fk == SweBenchRunValidation.id, SweBenchRun.benchmark_type == "swebench_verified")),
+        (ev, and_(ev.validation_fk == SweBenchRunValidation.id, SweBenchRun.benchmark_type == "swe_explorer_edit")),
+        (sev, and_(sev.validation_fk == SweBenchRunValidation.id, SweBenchRun.benchmark_type == "swe_explorer_explore")),
+    ]
+    return joins, resolved_expr
 
 _ORCHESTRATOR_LOCK_KEY = "swebench-orchestrator-v1"
 _SEED_IDLE_LOG_INTERVAL_SECONDS = 60
@@ -54,6 +78,13 @@ def _non_baseline_eligibility_sql(
     )
     return (
         f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM miners m
+                        WHERE m.id = {miner_fk_expr}
+                          AND m.miner_banned_status = FALSE
+                    )
+                    AND
                     EXISTS (
                         SELECT 1
                         FROM miner_uploads mu
@@ -380,7 +411,7 @@ async def _is_baseline_evaluation_complete(
     if not task_ids:
         return False
 
-    expected_runs = sum(max(1, int(task_repeats.get(task_id, 1))) for task_id in task_ids)
+    expected_runs = sum(max(1, int(task_repeats.get(task_id, 1))) for task_id in task_ids) * len(_BENCHMARK_TYPES)
     evaluated_runs = int(
         (
             await db.execute(
@@ -389,7 +420,6 @@ async def _is_baseline_evaluation_complete(
                 .where(SweBenchRun.baseline_run.is_(True))
                 .where(SweBenchRun.task_fk.in_(task_ids))
                 .where(SweBenchRunValidation.scored_at.is_not(None))
-                .where(SweBenchRunValidation.resolved.is_not(None))
             )
         ).scalar()
         or 0
@@ -408,24 +438,22 @@ async def _select_dynamic_screener_tasks(
         return
 
     task_ids = [int(task.id) for task in tasks]
-    rows = (
-        await db.execute(
-            select(
-                SweBenchRun.task_fk,
-                SweBenchRunValidation.resolved,
-            )
-            .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
-            .where(SweBenchRun.baseline_run.is_(True))
-            .where(SweBenchRun.task_fk.in_(task_ids))
-            .where(SweBenchRunValidation.scored_at.is_not(None))
-            .where(SweBenchRunValidation.resolved.is_not(None))
-        )
-    ).all()
+    sub_joins, resolved_expr = _all_types_resolved_joins_and_expr()
+    stmt = (
+        select(SweBenchRun.task_fk, resolved_expr)
+        .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
+        .where(SweBenchRun.baseline_run.is_(True))
+        .where(SweBenchRun.task_fk.in_(task_ids))
+        .where(SweBenchRunValidation.scored_at.is_not(None))
+    )
+    for model, condition in sub_joins:
+        stmt = stmt.outerjoin(model, condition)
+    rows = (await db.execute(stmt)).all()
 
     success_counts: dict[int, int] = {task_id: 0 for task_id in task_ids}
     for task_fk, resolved in rows:
         task_id = int(task_fk)
-        if bool(resolved):
+        if resolved is not None and bool(resolved):
             success_counts[task_id] = success_counts.get(task_id, 0) + 1
 
     by_success: dict[int, list[int]] = {}
@@ -503,13 +531,10 @@ async def _seed_baseline_runs(
 ) -> int:
     task_ids = [int(task.id) for task in tasks]
     existing = set(
-        (
-            int(row[0]),
-            int(row[1]),
-        )
+        (int(row[0]), int(row[1]), str(row[2]))
         for row in (
             await db.execute(
-                select(SweBenchRun.task_fk, SweBenchRun.attempt_no)
+                select(SweBenchRun.task_fk, SweBenchRun.attempt_no, SweBenchRun.benchmark_type)
                 .where(SweBenchRun.baseline_run.is_(True))
                 .where(SweBenchRun.miner_fk.is_(None))
                 .where(SweBenchRun.script_fk.is_(None))
@@ -522,20 +547,22 @@ async def _seed_baseline_runs(
     for task in tasks:
         task_id = int(task.id)
         for attempt_no in range(1, task_repeats[task_id] + 1):
-            key = (task_id, attempt_no)
-            if key in existing:
-                continue
-            await _create_run_and_validation(
-                db,
-                task_fk=task_id,
-                attempt_no=attempt_no,
-                baseline_run=True,
-                miner_fk=None,
-                script_fk=None,
-                now=now,
-            )
-            existing.add(key)
-            created += 1
+            for benchmark_type in _BENCHMARK_TYPES:
+                key = (task_id, attempt_no, benchmark_type)
+                if key in existing:
+                    continue
+                await _create_run_and_validation(
+                    db,
+                    task_fk=task_id,
+                    attempt_no=attempt_no,
+                    benchmark_type=benchmark_type,
+                    baseline_run=True,
+                    miner_fk=None,
+                    script_fk=None,
+                    now=now,
+                )
+                existing.add(key)
+                created += 1
     return created
 
 
@@ -557,6 +584,7 @@ async def _seed_script_runs(
             task_ids=screener_task_ids,
             task_repeats=task_repeats,
             now=now,
+            benchmark_types=("swebench_verified",),
         )
 
     screening_complete, screening_passed = await _evaluate_screening_for_script(
@@ -587,18 +615,16 @@ async def _seed_script_task_subset(
     task_ids: list[int],
     task_repeats: dict[int, int],
     now: datetime,
+    benchmark_types: tuple[str, ...] = _BENCHMARK_TYPES,
 ) -> int:
     if not task_ids:
         return 0
 
     existing = set(
-        (
-            int(row[0]),
-            int(row[1]),
-        )
+        (int(row[0]), int(row[1]), str(row[2]))
         for row in (
             await db.execute(
-                select(SweBenchRun.task_fk, SweBenchRun.attempt_no)
+                select(SweBenchRun.task_fk, SweBenchRun.attempt_no, SweBenchRun.benchmark_type)
                 .where(SweBenchRun.baseline_run.is_(False))
                 .where(SweBenchRun.script_fk == script.script_id)
                 .where(SweBenchRun.miner_fk == script.miner_fk)
@@ -611,20 +637,22 @@ async def _seed_script_task_subset(
     for task_id in task_ids:
         repeats = max(1, int(task_repeats.get(int(task_id), 1)))
         for attempt_no in range(1, repeats + 1):
-            key = (int(task_id), attempt_no)
-            if key in existing:
-                continue
-            await _create_run_and_validation(
-                db,
-                task_fk=int(task_id),
-                attempt_no=attempt_no,
-                baseline_run=False,
-                miner_fk=script.miner_fk,
-                script_fk=script.script_id,
-                now=now,
-            )
-            existing.add(key)
-            created += 1
+            for benchmark_type in benchmark_types:
+                key = (int(task_id), attempt_no, benchmark_type)
+                if key in existing:
+                    continue
+                await _create_run_and_validation(
+                    db,
+                    task_fk=int(task_id),
+                    attempt_no=attempt_no,
+                    benchmark_type=benchmark_type,
+                    baseline_run=False,
+                    miner_fk=script.miner_fk,
+                    script_fk=script.script_id,
+                    now=now,
+                )
+                existing.add(key)
+                created += 1
     return created
 
 
@@ -642,45 +670,38 @@ async def _evaluate_screening_for_script(
     cached_input_tokens_col = _model_attr(SweBenchRun, "cached_input_tokens")
     output_tokens_col = _model_attr(SweBenchRun, "output_tokens")
 
-    rows = (
-        await db.execute(
-            select(
-                SweBenchRun.task_fk,
-                SweBenchRun.attempt_no,
-                SweBenchRunValidation.resolved,
-                SweBenchRunValidation.scored_at,
-                SweBenchRun.tokens_used,
-                (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
-                (
-                    cached_input_tokens_col
-                    if cached_input_tokens_col is not None
-                    else literal(None)
-                ).label("cached_input_tokens"),
-                (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
-            )
-            .join(
-                SweBenchRunValidation,
-                SweBenchRunValidation.run_fk == SweBenchRun.id,
-            )
-            .where(SweBenchRun.baseline_run.is_(False))
-            .where(SweBenchRun.script_fk == script.script_id)
-            .where(SweBenchRun.miner_fk == script.miner_fk)
-            .where(SweBenchRun.task_fk.in_(screener_task_ids))
+    sub_joins, resolved_expr = _all_types_resolved_joins_and_expr()
+    miner_stmt = (
+        select(
+            SweBenchRun.task_fk,
+            SweBenchRun.attempt_no,
+            SweBenchRun.benchmark_type,
+            resolved_expr,
+            SweBenchRunValidation.scored_at,
+            SweBenchRun.tokens_used,
+            (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
+            (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
+            (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
         )
-    ).all()
+        .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
+        .where(SweBenchRun.baseline_run.is_(False))
+        .where(SweBenchRun.script_fk == script.script_id)
+        .where(SweBenchRun.miner_fk == script.miner_fk)
+        .where(SweBenchRun.task_fk.in_(screener_task_ids))
+    )
+    for model, condition in sub_joins:
+        miner_stmt = miner_stmt.outerjoin(model, condition)
+    rows = (await db.execute(miner_stmt)).all()
 
     baseline_rows = (
         await db.execute(
             select(
                 SweBenchRun.task_fk,
                 SweBenchRun.attempt_no,
+                SweBenchRun.benchmark_type,
                 SweBenchRun.tokens_used,
                 (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
-                (
-                    cached_input_tokens_col
-                    if cached_input_tokens_col is not None
-                    else literal(None)
-                ).label("cached_input_tokens"),
+                (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
                 (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
             )
             .where(SweBenchRun.baseline_run.is_(True))
@@ -690,26 +711,26 @@ async def _evaluate_screening_for_script(
         )
     ).all()
 
-    by_task_attempt: dict[tuple[int, int], tuple[bool | None, datetime | None, float | None]] = {}
+    by_task_attempt: dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]] = {}
     for row in rows:
-        by_task_attempt[(int(row[0]), int(row[1]))] = (
-            row[2],
+        by_task_attempt[(int(row[0]), int(row[1]), str(row[2]))] = (
             row[3],
+            row[4],
             _weighted_tokens_for_screening(
-                total_tokens=_coerce_optional_int(row[4]),
-                input_tokens=_coerce_optional_int(row[5]),
-                cached_input_tokens=_coerce_optional_int(row[6]),
-                output_tokens=_coerce_optional_int(row[7]),
+                total_tokens=_coerce_optional_int(row[5]),
+                input_tokens=_coerce_optional_int(row[6]),
+                cached_input_tokens=_coerce_optional_int(row[7]),
+                output_tokens=_coerce_optional_int(row[8]),
             ),
         )
 
-    baseline_weighted_by_task_attempt: dict[tuple[int, int], float | None] = {}
+    baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None] = {}
     for row in baseline_rows:
-        baseline_weighted_by_task_attempt[(int(row[0]), int(row[1]))] = _weighted_tokens_for_screening(
-            total_tokens=_coerce_optional_int(row[2]),
-            input_tokens=_coerce_optional_int(row[3]),
-            cached_input_tokens=_coerce_optional_int(row[4]),
-            output_tokens=_coerce_optional_int(row[5]),
+        baseline_weighted_by_task_attempt[(int(row[0]), int(row[1]), str(row[2]))] = _weighted_tokens_for_screening(
+            total_tokens=_coerce_optional_int(row[3]),
+            input_tokens=_coerce_optional_int(row[4]),
+            cached_input_tokens=_coerce_optional_int(row[5]),
+            output_tokens=_coerce_optional_int(row[6]),
         )
 
     passed_task_count = 0
@@ -719,24 +740,19 @@ async def _evaluate_screening_for_script(
         repeats = max(1, int(task_repeats.get(int(task_id), 1)))
         attempt_resolved: list[bool] = []
         for attempt_no in range(1, repeats + 1):
-            state = by_task_attempt.get((int(task_id), attempt_no))
-            if state is None:
-                return False, False
-            resolved_value, scored_at, miner_weighted_tokens = state
-            if scored_at is None or resolved_value is None:
-                return False, False
-            baseline_weighted_tokens = baseline_weighted_by_task_attempt.get((int(task_id), attempt_no))
-            if baseline_weighted_tokens is None:
-                return False, False
-            if miner_weighted_tokens is None:
-                if bool(resolved_value):
+            for benchmark_type in ("swebench_verified",):
+                state = by_task_attempt.get((int(task_id), attempt_no, benchmark_type))
+                if state is None:
                     return False, False
-                # Keep screening behavior aligned with frontend status rules:
-                # failed attempts with missing token components count as zero.
-                miner_weighted_tokens = 0.0
-            miner_weighted_total += miner_weighted_tokens
-            baseline_weighted_total += baseline_weighted_tokens
-            attempt_resolved.append(bool(resolved_value))
+                resolved_value, scored_at, miner_weighted_tokens = state
+                if scored_at is None or resolved_value is None:
+                    return False, False
+                baseline_weighted_tokens = baseline_weighted_by_task_attempt.get((int(task_id), attempt_no, benchmark_type))
+                if miner_weighted_tokens is None or baseline_weighted_tokens is None:
+                    return False, False
+                miner_weighted_total += miner_weighted_tokens
+                baseline_weighted_total += baseline_weighted_tokens
+                attempt_resolved.append(bool(resolved_value))
 
         if sum(1 for value in attempt_resolved if value) > (len(attempt_resolved) // 2):
             passed_task_count += 1
@@ -838,6 +854,7 @@ async def _create_run_and_validation(
     *,
     task_fk: int,
     attempt_no: int,
+    benchmark_type: str,
     baseline_run: bool,
     miner_fk: int | None,
     script_fk: int | None,
@@ -847,6 +864,7 @@ async def _create_run_and_validation(
         task_fk=task_fk,
         request_fk=None,
         attempt_no=attempt_no,
+        benchmark_type=benchmark_type,
         miner_fk=miner_fk,
         script_fk=script_fk,
         diff_storage_uuid=str(uuid.uuid4()),
@@ -862,7 +880,6 @@ async def _create_run_and_validation(
         run_fk=run.id,
         request_fk=None,
         validator_fk=None,
-        resolved=None,
         scored_at=None,
     )
     db.add(validation)
@@ -893,6 +910,28 @@ async def _dispatch_due_runs(
     )
 
     async for db in get_db_session():
+        banned_pending_result = await db.execute(
+            text(
+                """
+                UPDATE swe_bench_runs r
+                SET status = 'failed',
+                    last_error = 'Miner failed review before sandbox dispatch',
+                    updated_at = now()
+                FROM miners m
+                WHERE r.status = 'pending'
+                  AND r.baseline_run = FALSE
+                  AND r.miner_fk = m.id
+                  AND m.miner_banned_status = TRUE
+                """
+            )
+        )
+        banned_pending_count = int(banned_pending_result.rowcount or 0)
+        if banned_pending_count > 0:
+            logger.info(
+                "swebench_orchestrator_failed_banned_pending_runs",
+                extra={"failed_runs": banned_pending_count},
+            )
+
         strict_fifo_dispatch = bool(settings.swebench_dispatch_strict_fifo)
         batch_size = (
             1
@@ -908,6 +947,7 @@ async def _dispatch_due_runs(
                         r.id AS run_id,
                         r.diff_storage_uuid,
                         r.attempt_no,
+                        r.benchmark_type,
                         r.miner_fk,
                         r.script_fk,
                         r.baseline_run,
@@ -1012,9 +1052,11 @@ async def _dispatch_due_runs(
                 deferred += 1
                 continue
 
+            run_benchmark_type = str(row.get("benchmark_type") or "swebench_verified")
+            benchmark_name = str(settings.swebench_benchmark_name)
             ok, error, retryable = await manager.dispatch_swebench_run(
                 run_id=run_id,
-                benchmark=str(settings.swebench_benchmark_name),
+                benchmark=benchmark_name,
                 instance_id=str(row["instance_id"]),
                 storage_uuid=str(row["diff_storage_uuid"]),
                 script_presigned_url=script_presigned_url,
@@ -1026,6 +1068,7 @@ async def _dispatch_due_runs(
                     "planned_repeats": int(row["planned_repeats"]),
                     "baseline_run": bool(row["baseline_run"]),
                     "is_screener": bool(row["is_screener"]),
+                    "benchmark_type": run_benchmark_type,
                 },
             )
 
@@ -1146,11 +1189,20 @@ async def _get_baseline_script_presigned_url(
 ) -> str:
     key = getattr(app.state, "swebench_baseline_script_key", None)
     if not key:
-        key = "hot/miner_solutions/__baseline__/baseline_default.py"
+        key = "hot/miner_solutions/__baseline__/baseline_default_v3.py"
         script = (
-            "from typing import Optional\n\n"
-            "def main(task: str, compression_ratio: Optional[float]) -> str:\n"
-            "    return task or ''\n"
+            "from __future__ import annotations\n\n"
+            "from typing import Any\n\n"
+            "def compress_messages(\n"
+            "    messages: list[Any] | None = None,\n"
+            "    path: str | None = None,\n"
+            "    metadata: dict[str, Any] | None = None,\n"
+            ") -> list[Any]:\n"
+            "    \"\"\"Identity compressor: return incoming messages unchanged.\"\"\"\n"
+            "    del path, metadata\n"
+            "    if isinstance(messages, list):\n"
+            "        return messages\n"
+            "    return []\n"
         )
         await s3_storage.put_bytes(
             key,
@@ -1207,6 +1259,7 @@ async def _load_script_dispatch_context(
                 JOIN miner_uploads u ON u.script_fk = s.id
                 WHERE s.id = :script_fk
                   AND m.id = :miner_fk
+                                    AND m.miner_banned_status = FALSE
                   AND u.competition_fk = :competition_fk
                   {key_filter}
                 ORDER BY u.created_at DESC
