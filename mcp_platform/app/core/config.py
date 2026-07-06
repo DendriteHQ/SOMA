@@ -232,6 +232,18 @@ class Settings(BaseSettings):
         default=False,
         alias="SWEBENCH_DISPATCH_STRICT_FIFO",
     )
+    swebench_dispatch_window_seconds: float = Field(
+        default=60.0,
+        alias="SWEBENCH_DISPATCH_WINDOW_SECONDS",
+    )
+    swebench_dispatch_max_runs_per_window: int = Field(
+        default=10,
+        alias="SWEBENCH_DISPATCH_MAX_RUNS_PER_WINDOW",
+    )
+    swebench_max_concurrent_dispatched_per_miner: int = Field(
+        default=30,
+        alias="SWEBENCH_MAX_CONCURRENT_DISPATCHED_PER_MINER",
+    )
     swebench_dispatched_ttl_seconds: int = Field(
         default=2400,
         alias="SWEBENCH_DISPATCHED_TTL_SECONDS",
@@ -455,6 +467,39 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SWEBENCH_SCREENING_MIN_PASSED_TASKS must be an integer"
             ) from exc
+        return max(0, numeric)
+
+    @field_validator("swebench_dispatch_window_seconds", mode="before")
+    @classmethod
+    def _parse_swebench_dispatch_window_seconds(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 60.0
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_DISPATCH_WINDOW_SECONDS must be a number") from exc
+        return max(1.0, numeric)
+
+    @field_validator("swebench_dispatch_max_runs_per_window", mode="before")
+    @classmethod
+    def _parse_swebench_dispatch_max_runs_per_window(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 10
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_DISPATCH_MAX_RUNS_PER_WINDOW must be an integer") from exc
+        return max(0, numeric)
+
+    @field_validator("swebench_max_concurrent_dispatched_per_miner", mode="before")
+    @classmethod
+    def _parse_swebench_max_concurrent_dispatched_per_miner(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 30
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_MAX_CONCURRENT_DISPATCHED_PER_MINER must be an integer") from exc
         return max(0, numeric)
 
     @field_validator("swebench_screening_pass_ratio", mode="before")

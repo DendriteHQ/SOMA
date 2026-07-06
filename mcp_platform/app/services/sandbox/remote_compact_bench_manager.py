@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import threading
+import random
 
 from typing import Any
 
@@ -40,19 +40,19 @@ class RemoteCompactBenchManager:
         if not urls and sandbox_service_url:
             urls = [sandbox_service_url.strip().rstrip("/")]
         self._sandbox_service_urls: list[str] = urls
-        self._rr_index: int = 0
-        self._rr_lock: threading.Lock = threading.Lock()
         self._execution_timeout_seconds = execution_timeout_seconds
         self._submission_timeout_seconds = submission_timeout_seconds
         self._default_model = (default_model or "").strip() or None
 
+    def _pick_sandbox_urls(self) -> list[str]:
+        if not self._sandbox_service_urls:
+            raise RuntimeError("No sandbox service URLs configured")
+        candidates = list(self._sandbox_service_urls)
+        random.shuffle(candidates)
+        return candidates
+
     def _pick_sandbox_url(self) -> str:
-        with self._rr_lock:
-            if not self._sandbox_service_urls:
-                raise RuntimeError("No sandbox service URLs configured")
-            url = self._sandbox_service_urls[self._rr_index % len(self._sandbox_service_urls)]
-            self._rr_index = (self._rr_index + 1) % len(self._sandbox_service_urls)
-            return url
+        return self._pick_sandbox_urls()[0]
 
     async def execute_task(
         self,
@@ -186,14 +186,29 @@ class RemoteCompactBenchManager:
         payload: CompactBenchRunTaskRequest,
         timeout: float,
     ) -> CompactBenchRunTaskResponse:
-        sandbox_url = self._pick_sandbox_url()
-        response = await client.post(
-            f"{sandbox_url}/run_compact_bench_task",
-            json=payload.model_dump(mode="json"),
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        return CompactBenchRunTaskResponse.model_validate(response.json())
+        last_exc: Exception | None = None
+        candidate_urls = self._pick_sandbox_urls()
+
+        for index, sandbox_url in enumerate(candidate_urls):
+            try:
+                response = await client.post(
+                    f"{sandbox_url}/run_compact_bench_task",
+                    json=payload.model_dump(mode="json"),
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                return CompactBenchRunTaskResponse.model_validate(response.json())
+            except Exception as exc:
+                last_exc = exc
+                _, retryable = self._format_dispatch_error(exc)
+                has_fallback = index < len(candidate_urls) - 1
+                if retryable and has_fallback:
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No sandbox service URLs configured")
 
     def _format_dispatch_error(self, exc: Exception) -> tuple[str, bool]:
         if isinstance(exc, httpx.TimeoutException):

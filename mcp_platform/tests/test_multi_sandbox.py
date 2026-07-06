@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import random
 import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 TESTS_DIR = os.path.dirname(__file__)
@@ -65,41 +67,36 @@ def _make_manager(urls: list[str] | None = None, **kwargs) -> RemoteCompactBench
     )
 
 
-def test_round_robin_distributes_across_urls():
+def test_pick_sandbox_urls_returns_shuffled_candidates():
     urls = ["http://sandbox-a", "http://sandbox-b", "http://sandbox-c"]
     manager = _make_manager(urls)
 
-    picked = [manager._pick_sandbox_url() for _ in range(6)]
+    def _reverse(values: list[str]) -> None:
+        values.reverse()
 
-    # Round-robin in order, each URL chosen exactly twice.
-    assert picked == [
-        "http://sandbox-a",
-        "http://sandbox-b",
-        "http://sandbox-c",
-        "http://sandbox-a",
-        "http://sandbox-b",
-        "http://sandbox-c",
-    ]
-    for url in urls:
-        assert picked.count(url) == 2
+    with patch.object(random, "shuffle", side_effect=_reverse) as shuffle_mock:
+        picked = manager._pick_sandbox_urls()
+
+    assert picked == ["http://sandbox-c", "http://sandbox-b", "http://sandbox-a"]
+    shuffle_mock.assert_called_once()
 
 
 def test_single_url_always_picked():
     manager = _make_manager(["http://only-sandbox"])
 
-    picked = [manager._pick_sandbox_url() for _ in range(3)]
+    picked = [manager._pick_sandbox_urls() for _ in range(3)]
 
-    assert picked == ["http://only-sandbox"] * 3
+    assert picked == [["http://only-sandbox"]] * 3
 
 
 def test_empty_urls_raises():
     manager = _make_manager([])
 
     with pytest.raises(RuntimeError):
-        manager._pick_sandbox_url()
+        manager._pick_sandbox_urls()
 
 
-async def test_dispatch_uses_round_robin():
+async def test_dispatch_tries_other_sandbox_when_first_is_busy():
     urls = ["http://sandbox-a", "http://sandbox-b", "http://sandbox-c"]
     manager = _make_manager(urls)
 
@@ -107,28 +104,65 @@ async def test_dispatch_uses_round_robin():
 
     async def _fake_post(self, url, *args, **kwargs):
         requested_urls.append(url)
+        if url.startswith("http://sandbox-a"):
+            request = httpx.Request("POST", url)
+            response = httpx.Response(status_code=429, request=request)
+            raise httpx.HTTPStatusError("429 Too Many Requests", request=request, response=response)
         response = MagicMock()
         response.raise_for_status = MagicMock(return_value=None)
         response.json = MagicMock(return_value={"success": True})
         return response
 
-    with patch("httpx.AsyncClient.post", new=_fake_post):
-        for idx in range(3):
-            ok, error, _retryable = await manager.dispatch_swebench_run(
-                run_id=idx + 1,
-                benchmark="SWE-bench/SWE-bench_Verified",
-                instance_id=f"instance-{idx}",
-                storage_uuid=f"uuid-{idx}",
-                script_presigned_url="http://example.com/script.py",
-            )
-            assert ok is True
-            assert error is None
+    with (
+        patch.object(manager, "_pick_sandbox_urls", return_value=urls),
+        patch("httpx.AsyncClient.post", new=_fake_post),
+    ):
+        ok, error, _retryable = await manager.dispatch_swebench_run(
+            run_id=1,
+            benchmark="SWE-bench/SWE-bench_Verified",
+            instance_id="instance-1",
+            storage_uuid="uuid-1",
+            script_presigned_url="http://example.com/script.py",
+        )
+        assert ok is True
+        assert error is None
 
-    # One request per dispatch, and each sandbox URL received exactly one.
+    assert len(requested_urls) == 2
+    assert requested_urls[0].startswith("http://sandbox-a/")
+    assert requested_urls[1].startswith("http://sandbox-b/")
+
+
+async def test_dispatch_all_busy_returns_retryable_after_trying_all():
+    urls = ["http://sandbox-a", "http://sandbox-b", "http://sandbox-c"]
+    manager = _make_manager(urls)
+
+    requested_urls: list[str] = []
+
+    async def _fake_post(self, url, *args, **kwargs):
+        requested_urls.append(url)
+        request = httpx.Request("POST", url)
+        response = httpx.Response(status_code=429, request=request)
+        raise httpx.HTTPStatusError("429 Too Many Requests", request=request, response=response)
+
+    with (
+        patch.object(manager, "_pick_sandbox_urls", return_value=urls),
+        patch("httpx.AsyncClient.post", new=_fake_post),
+    ):
+        ok, error, retryable = await manager.dispatch_swebench_run(
+            run_id=2,
+            benchmark="SWE-bench/SWE-bench_Verified",
+            instance_id="instance-2",
+            storage_uuid="uuid-2",
+            script_presigned_url="http://example.com/script.py",
+        )
+
+    assert ok is False
+    assert retryable is True
+    assert error is not None
     assert len(requested_urls) == 3
-    base_urls = [url.rsplit("/run_compact_bench_task", 1)[0] for url in requested_urls]
-    for url in urls:
-        assert base_urls.count(url) == 1
+    assert requested_urls[0].startswith("http://sandbox-a/")
+    assert requested_urls[1].startswith("http://sandbox-b/")
+    assert requested_urls[2].startswith("http://sandbox-c/")
 
 
 def test_legacy_single_url_param():

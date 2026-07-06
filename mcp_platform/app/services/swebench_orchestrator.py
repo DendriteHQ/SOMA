@@ -55,8 +55,11 @@ _SEED_IDLE_LOG_INTERVAL_SECONDS = 60
 _LAST_IDLE_SEED_LOG_AT: datetime | None = None
 _LAST_CAPACITY_LOG_AT: float | None = None
 _CAPACITY_LOG_INTERVAL_SECONDS = 30.0
+_LAST_WINDOW_LIMIT_LOG_AT: float | None = None
+_WINDOW_LIMIT_LOG_INTERVAL_SECONDS = 30.0
 _LAST_IDLE_DISPATCH_LOG_AT: float | None = None
 _DISPATCH_IDLE_LOG_INTERVAL_SECONDS = 30.0
+_DISPATCH_FETCH_LIMIT_CAP = 2000
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,11 @@ def start_swebench_orchestrator_task(app) -> None:
             "interval_seconds": interval,
             "dispatch_batch_size": int(settings.swebench_dispatch_batch_size),
             "dispatch_strict_fifo": bool(settings.swebench_dispatch_strict_fifo),
+            "dispatch_window_seconds": float(settings.swebench_dispatch_window_seconds),
+            "dispatch_max_runs_per_window": int(settings.swebench_dispatch_max_runs_per_window),
+            "max_concurrent_dispatched_per_miner": int(
+                settings.swebench_max_concurrent_dispatched_per_miner
+            ),
         },
     )
 
@@ -182,7 +190,27 @@ async def _run_orchestration_tick(app) -> None:
                 )
             break
 
-        dispatched, deferred, failed = await _dispatch_due_runs(app, now)
+        dispatched = 0
+        deferred = 0
+        failed = 0
+        strict_fifo_dispatch = bool(settings.swebench_dispatch_strict_fifo)
+        dispatch_window_quota = max(0, int(settings.swebench_dispatch_max_runs_per_window))
+        # In strict FIFO mode we still dispatch one run per pass, but we can
+        # perform multiple passes in a single orchestrator tick up to the
+        # configured window quota.
+        dispatch_pass_limit = (
+            dispatch_window_quota
+            if strict_fifo_dispatch and dispatch_window_quota > 0
+            else 1
+        )
+        for _ in range(max(1, dispatch_pass_limit)):
+            pass_dispatched, pass_deferred, pass_failed = await _dispatch_due_runs(app, now)
+            dispatched += pass_dispatched
+            deferred += pass_deferred
+            failed += pass_failed
+            # Stop early when a pass made no progress (e.g. cooldown/empty queue/window capped).
+            if pass_dispatched == 0 and pass_failed == 0:
+                break
         if dispatched or failed:
             logger.info(
                 "swebench_orchestrator_dispatch_pass",
@@ -889,7 +917,7 @@ async def _dispatch_due_runs(
     app,
     now: datetime,
 ) -> tuple[int, int, int]:
-    global _LAST_CAPACITY_LOG_AT
+    global _LAST_CAPACITY_LOG_AT, _LAST_WINDOW_LIMIT_LOG_AT
 
     manager = _get_compact_bench_manager(app)
     s3_storage = _get_s3_storage(app)
@@ -903,6 +931,22 @@ async def _dispatch_due_runs(
     global_not_before: float = float(getattr(app.state, "swebench_global_retry_not_before", 0.0))
     app.state.swebench_retry_not_before = retry_not_before
     app.state.swebench_retry_attempts = retry_attempts
+
+    dispatch_window_seconds = max(1.0, float(settings.swebench_dispatch_window_seconds))
+    dispatch_window_quota = max(0, int(settings.swebench_dispatch_max_runs_per_window))
+    dispatches_this_window = int(getattr(app.state, "swebench_dispatches_this_window", 0))
+    dispatch_window_started_at = float(
+        getattr(app.state, "swebench_dispatch_window_started_at", time.monotonic())
+    )
+    now_monotonic = time.monotonic()
+    if dispatch_window_quota > 0 and (now_monotonic - dispatch_window_started_at) >= dispatch_window_seconds:
+        dispatch_window_started_at = now_monotonic
+        dispatches_this_window = 0
+        _LAST_WINDOW_LIMIT_LOG_AT = None
+    app.state.swebench_dispatches_this_window = dispatches_this_window
+    app.state.swebench_dispatch_window_started_at = dispatch_window_started_at
+
+    max_dispatched_per_miner = max(0, int(settings.swebench_max_concurrent_dispatched_per_miner))
     eligibility_sql = _non_baseline_eligibility_sql(
         script_fk_expr="r.script_fk",
         miner_fk_expr="r.miner_fk",
@@ -938,7 +982,11 @@ async def _dispatch_due_runs(
             if strict_fifo_dispatch
             else max(1, int(settings.swebench_dispatch_batch_size))
         )
-        fetch_limit = min(200, batch_size if strict_fifo_dispatch else batch_size * 5)
+        fetch_limit = (
+            _DISPATCH_FETCH_LIMIT_CAP
+            if strict_fifo_dispatch
+            else min(_DISPATCH_FETCH_LIMIT_CAP, batch_size * 5)
+        )
         due_rows = (
             await db.execute(
                 text(
@@ -1007,8 +1055,58 @@ async def _dispatch_due_runs(
                 )
             break
 
+        dispatch_window_remaining = (
+            max(0, dispatch_window_quota - dispatches_this_window)
+            if dispatch_window_quota > 0
+            else None
+        )
+        if dispatch_window_remaining is not None and dispatch_window_remaining <= 0:
+            deferred += len(due_rows)
+            await db.rollback()
+            if (
+                _LAST_WINDOW_LIMIT_LOG_AT is None
+                or (now_monotonic - _LAST_WINDOW_LIMIT_LOG_AT) >= _WINDOW_LIMIT_LOG_INTERVAL_SECONDS
+            ):
+                _LAST_WINDOW_LIMIT_LOG_AT = now_monotonic
+                seconds_left = max(
+                    0.0,
+                    dispatch_window_seconds - (now_monotonic - dispatch_window_started_at),
+                )
+                logger.info(
+                    "swebench_orchestrator_dispatch_window_limit_active",
+                    extra={
+                        "seconds_left": round(seconds_left, 2),
+                        "window_seconds": dispatch_window_seconds,
+                        "window_quota": dispatch_window_quota,
+                        "dispatched_in_window": dispatches_this_window,
+                        "deferred_runs": len(due_rows),
+                    },
+                )
+            break
+
+        active_dispatched_by_miner: dict[int, int] = {}
+        if max_dispatched_per_miner > 0:
+            miner_rows = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT miner_fk, COUNT(*) AS dispatched_count
+                        FROM swe_bench_runs
+                        WHERE status = 'dispatched'
+                          AND miner_fk IS NOT NULL
+                        GROUP BY miner_fk
+                        """
+                    )
+                )
+            ).all()
+            active_dispatched_by_miner = {
+                int(miner_fk): int(dispatched_count)
+                for miner_fk, dispatched_count in miner_rows
+            }
+
         dispatch_rows: list[dict] = []
         deferred_by_cooldown = 0
+        deferred_by_miner_limit = 0
         for row in due_rows:
             run_id = int(row["run_id"])
             retry_at = retry_not_before.get(run_id)
@@ -1018,17 +1116,34 @@ async def _dispatch_due_runs(
                     # Preserve strict queue order: do not bypass a cooling head run.
                     break
                 continue
+
+            miner_fk = row.get("miner_fk")
+            if max_dispatched_per_miner > 0 and miner_fk is not None:
+                active_for_miner = int(active_dispatched_by_miner.get(int(miner_fk), 0))
+                if active_for_miner >= max_dispatched_per_miner:
+                    deferred_by_miner_limit += 1
+                    # Intentionally bypass capped miners so other miners can keep flowing.
+                    continue
+
             dispatch_rows.append(row)
-            if strict_fifo_dispatch or len(dispatch_rows) >= batch_size:
+            if (
+                strict_fifo_dispatch
+                or len(dispatch_rows) >= batch_size
+                or (
+                    dispatch_window_remaining is not None
+                    and len(dispatch_rows) >= dispatch_window_remaining
+                )
+            ):
                 break
 
         if not dispatch_rows:
-            deferred += deferred_by_cooldown
+            deferred += deferred_by_cooldown + deferred_by_miner_limit
             await db.rollback()
             break
 
         expires_in = int(max(60.0, float(settings.sandbox_timeout_per_task_seconds) + 300.0))
 
+        prepared_dispatches: list[tuple[dict, int, str]] = []
         for row in dispatch_rows:
             run_id = int(row["run_id"])
             try:
@@ -1051,27 +1166,40 @@ async def _dispatch_due_runs(
                 )
                 deferred += 1
                 continue
+            prepared_dispatches.append((row, run_id, script_presigned_url))
 
-            run_benchmark_type = str(row.get("benchmark_type") or "swebench_verified")
-            benchmark_name = str(settings.swebench_benchmark_name)
-            ok, error, retryable = await manager.dispatch_swebench_run(
-                run_id=run_id,
-                benchmark=benchmark_name,
-                instance_id=str(row["instance_id"]),
-                storage_uuid=str(row["diff_storage_uuid"]),
-                script_presigned_url=script_presigned_url,
-                task_context={
-                    "competition_fk": int(row["competition_fk"]),
-                    "miner_fk": row["miner_fk"],
-                    "script_fk": row["script_fk"],
-                    "attempt_no": int(row["attempt_no"]),
-                    "planned_repeats": int(row["planned_repeats"]),
-                    "baseline_run": bool(row["baseline_run"]),
-                    "is_screener": bool(row["is_screener"]),
-                    "benchmark_type": run_benchmark_type,
-                },
+        async def _dispatch_one(prepared: tuple[dict, int, str]) -> tuple[dict, int, bool, str | None, bool]:
+            row, run_id, script_presigned_url = prepared
+            try:
+                run_benchmark_type = str(row.get("benchmark_type") or "swebench_verified")
+                ok, error, retryable = await manager.dispatch_swebench_run(
+                    run_id=run_id,
+                    benchmark=str(settings.swebench_benchmark_name),
+                    instance_id=str(row["instance_id"]),
+                    storage_uuid=str(row["diff_storage_uuid"]),
+                    script_presigned_url=script_presigned_url,
+                    task_context={
+                        "competition_fk": int(row["competition_fk"]),
+                        "miner_fk": row["miner_fk"],
+                        "script_fk": row["script_fk"],
+                        "attempt_no": int(row["attempt_no"]),
+                        "planned_repeats": int(row["planned_repeats"]),
+                        "baseline_run": bool(row["baseline_run"]),
+                        "is_screener": bool(row["is_screener"]),
+                        "benchmark_type": run_benchmark_type,
+                    },
+                )
+                return row, run_id, bool(ok), error, bool(retryable)
+            except Exception as exc:
+                return row, run_id, False, f"Dispatch exception: {exc}", True
+
+        dispatch_results: list[tuple[dict, int, bool, str | None, bool]] = []
+        if prepared_dispatches:
+            dispatch_results = list(
+                await asyncio.gather(*(_dispatch_one(prepared) for prepared in prepared_dispatches))
             )
 
+        for row, run_id, ok, error, retryable in dispatch_results:
             if ok:
                 await db.execute(
                     text(
@@ -1080,6 +1208,16 @@ async def _dispatch_due_runs(
                     {"run_id": run_id},
                 )
                 dispatched += 1
+                if max_dispatched_per_miner > 0 and row.get("miner_fk") is not None:
+                    miner_fk_int = int(row["miner_fk"])
+                    active_dispatched_by_miner[miner_fk_int] = (
+                        int(active_dispatched_by_miner.get(miner_fk_int, 0)) + 1
+                    )
+                if dispatch_window_quota > 0:
+                    dispatches_this_window += 1
+                    app.state.swebench_dispatches_this_window = dispatches_this_window
+                    app.state.swebench_dispatch_window_started_at = dispatch_window_started_at
+                    _LAST_WINDOW_LIMIT_LOG_AT = None
                 retry_not_before.pop(run_id, None)
                 retry_attempts.pop(run_id, None)
                 continue
@@ -1106,9 +1244,11 @@ async def _dispatch_due_runs(
 
                 is_capacity_error = bool(error) and "at capacity" in error.lower()
                 if is_capacity_error:
-                    cooldown_seconds = min(max_seconds, base + (random.uniform(0.0, jitter) if jitter > 0 else 0.0))
+                    cooldown_seconds = min(
+                        max_seconds,
+                        base + (random.uniform(0.0, jitter) if jitter > 0 else 0.0),
+                    )
                     app.state.swebench_global_retry_not_before = time.monotonic() + cooldown_seconds
-                    break
             else:
                 retry_not_before.pop(run_id, None)
                 retry_attempts.pop(run_id, None)
@@ -1120,7 +1260,7 @@ async def _dispatch_due_runs(
                 )
                 failed += 1
 
-        deferred += deferred_by_cooldown
+        deferred += deferred_by_cooldown + deferred_by_miner_limit
         await db.commit()
         break
 
