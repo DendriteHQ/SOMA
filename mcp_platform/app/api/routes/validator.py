@@ -489,26 +489,39 @@ async def _build_best_miners_payload(
         )
         return _burn_only_payload()
 
-    top_miner_weight_total = sum(w for w in top_miner_ss58_weights.values() if w > 0.0)
+    top_miner_weight_total_raw = sum(
+        w for w in top_miner_ss58_weights.values() if w > 0.0
+    )
     remaining_for_top_miners = max(0.0, 1.0 - screener_used)
+
+    registered_top_miner_ss58_weights: dict[str, float] = {}
+    unregistered_top_miner_ss58_weights: dict[str, float] = {}
+    for ss58, weight in top_miner_ss58_weights.items():
+        if weight <= 0.0:
+            continue
+        if hotkey_to_uid.get(ss58) is None:
+            unregistered_top_miner_ss58_weights[ss58] = weight
+        else:
+            registered_top_miner_ss58_weights[ss58] = weight
+
+    top_miner_weight_total_registered = sum(
+        w for w in registered_top_miner_ss58_weights.values() if w > 0.0
+    )
     top_miner_scale = (
-        (remaining_for_top_miners / top_miner_weight_total)
-        if top_miner_weight_total > 0.0
+        (remaining_for_top_miners / top_miner_weight_total_registered)
+        if top_miner_weight_total_registered > 0.0
         else 0.0
     )
 
     top_miners_assigned = 0.0
-    for ss58, weight in top_miner_ss58_weights.items():
-        if weight <= 0.0:
-            continue
+    for ss58, weight in registered_top_miner_ss58_weights.items():
         normalized_weight = weight * top_miner_scale
         if normalized_weight <= 0.0:
             continue
         uid = hotkey_to_uid.get(ss58)
         if uid is None:
-            miners_by_uid[0] = miners_by_uid.get(0, 0.0) + normalized_weight
-        else:
-            miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + normalized_weight
+            continue
+        miners_by_uid[int(uid)] = miners_by_uid.get(int(uid), 0.0) + normalized_weight
         top_miners_assigned += normalized_weight
 
     burn = max(0.0, 1.0 - screener_used - top_miners_assigned)
@@ -531,8 +544,16 @@ async def _build_best_miners_payload(
             "screener_weight_total": screener_weight_total,
             "screener_weight_per_miner": screener_weight_per_miner,
             "remaining_for_top_miners": remaining_for_top_miners,
-            "top_miner_weight_total_raw": top_miner_weight_total,
+            "top_miner_weight_total_raw": top_miner_weight_total_raw,
+            "top_miner_weight_total_registered": top_miner_weight_total_registered,
+            "top_miner_weight_total_unregistered": sum(
+                w for w in unregistered_top_miner_ss58_weights.values() if w > 0.0
+            ),
             "top_miner_scale": top_miner_scale,
+            "unregistered_top_miners": [
+                {"ss58": ss58, "weight": weight}
+                for ss58, weight in unregistered_top_miner_ss58_weights.items()
+            ],
             "top_miners_assigned": top_miners_assigned,
             "burn": burn,
             "miners": _miners_log(miners),
