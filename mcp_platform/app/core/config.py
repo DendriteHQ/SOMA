@@ -273,7 +273,7 @@ class Settings(BaseSettings):
         alias="SWEBENCH_SCREENING_PASS_RATIO",
     )
     swebench_screening_min_weighted_token_saving_ratio: float = Field(
-        default=0.1,
+        default=0.2,
         alias="SWEBENCH_SCREENING_MIN_WEIGHTED_TOKEN_SAVING_RATIO",
     )
     swebench_screening_input_tokens_weight: float = Field(
@@ -281,7 +281,7 @@ class Settings(BaseSettings):
         alias="SWEBENCH_SCREENING_INPUT_TOKENS_WEIGHT",
     )
     swebench_screening_cached_input_tokens_weight: float = Field(
-        default=1.0 / 3.0,
+        default=1.0 / 10.0,
         alias="SWEBENCH_SCREENING_CACHED_INPUT_TOKENS_WEIGHT",
     )
     swebench_screening_output_tokens_weight: float = Field(
@@ -525,7 +525,7 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_swebench_screening_min_weighted_token_saving_ratio(cls, value: Any) -> float:
         if value is None or value == "":
-            return 0.1
+            return 0.2
         try:
             numeric = float(value)
         except (TypeError, ValueError) as exc:
