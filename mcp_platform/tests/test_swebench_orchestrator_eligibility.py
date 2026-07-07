@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -121,46 +121,11 @@ def test_weighted_tokens_for_screening_uses_configured_weights(
 
 
 @pytest.mark.asyncio
-async def test_seed_selects_dynamic_screeners_once_when_none_selected(
+async def test_seed_upload_phase_seeds_screener_baseline_and_screening_runs_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime.now(timezone.utc)
-    tasks = [
-        SimpleNamespace(id=1, planned_repeats=3, is_screener=False),
-        SimpleNamespace(id=2, planned_repeats=3, is_screener=False),
-        SimpleNamespace(id=3, planned_repeats=3, is_screener=False),
-    ]
-
-    db = AsyncMock()
-    db.execute = AsyncMock(return_value=_ScalarsExecuteResult(tasks))
-
-    seed_baseline_mock = AsyncMock(return_value=0)
-    baseline_complete_mock = AsyncMock(return_value=True)
-    select_screeners_mock = AsyncMock(return_value=None)
-    load_scripts_mock = AsyncMock(return_value=[])
-
-    monkeypatch.setattr(
-        orchestrator.settings,
-        "swebench_dynamic_screener_task_count",
-        2,
-        raising=False,
-    )
-    monkeypatch.setattr(orchestrator, "_seed_baseline_runs", seed_baseline_mock)
-    monkeypatch.setattr(orchestrator, "_is_baseline_evaluation_complete", baseline_complete_mock)
-    monkeypatch.setattr(orchestrator, "_select_dynamic_screener_tasks", select_screeners_mock)
-    monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
-
-    created = await orchestrator._seed_runs_for_competition(db, competition_id=75, now=now)
-
-    assert created == 0
-    assert select_screeners_mock.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_seed_skips_dynamic_reselection_when_screeners_already_selected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = datetime.now(timezone.utc)
+    eval_starts_at = now + timedelta(hours=6)
     tasks = [
         SimpleNamespace(id=1, planned_repeats=3, is_screener=True),
         SimpleNamespace(id=2, planned_repeats=3, is_screener=False),
@@ -171,19 +136,116 @@ async def test_seed_skips_dynamic_reselection_when_screeners_already_selected(
     db.execute = AsyncMock(return_value=_ScalarsExecuteResult(tasks))
 
     seed_baseline_mock = AsyncMock(return_value=0)
-    baseline_complete_mock = AsyncMock(return_value=True)
-    select_screeners_mock = AsyncMock(return_value=None)
+    screener_baseline_complete_mock = AsyncMock(return_value=True)
+    load_scripts_mock = AsyncMock(
+        return_value=[orchestrator._ScriptRef(script_id=501, miner_fk=11)]
+    )
+    seed_script_runs_mock = AsyncMock(return_value=0)
+
+    monkeypatch.setattr(orchestrator, "_seed_baseline_runs", seed_baseline_mock)
+    monkeypatch.setattr(
+        orchestrator, "_is_screener_baseline_complete", screener_baseline_complete_mock
+    )
+    monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
+    monkeypatch.setattr(orchestrator, "_seed_script_runs", seed_script_runs_mock)
+
+    created = await orchestrator._seed_runs_for_competition(
+        db,
+        competition_id=75,
+        eval_starts_at=eval_starts_at,
+        now=now,
+    )
+
+    assert created == 0
+    baseline_kwargs = seed_baseline_mock.await_args_list[0].kwargs
+    assert [task.id for task in baseline_kwargs["tasks"]] == [1]
+    assert baseline_kwargs["benchmark_types"] == orchestrator._SCREENING_BENCHMARK_TYPES
+
+    script_kwargs = seed_script_runs_mock.await_args_list[0].kwargs
+    assert script_kwargs["seed_screener_runs"] is True
+    assert script_kwargs["allow_full_runs"] is False
+    assert script_kwargs["screener_task_ids"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_seed_upload_phase_waits_for_screener_baseline_before_screening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    eval_starts_at = now + timedelta(hours=6)
+    tasks = [
+        SimpleNamespace(id=1, planned_repeats=3, is_screener=True),
+        SimpleNamespace(id=2, planned_repeats=3, is_screener=False),
+    ]
+
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=_ScalarsExecuteResult(tasks))
+
+    seed_baseline_mock = AsyncMock(return_value=0)
+    screener_baseline_complete_mock = AsyncMock(return_value=False)
     load_scripts_mock = AsyncMock(return_value=[])
 
     monkeypatch.setattr(orchestrator, "_seed_baseline_runs", seed_baseline_mock)
-    monkeypatch.setattr(orchestrator, "_is_baseline_evaluation_complete", baseline_complete_mock)
-    monkeypatch.setattr(orchestrator, "_select_dynamic_screener_tasks", select_screeners_mock)
+    monkeypatch.setattr(
+        orchestrator, "_is_screener_baseline_complete", screener_baseline_complete_mock
+    )
     monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
 
-    created = await orchestrator._seed_runs_for_competition(db, competition_id=75, now=now)
+    created = await orchestrator._seed_runs_for_competition(
+        db,
+        competition_id=75,
+        eval_starts_at=eval_starts_at,
+        now=now,
+    )
 
     assert created == 0
-    assert select_screeners_mock.await_count == 0
+    assert load_scripts_mock.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_seed_eval_window_seeds_full_baseline_and_allows_full_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    eval_starts_at = now - timedelta(minutes=5)
+    tasks = [
+        SimpleNamespace(id=1, planned_repeats=3, is_screener=True),
+        SimpleNamespace(id=2, planned_repeats=3, is_screener=False),
+        SimpleNamespace(id=3, planned_repeats=3, is_screener=False),
+    ]
+
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=_ScalarsExecuteResult(tasks))
+
+    seed_baseline_mock = AsyncMock(return_value=0)
+    screener_baseline_complete_mock = AsyncMock(return_value=True)
+    load_scripts_mock = AsyncMock(
+        return_value=[orchestrator._ScriptRef(script_id=501, miner_fk=11)]
+    )
+    seed_script_runs_mock = AsyncMock(return_value=0)
+
+    monkeypatch.setattr(orchestrator, "_seed_baseline_runs", seed_baseline_mock)
+    monkeypatch.setattr(
+        orchestrator, "_is_screener_baseline_complete", screener_baseline_complete_mock
+    )
+    monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
+    monkeypatch.setattr(orchestrator, "_seed_script_runs", seed_script_runs_mock)
+
+    created = await orchestrator._seed_runs_for_competition(
+        db,
+        competition_id=75,
+        eval_starts_at=eval_starts_at,
+        now=now,
+    )
+
+    assert created == 0
+    baseline_kwargs = seed_baseline_mock.await_args_list[0].kwargs
+    assert [task.id for task in baseline_kwargs["tasks"]] == [1, 2, 3]
+    assert "benchmark_types" not in baseline_kwargs
+
+    script_kwargs = seed_script_runs_mock.await_args_list[0].kwargs
+    assert script_kwargs["seed_screener_runs"] is True
+    assert script_kwargs["allow_full_runs"] is True
 
 
 @pytest.mark.asyncio
@@ -389,7 +451,14 @@ async def test_dispatch_query_orders_baseline_then_upload_time(
     selection_sql = _extract_sql(db.execute)
     assert "AS miner_upload_created_at" in selection_sql
     assert "SELECT MIN(mu.created_at)" in selection_sql
-    assert "CASE WHEN r.baseline_run = TRUE THEN 0 ELSE 1 END ASC" in selection_sql
+    screener_priority_clause = (
+        "CASE WHEN t.is_screener = TRUE AND r.benchmark_type IN ('swebench_verified') "
+        "THEN 0 ELSE 1 END ASC"
+    )
+    assert screener_priority_clause in selection_sql
+    assert selection_sql.index(screener_priority_clause) < selection_sql.index(
+        "CASE WHEN r.baseline_run = TRUE THEN 0 ELSE 1 END ASC"
+    )
     assert "miner_upload_created_at ASC NULLS LAST" in selection_sql
     assert "r.id ASC" in selection_sql
 

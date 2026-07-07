@@ -30,6 +30,7 @@ from soma_shared.db.session import get_db_session, get_engine
 logger = get_logger(__name__)
 
 _BENCHMARK_TYPES = ("swebench_verified", "swe_explorer_explore", "swe_explorer_edit")
+_SCREENING_BENCHMARK_TYPES = ("swebench_verified",)
 
 
 def _all_types_resolved_joins_and_expr():
@@ -169,14 +170,19 @@ async def _run_orchestration_tick(app) -> None:
         now = datetime.now(timezone.utc)
 
         async for db in get_db_session():
-            active_competition_ids = await _get_active_competition_ids(db, now)
+            active_competitions = await _get_active_competitions(db, now)
             seeded_runs = 0
-            for competition_id in active_competition_ids:
-                seeded_runs += await _seed_runs_for_competition(db, competition_id, now)
+            for competition_id, eval_starts_at in active_competitions:
+                seeded_runs += await _seed_runs_for_competition(
+                    db,
+                    competition_id=competition_id,
+                    eval_starts_at=eval_starts_at,
+                    now=now,
+                )
             recovered_runs = await _recover_stale_dispatched_runs(db=db, now=now)
             await db.commit()
             _maybe_log_seed_pass(
-                active_competitions=len(active_competition_ids),
+                active_competitions=len(active_competitions),
                 seeded_runs=seeded_runs,
                 now=now,
             )
@@ -338,10 +344,10 @@ async def _recover_stale_dispatched_runs(
     return len(stale_run_ids)
 
 
-async def _get_active_competition_ids(db: AsyncSession, now: datetime) -> list[int]:
+async def _get_active_competitions(db: AsyncSession, now: datetime) -> list[tuple[int, datetime]]:
     rows = (
         await db.execute(
-            select(Competition.id)
+            select(Competition.id, CompetitionTimeframe.eval_starts_at)
             .join(CompetitionConfig, CompetitionConfig.competition_fk == Competition.id)
             .join(
                 CompetitionTimeframe,
@@ -352,12 +358,19 @@ async def _get_active_competition_ids(db: AsyncSession, now: datetime) -> list[i
             .where(CompetitionTimeframe.eval_ends_at >= now)
         )
     ).all()
-    return [int(row[0]) for row in rows]
+    by_competition: dict[int, datetime] = {}
+    for competition_id, eval_starts_at in rows:
+        competition_id = int(competition_id)
+        if competition_id not in by_competition or eval_starts_at < by_competition[competition_id]:
+            by_competition[competition_id] = eval_starts_at
+    return list(by_competition.items())
 
 
 async def _seed_runs_for_competition(
     db: AsyncSession,
+    *,
     competition_id: int,
+    eval_starts_at: datetime,
     now: datetime,
 ) -> int:
     tasks = (
@@ -377,34 +390,40 @@ async def _seed_runs_for_competition(
     task_repeats: dict[int, int] = {
         int(task.id): max(1, int(task.planned_repeats or 1)) for task in tasks
     }
-    screener_task_count = _resolve_screener_task_count(tasks)
+    screener_tasks = [task for task in tasks if bool(task.is_screener)]
+    screener_task_ids = [int(task.id) for task in screener_tasks]
+    in_eval_window = now >= eval_starts_at
 
     created = 0
-    created += await _seed_baseline_runs(
-        db,
-        tasks=tasks,
-        task_repeats=task_repeats,
-        now=now,
-    )
-
-    baseline_complete = await _is_baseline_evaluation_complete(
-        db,
-        task_ids=[int(task.id) for task in tasks],
-        task_repeats=task_repeats,
-    )
-    if not baseline_complete:
-        return created
-
-    has_selected_screener_tasks = any(bool(task.is_screener) for task in tasks)
-    if screener_task_count > 0 and not has_selected_screener_tasks:
-        await _select_dynamic_screener_tasks(
+    if in_eval_window:
+        created += await _seed_baseline_runs(
             db,
             tasks=tasks,
             task_repeats=task_repeats,
-            screener_task_count=screener_task_count,
+            now=now,
+        )
+    else:
+        # Upload phase: baseline covers only the preset screener tasks in the
+        # screening benchmark type; the full matrix is seeded once the
+        # evaluation window opens.
+        created += await _seed_baseline_runs(
+            db,
+            tasks=screener_tasks,
+            task_repeats=task_repeats,
+            now=now,
+            benchmark_types=_SCREENING_BENCHMARK_TYPES,
         )
 
-    screener_task_ids = [int(task.id) for task in tasks if bool(task.is_screener)]
+    screener_baseline_complete = await _is_screener_baseline_complete(
+        db,
+        screener_task_ids=screener_task_ids,
+        task_repeats=task_repeats,
+    )
+
+    if not in_eval_window and not screener_baseline_complete:
+        # Upload phase only performs screening, which requires the screener
+        # baseline runs to be scored first (token comparison reference).
+        return created
 
     scripts = await _load_latest_scripts_for_competition(db, competition_id)
     for script in scripts:
@@ -414,103 +433,40 @@ async def _seed_runs_for_competition(
             tasks=tasks,
             task_repeats=task_repeats,
             screener_task_ids=screener_task_ids,
+            seed_screener_runs=screener_baseline_complete,
+            allow_full_runs=in_eval_window,
             now=now,
         )
 
     return created
 
 
-def _resolve_screener_task_count(tasks: list[SweBenchTask]) -> int:
-    if not tasks:
-        return 0
-    preset_count = sum(1 for task in tasks if bool(task.is_screener))
-    if preset_count > 0:
-        return min(len(tasks), int(preset_count))
-    configured = max(0, int(getattr(settings, "swebench_dynamic_screener_task_count", 0)))
-    return min(len(tasks), configured)
-
-
-async def _is_baseline_evaluation_complete(
+async def _is_screener_baseline_complete(
     db: AsyncSession,
     *,
-    task_ids: list[int],
+    screener_task_ids: list[int],
     task_repeats: dict[int, int],
 ) -> bool:
-    if not task_ids:
+    if not screener_task_ids:
         return False
 
-    expected_runs = sum(max(1, int(task_repeats.get(task_id, 1))) for task_id in task_ids) * len(_BENCHMARK_TYPES)
+    expected_runs = sum(
+        max(1, int(task_repeats.get(int(task_id), 1))) for task_id in screener_task_ids
+    ) * len(_SCREENING_BENCHMARK_TYPES)
     evaluated_runs = int(
         (
             await db.execute(
                 select(func.count(func.distinct(SweBenchRun.id)))
                 .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
                 .where(SweBenchRun.baseline_run.is_(True))
-                .where(SweBenchRun.task_fk.in_(task_ids))
+                .where(SweBenchRun.task_fk.in_(screener_task_ids))
+                .where(SweBenchRun.benchmark_type.in_(_SCREENING_BENCHMARK_TYPES))
                 .where(SweBenchRunValidation.scored_at.is_not(None))
             )
         ).scalar()
         or 0
     )
     return evaluated_runs >= expected_runs
-
-
-async def _select_dynamic_screener_tasks(
-    db: AsyncSession,
-    *,
-    tasks: list[SweBenchTask],
-    task_repeats: dict[int, int],
-    screener_task_count: int,
-) -> None:
-    if screener_task_count <= 0 or not tasks:
-        return
-
-    task_ids = [int(task.id) for task in tasks]
-    sub_joins, resolved_expr = _all_types_resolved_joins_and_expr()
-    stmt = (
-        select(SweBenchRun.task_fk, resolved_expr)
-        .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
-        .where(SweBenchRun.baseline_run.is_(True))
-        .where(SweBenchRun.task_fk.in_(task_ids))
-        .where(SweBenchRunValidation.scored_at.is_not(None))
-    )
-    for model, condition in sub_joins:
-        stmt = stmt.outerjoin(model, condition)
-    rows = (await db.execute(stmt)).all()
-
-    success_counts: dict[int, int] = {task_id: 0 for task_id in task_ids}
-    for task_fk, resolved in rows:
-        task_id = int(task_fk)
-        if resolved is not None and bool(resolved):
-            success_counts[task_id] = success_counts.get(task_id, 0) + 1
-
-    by_success: dict[int, list[int]] = {}
-    for task_id in task_ids:
-        score = int(success_counts.get(task_id, 0))
-        by_success.setdefault(score, []).append(task_id)
-
-    selected: list[int] = []
-    for score in sorted(by_success.keys(), reverse=True):
-        candidates = by_success[score]
-        random.shuffle(candidates)
-        remaining = screener_task_count - len(selected)
-        if remaining <= 0:
-            break
-        selected.extend(candidates[:remaining])
-
-    selected_set = set(selected[:screener_task_count])
-    for task in tasks:
-        task.is_screener = int(task.id) in selected_set
-
-    logger.info(
-        "swebench_dynamic_screener_tasks_selected",
-        extra={
-            "task_ids": sorted(task_ids),
-            "selected_screener_task_ids": sorted(selected_set),
-            "requested_screener_task_count": int(screener_task_count),
-            "success_counts": {str(task_id): int(success_counts.get(task_id, 0)) for task_id in task_ids},
-        },
-    )
 
 
 async def _load_latest_scripts_for_competition(
@@ -556,8 +512,12 @@ async def _seed_baseline_runs(
     tasks: list[SweBenchTask],
     task_repeats: dict[int, int],
     now: datetime,
+    benchmark_types: tuple[str, ...] = _BENCHMARK_TYPES,
 ) -> int:
     task_ids = [int(task.id) for task in tasks]
+    if not task_ids:
+        return 0
+
     existing = set(
         (int(row[0]), int(row[1]), str(row[2]))
         for row in (
@@ -575,7 +535,7 @@ async def _seed_baseline_runs(
     for task in tasks:
         task_id = int(task.id)
         for attempt_no in range(1, task_repeats[task_id] + 1):
-            for benchmark_type in _BENCHMARK_TYPES:
+            for benchmark_type in benchmark_types:
                 key = (task_id, attempt_no, benchmark_type)
                 if key in existing:
                     continue
@@ -601,19 +561,26 @@ async def _seed_script_runs(
     tasks: list[SweBenchTask],
     task_repeats: dict[int, int],
     screener_task_ids: list[int],
+    seed_screener_runs: bool,
+    allow_full_runs: bool,
     now: datetime,
 ) -> int:
     created = 0
 
-    if screener_task_ids:
+    if screener_task_ids and seed_screener_runs:
         created += await _seed_script_task_subset(
             db,
             script=script,
             task_ids=screener_task_ids,
             task_repeats=task_repeats,
             now=now,
-            benchmark_types=("swebench_verified",),
+            benchmark_types=_SCREENING_BENCHMARK_TYPES,
         )
+
+    if not allow_full_runs:
+        # Upload phase: screening runs only; full evaluation runs are seeded
+        # once the evaluation window opens.
+        return created
 
     screening_complete, screening_passed = await _evaluate_screening_for_script(
         db,
@@ -768,7 +735,7 @@ async def _evaluate_screening_for_script(
         repeats = max(1, int(task_repeats.get(int(task_id), 1)))
         attempt_resolved: list[bool] = []
         for attempt_no in range(1, repeats + 1):
-            for benchmark_type in ("swebench_verified",):
+            for benchmark_type in _SCREENING_BENCHMARK_TYPES:
                 state = by_task_attempt.get((int(task_id), attempt_no, benchmark_type))
                 if state is None:
                     return False, False
@@ -1021,13 +988,19 @@ async def _dispatch_due_runs(
                           OR ({eligibility_sql})
                       )
                     ORDER BY
+                        CASE WHEN t.is_screener = TRUE AND r.benchmark_type IN ({screening_types}) THEN 0 ELSE 1 END ASC,
                         CASE WHEN r.baseline_run = TRUE THEN 0 ELSE 1 END ASC,
                         miner_upload_created_at ASC NULLS LAST,
                         r.created_at ASC,
                         r.id ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT :limit
-                    """.format(eligibility_sql=eligibility_sql)
+                    """.format(
+                        eligibility_sql=eligibility_sql,
+                        screening_types=", ".join(
+                            f"'{benchmark_type}'" for benchmark_type in _SCREENING_BENCHMARK_TYPES
+                        ),
+                    )
                 ),
                 {"limit": fetch_limit},
             )
