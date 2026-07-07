@@ -1316,6 +1316,8 @@ class CompactBenchExecutor:
                 command.extend(["--openclaw-plugin-path", str(plugin_path)])
             if openclaw_agent_timeout_seconds is not None:
                 command.extend(["--openclaw-command", f"--timeout {openclaw_agent_timeout_seconds}"])
+        else:
+            command.append("--openclaw-ignore-api-key")
         if task.model:
             command.extend(["--model", task.model])
         if task.openclaw_disable_somarizer:
