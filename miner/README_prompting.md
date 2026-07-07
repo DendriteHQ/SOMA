@@ -27,6 +27,8 @@ Allowed marker behavior:
 - Preserve tool policy, safety policy, role policy, and output contract.
 - Use clear marker boundaries such as `Compressed text starts here` and `Compressed text ends here`.
 - Marker aliases may be defined once and reused; `[[CMP]]` is the start marker and `[[/CMP]]` is the end marker.
+- Omission markers `[[Omitted]]` / `[[/Omitted]]` and `[[deleted]]` / `[[/deleted]]` may be used in place of `[[CMP]]` / `[[/CMP]]` to wrap omitted content.
+- When compressing code, include a source line reference inside the marker so omitted lines remain locatable (single line or an inclusive range).
 - `Same response as in ...` references are allowed only when the referenced block is explicit and unambiguous.
 
 Not allowed for markers:
@@ -95,9 +97,15 @@ Allowed exact strings:
 - `Compressed text ends here`
 - `[[CMP]]`
 - `[[/CMP]]`
+- `[[Omitted]]`
+- `[[/Omitted]]`
+- `[[deleted]]`
+- `[[/deleted]]`
 - `[[BLOCK X]]`
 - `[[/BLOCK X]]`
 - `Same response as in [[BLOCK X]].`
+- `[[CMP]] source line N [[/CMP]]`
+- `[[CMP]] source line N ~ source line M Omitted [[/CMP]]`
 
 ### 5.2 Loop Detection
 
