@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -152,6 +154,69 @@ def _burn_only_payload() -> GetBestMinersUidResponse:
     return GetBestMinersUidResponse(miners=[MinerWeight(uid=0, weight=1.0)])
 
 
+def _is_burn_only_payload(payload: GetBestMinersUidResponse) -> bool:
+    return len(payload.miners) == 1 and payload.miners[0].uid == 0
+
+
+def _write_best_miners_cache(
+    payload: GetBestMinersUidResponse,
+    *,
+    request_id: str | None,
+    now: datetime,
+) -> None:
+    try:
+        cache_path = Path(settings.best_miners_cache_path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "cached_at": now.isoformat(),
+            "miners": _miners_log(payload.miners),
+        }
+        # Unique tmp name so concurrent workers never write to the same file;
+        # replace() is an atomic rename, readers always see a complete file.
+        tmp_path = cache_path.with_name(f"{cache_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp_path.write_text(json.dumps(data), encoding="utf-8")
+            tmp_path.replace(cache_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning(
+            "get_best_miners_cache_write_failed",
+            extra={"request_id": request_id, "error": str(exc)},
+            exc_info=exc,
+        )
+
+
+def _read_best_miners_cache(request_id: str | None) -> GetBestMinersUidResponse | None:
+    cache_path = Path(settings.best_miners_cache_path)
+    try:
+        if not cache_path.exists():
+            return None
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        miners = [
+            MinerWeight(uid=int(entry["uid"]), weight=float(entry["weight"]))
+            for entry in data.get("miners", [])
+        ]
+        if not miners:
+            return None
+        logger.info(
+            "get_best_miners_cache_hit",
+            extra={
+                "request_id": request_id,
+                "cached_at": data.get("cached_at"),
+                "miners": _miners_log(miners),
+            },
+        )
+        return GetBestMinersUidResponse(miners=miners)
+    except Exception as exc:
+        logger.warning(
+            "get_best_miners_cache_read_failed",
+            extra={"request_id": request_id, "error": str(exc)},
+            exc_info=exc,
+        )
+        return None
+
+
 def _log_get_best_miners_fallback(
     request_id: str | None,
     reason: str,
@@ -163,6 +228,18 @@ def _log_get_best_miners_fallback(
     }
     payload.update(extra)
     logger.info("get_best_miners_fallback", extra=payload)
+
+
+def _fallback_best_miners_payload(
+    request_id: str | None,
+    reason: str,
+    **extra: object,
+) -> GetBestMinersUidResponse:
+    _log_get_best_miners_fallback(request_id, reason, **extra)
+    cached = _read_best_miners_cache(request_id)
+    if cached is not None:
+        return cached
+    return _burn_only_payload()
 
 
 async def _load_top_screener_uids_for_competition(
@@ -1086,38 +1163,56 @@ async def get_best_miners(
         else None
     )
     if not snapshot or not isinstance(snapshot, dict):
-        _log_get_best_miners_fallback(
+        response_payload = _fallback_best_miners_payload(
             request_id,
             "missing_or_invalid_metagraph_snapshot",
         )
-        response_payload = _burn_only_payload()
     else:
         hotkeys = snapshot.get("hotkeys", [])
         uids = snapshot.get("uids", [])
         if not hotkeys or not uids or len(hotkeys) != len(uids):
-            _log_get_best_miners_fallback(
+            response_payload = _fallback_best_miners_payload(
                 request_id,
                 "metagraph_hotkeys_uids_invalid",
                 hotkeys_count=len(hotkeys),
                 uids_count=len(uids),
             )
-            response_payload = _burn_only_payload()
         else:
             hotkey_to_uid = {str(hk): int(uid) for hk, uid in zip(hotkeys, uids)}
-            current_competition_id = await _get_active_competition_id(db)
-            if current_competition_id is None:
-                _log_get_best_miners_fallback(
-                    request_id,
-                    "no_active_competition_timeframe",
+            try:
+                current_competition_id = await _get_active_competition_id(db)
+                if current_competition_id is None:
+                    response_payload = _fallback_best_miners_payload(
+                        request_id,
+                        "no_active_competition_timeframe",
+                    )
+                else:
+                    response_payload = await _build_best_miners_payload(
+                        db,
+                        request_id=request_id,
+                        now=now,
+                        active_competition_id=int(current_competition_id),
+                        hotkey_to_uid=hotkey_to_uid,
+                    )
+                    if not _is_burn_only_payload(response_payload):
+                        _write_best_miners_cache(
+                            response_payload,
+                            request_id=request_id,
+                            now=now,
+                        )
+            except Exception as exc:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    "get_best_miners_computation_failed",
+                    extra={"request_id": request_id, "error": str(exc)},
+                    exc_info=exc,
                 )
-                response_payload = _burn_only_payload()
-            else:
-                response_payload = await _build_best_miners_payload(
-                    db,
-                    request_id=request_id,
-                    now=now,
-                    active_competition_id=int(current_competition_id),
-                    hotkey_to_uid=hotkey_to_uid,
+                response_payload = _fallback_best_miners_payload(
+                    request_id,
+                    "best_miners_computation_failed",
                 )
 
     response_nonce = generate_nonce()
@@ -1146,16 +1241,27 @@ async def get_best_miners(
             },
         )
 
-    await log_validator_message(
-        db,
-        direction="response",
-        endpoint=request.url.path,
-        method=request.method,
-        signature=response_sig.signature,
-        nonce=response_sig.nonce,
-        request_id=request_id,
-        payload=log_payload,
-        status_code=status.HTTP_200_OK,
-        response_payload=response_payload.model_dump(mode="json"),
-    )
+    try:
+        await log_validator_message(
+            db,
+            direction="response",
+            endpoint=request.url.path,
+            method=request.method,
+            signature=response_sig.signature,
+            nonce=response_sig.nonce,
+            request_id=request_id,
+            payload=log_payload,
+            status_code=status.HTTP_200_OK,
+            response_payload=response_payload.model_dump(mode="json"),
+        )
+    except Exception as exc:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "get_best_miners_response_log_failed",
+            extra={"request_id": request_id, "error": str(exc)},
+            exc_info=exc,
+        )
     return response

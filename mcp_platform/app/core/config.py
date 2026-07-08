@@ -141,6 +141,10 @@ class Settings(BaseSettings):
         default="frontend/competition_aggregate_snapshots",
         alias="FRONTEND_AGGREGATE_SNAPSHOT_S3_PREFIX",
     )
+    best_miners_cache_path: Path = Field(
+        default=Path("/tmp/soma/best_miners_cache.json"),
+        alias="BEST_MINERS_CACHE_PATH",
+    )
 
     # Batch cleanup
     batch_cleanup_interval_secs: int = Field(
