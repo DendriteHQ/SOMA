@@ -147,6 +147,11 @@ async def test_seed_upload_phase_seeds_screener_baseline_and_screening_runs_only
         orchestrator, "_is_screener_baseline_complete", screener_baseline_complete_mock
     )
     monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_screening_baseline_weighted_tokens",
+        AsyncMock(return_value={(1, 1, "swebench_verified"): 100.0}),
+    )
     monkeypatch.setattr(orchestrator, "_seed_script_runs", seed_script_runs_mock)
 
     created = await orchestrator._seed_runs_for_competition(
@@ -229,6 +234,11 @@ async def test_seed_eval_window_seeds_full_baseline_and_allows_full_runs(
         orchestrator, "_is_screener_baseline_complete", screener_baseline_complete_mock
     )
     monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_screening_baseline_weighted_tokens",
+        AsyncMock(return_value={(1, 1, "swebench_verified"): 100.0}),
+    )
     monkeypatch.setattr(orchestrator, "_seed_script_runs", seed_script_runs_mock)
 
     created = await orchestrator._seed_runs_for_competition(
@@ -258,14 +268,8 @@ async def test_evaluate_screening_passes_with_weighted_token_saving_threshold(
         side_effect=[
             _ExecuteResult(
                 all_rows=[
-                    (101, 1, True, now, None, 100, 300, 10),
-                    (102, 1, True, now, None, 80, 60, 10),
-                ]
-            ),
-            _ExecuteResult(
-                all_rows=[
-                    (101, 1, None, 150, 300, 20),
-                    (102, 1, None, 120, 120, 20),
+                    (101, 1, "swebench_verified", True, now, None, 100, 300, 10),
+                    (102, 1, "swebench_verified", True, now, None, 80, 60, 10),
                 ]
             ),
         ]
@@ -285,6 +289,10 @@ async def test_evaluate_screening_passes_with_weighted_token_saving_threshold(
         script=orchestrator._ScriptRef(script_id=2001, miner_fk=3001),
         screener_task_ids=[101, 102],
         task_repeats={101: 1, 102: 1},
+        baseline_weighted_by_task_attempt={
+            (101, 1, "swebench_verified"): 150.0,
+            (102, 1, "swebench_verified"): 120.0,
+        },
     )
 
     assert (complete, passed) == (True, True)
@@ -300,12 +308,7 @@ async def test_evaluate_screening_fails_when_weighted_token_saving_is_below_thre
         side_effect=[
             _ExecuteResult(
                 all_rows=[
-                    (101, 1, True, now, None, 95, 0, 0),
-                ]
-            ),
-            _ExecuteResult(
-                all_rows=[
-                    (101, 1, None, 100, 0, 0),
+                    (101, 1, "swebench_verified", True, now, None, 95, 0, 0),
                 ]
             ),
         ]
@@ -325,6 +328,9 @@ async def test_evaluate_screening_fails_when_weighted_token_saving_is_below_thre
         script=orchestrator._ScriptRef(script_id=2002, miner_fk=3002),
         screener_task_ids=[101],
         task_repeats={101: 1},
+        baseline_weighted_by_task_attempt={
+            (101, 1, "swebench_verified"): 100.0,
+        },
     )
 
     assert (complete, passed) == (True, False)

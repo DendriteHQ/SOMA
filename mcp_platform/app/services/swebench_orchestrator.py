@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, case, func, literal, select, text
+from sqlalchemy import and_, func, literal, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -19,8 +19,6 @@ from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
 from soma_shared.db.models.swe_bench_verified_validation import SweBenchVerifiedValidation
-from soma_shared.db.models.swe_explorer_edit_validation import SweExplorerEditValidation
-from soma_shared.db.models.swe_explorer_validation import SweExplorerValidation
 from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.competition_config import CompetitionConfig
 from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
@@ -31,25 +29,6 @@ logger = get_logger(__name__)
 
 _BENCHMARK_TYPES = ("swebench_verified", "swe_explorer_explore", "swe_explorer_edit")
 _SCREENING_BENCHMARK_TYPES = ("swebench_verified",)
-
-
-def _all_types_resolved_joins_and_expr():
-    """Return (outerjoin_targets, resolved_case_expr) for querying resolved across all benchmark types."""
-    vv = SweBenchVerifiedValidation
-    ev = SweExplorerEditValidation
-    sev = SweExplorerValidation
-    resolved_expr = case(
-        (SweBenchRun.benchmark_type == "swebench_verified", vv.resolved),
-        (SweBenchRun.benchmark_type == "swe_explorer_edit", ev.resolved),
-        (SweBenchRun.benchmark_type == "swe_explorer_explore", sev.f1_score > 0),
-        else_=None,
-    ).label("resolved")
-    joins = [
-        (vv, and_(vv.validation_fk == SweBenchRunValidation.id, SweBenchRun.benchmark_type == "swebench_verified")),
-        (ev, and_(ev.validation_fk == SweBenchRunValidation.id, SweBenchRun.benchmark_type == "swe_explorer_edit")),
-        (sev, and_(sev.validation_fk == SweBenchRunValidation.id, SweBenchRun.benchmark_type == "swe_explorer_explore")),
-    ]
-    return joins, resolved_expr
 
 _ORCHESTRATOR_LOCK_KEY = "swebench-orchestrator-v1"
 _SEED_IDLE_LOG_INTERVAL_SECONDS = 60
@@ -390,6 +369,7 @@ async def _seed_runs_for_competition(
     task_repeats: dict[int, int] = {
         int(task.id): max(1, int(task.planned_repeats or 1)) for task in tasks
     }
+    all_task_ids = [int(task.id) for task in tasks]
     screener_tasks = [task for task in tasks if bool(task.is_screener)]
     screener_task_ids = [int(task.id) for task in screener_tasks]
     in_eval_window = now >= eval_starts_at
@@ -425,16 +405,24 @@ async def _seed_runs_for_competition(
         # baseline runs to be scored first (token comparison reference).
         return created
 
+    baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None] = {}
+    if screener_task_ids:
+        baseline_weighted_by_task_attempt = await _load_screening_baseline_weighted_tokens(
+            db,
+            screener_task_ids=screener_task_ids,
+        )
+
     scripts = await _load_latest_scripts_for_competition(db, competition_id)
     for script in scripts:
         created += await _seed_script_runs(
             db,
             script=script,
-            tasks=tasks,
+            all_task_ids=all_task_ids,
             task_repeats=task_repeats,
             screener_task_ids=screener_task_ids,
             seed_screener_runs=screener_baseline_complete,
             allow_full_runs=in_eval_window,
+            baseline_weighted_by_task_attempt=baseline_weighted_by_task_attempt,
             now=now,
         )
 
@@ -554,15 +542,58 @@ async def _seed_baseline_runs(
     return created
 
 
+async def _load_screening_baseline_weighted_tokens(
+    db: AsyncSession,
+    *,
+    screener_task_ids: list[int],
+) -> dict[tuple[int, int, str], float | None]:
+    if not screener_task_ids:
+        return {}
+
+    input_tokens_col = _model_attr(SweBenchRun, "input_tokens")
+    cached_input_tokens_col = _model_attr(SweBenchRun, "cached_input_tokens")
+    output_tokens_col = _model_attr(SweBenchRun, "output_tokens")
+
+    baseline_rows = (
+        await db.execute(
+            select(
+                SweBenchRun.task_fk,
+                SweBenchRun.attempt_no,
+                SweBenchRun.benchmark_type,
+                SweBenchRun.tokens_used,
+                (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
+                (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
+                (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
+            )
+            .where(SweBenchRun.baseline_run.is_(True))
+            .where(SweBenchRun.miner_fk.is_(None))
+            .where(SweBenchRun.script_fk.is_(None))
+            .where(SweBenchRun.benchmark_type.in_(_SCREENING_BENCHMARK_TYPES))
+            .where(SweBenchRun.task_fk.in_(screener_task_ids))
+        )
+    ).all()
+
+    baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None] = {}
+    for row in baseline_rows:
+        baseline_weighted_by_task_attempt[(int(row[0]), int(row[1]), str(row[2]))] = _weighted_tokens_for_screening(
+            total_tokens=_coerce_optional_int(row[3]),
+            input_tokens=_coerce_optional_int(row[4]),
+            cached_input_tokens=_coerce_optional_int(row[5]),
+            output_tokens=_coerce_optional_int(row[6]),
+        )
+    return baseline_weighted_by_task_attempt
+
+
 async def _seed_script_runs(
     db: AsyncSession,
     *,
     script: _ScriptRef,
-    tasks: list[SweBenchTask],
+    all_task_ids: list[int],
     task_repeats: dict[int, int],
     screener_task_ids: list[int],
     seed_screener_runs: bool,
     allow_full_runs: bool,
+    baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None],
     now: datetime,
 ) -> int:
     created = 0
@@ -587,12 +618,12 @@ async def _seed_script_runs(
         script=script,
         screener_task_ids=screener_task_ids,
         task_repeats=task_repeats,
+        baseline_weighted_by_task_attempt=baseline_weighted_by_task_attempt,
     )
 
     if not screening_complete or not screening_passed:
         return created
 
-    all_task_ids = [int(task.id) for task in tasks]
     created += await _seed_script_task_subset(
         db,
         script=script,
@@ -657,6 +688,7 @@ async def _evaluate_screening_for_script(
     script: _ScriptRef,
     screener_task_ids: list[int],
     task_repeats: dict[int, int],
+    baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None],
 ) -> tuple[bool, bool]:
     if not screener_task_ids:
         return True, True
@@ -665,43 +697,28 @@ async def _evaluate_screening_for_script(
     cached_input_tokens_col = _model_attr(SweBenchRun, "cached_input_tokens")
     output_tokens_col = _model_attr(SweBenchRun, "output_tokens")
 
-    sub_joins, resolved_expr = _all_types_resolved_joins_and_expr()
-    miner_stmt = (
-        select(
-            SweBenchRun.task_fk,
-            SweBenchRun.attempt_no,
-            SweBenchRun.benchmark_type,
-            resolved_expr,
-            SweBenchRunValidation.scored_at,
-            SweBenchRun.tokens_used,
-            (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
-            (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
-            (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
-        )
-        .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
-        .where(SweBenchRun.baseline_run.is_(False))
-        .where(SweBenchRun.script_fk == script.script_id)
-        .where(SweBenchRun.miner_fk == script.miner_fk)
-        .where(SweBenchRun.task_fk.in_(screener_task_ids))
-    )
-    for model, condition in sub_joins:
-        miner_stmt = miner_stmt.outerjoin(model, condition)
-    rows = (await db.execute(miner_stmt)).all()
-
-    baseline_rows = (
+    rows = (
         await db.execute(
             select(
                 SweBenchRun.task_fk,
                 SweBenchRun.attempt_no,
                 SweBenchRun.benchmark_type,
+                SweBenchVerifiedValidation.resolved.label("resolved"),
+                SweBenchRunValidation.scored_at,
                 SweBenchRun.tokens_used,
                 (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
                 (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
                 (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
             )
-            .where(SweBenchRun.baseline_run.is_(True))
-            .where(SweBenchRun.miner_fk.is_(None))
-            .where(SweBenchRun.script_fk.is_(None))
+            .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
+            .outerjoin(
+                SweBenchVerifiedValidation,
+                SweBenchVerifiedValidation.validation_fk == SweBenchRunValidation.id,
+            )
+            .where(SweBenchRun.baseline_run.is_(False))
+            .where(SweBenchRun.script_fk == script.script_id)
+            .where(SweBenchRun.miner_fk == script.miner_fk)
+            .where(SweBenchRun.benchmark_type.in_(_SCREENING_BENCHMARK_TYPES))
             .where(SweBenchRun.task_fk.in_(screener_task_ids))
         )
     ).all()
@@ -717,15 +734,6 @@ async def _evaluate_screening_for_script(
                 cached_input_tokens=_coerce_optional_int(row[7]),
                 output_tokens=_coerce_optional_int(row[8]),
             ),
-        )
-
-    baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None] = {}
-    for row in baseline_rows:
-        baseline_weighted_by_task_attempt[(int(row[0]), int(row[1]), str(row[2]))] = _weighted_tokens_for_screening(
-            total_tokens=_coerce_optional_int(row[3]),
-            input_tokens=_coerce_optional_int(row[4]),
-            cached_input_tokens=_coerce_optional_int(row[5]),
-            output_tokens=_coerce_optional_int(row[6]),
         )
 
     passed_task_count = 0
