@@ -423,22 +423,59 @@ async def _seed_runs_for_competition(
             scripts=scripts,
             screener_task_ids=screener_task_ids,
         )
-    for script in scripts:
-        created += await _seed_script_runs(
+
+    screener_existing_by_script: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
+    if scripts and screener_task_ids and screener_baseline_complete:
+        screener_existing_by_script = await _load_existing_non_baseline_run_keys_for_scripts(
             db,
-            script=script,
-            all_task_ids=all_task_ids,
-            task_repeats=task_repeats,
-            screener_task_ids=screener_task_ids,
-            seed_screener_runs=screener_baseline_complete,
-            allow_full_runs=in_eval_window,
-            baseline_weighted_by_task_attempt=baseline_weighted_by_task_attempt,
-            screening_by_task_attempt=screening_rows_by_script.get(
-                (script.script_id, script.miner_fk),
-                {},
-            ),
-            now=now,
+            scripts=scripts,
+            task_ids=screener_task_ids,
+            benchmark_types=_SCREENING_BENCHMARK_TYPES,
         )
+
+    passed_scripts: list[_ScriptRef] = []
+    for script in scripts:
+        script_key = (script.script_id, script.miner_fk)
+        if screener_task_ids and screener_baseline_complete:
+            created += await _seed_script_task_subset_from_existing(
+                db,
+                script=script,
+                task_ids=screener_task_ids,
+                task_repeats=task_repeats,
+                benchmark_types=_SCREENING_BENCHMARK_TYPES,
+                existing=screener_existing_by_script.get(script_key, set()),
+                now=now,
+            )
+
+        if not in_eval_window:
+            continue
+
+        screening_complete, screening_passed = await _evaluate_screening_for_script(
+            screener_task_ids=screener_task_ids,
+            task_repeats=task_repeats,
+            baseline_weighted_by_task_attempt=baseline_weighted_by_task_attempt,
+            screening_by_task_attempt=screening_rows_by_script.get(script_key, {}),
+        )
+        if screening_complete and screening_passed:
+            passed_scripts.append(script)
+
+    if in_eval_window and passed_scripts:
+        full_existing_by_script = await _load_existing_non_baseline_run_keys_for_scripts(
+            db,
+            scripts=passed_scripts,
+            task_ids=all_task_ids,
+            benchmark_types=_BENCHMARK_TYPES,
+        )
+        for script in passed_scripts:
+            created += await _seed_script_task_subset_from_existing(
+                db,
+                script=script,
+                task_ids=all_task_ids,
+                task_repeats=task_repeats,
+                benchmark_types=_BENCHMARK_TYPES,
+                existing=full_existing_by_script.get((script.script_id, script.miner_fk), set()),
+                now=now,
+            )
 
     return created
 
@@ -667,88 +704,69 @@ async def _load_screening_miner_states_for_scripts(
     return by_script
 
 
-async def _seed_script_runs(
+async def _load_existing_non_baseline_run_keys_for_scripts(
     db: AsyncSession,
     *,
-    script: _ScriptRef,
-    all_task_ids: list[int],
-    task_repeats: dict[int, int],
-    screener_task_ids: list[int],
-    seed_screener_runs: bool,
-    allow_full_runs: bool,
-    baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None],
-    screening_by_task_attempt: dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]],
-    now: datetime,
-) -> int:
-    created = 0
+    scripts: list[_ScriptRef],
+    task_ids: list[int],
+    benchmark_types: tuple[str, ...],
+) -> dict[tuple[int, int], set[tuple[int, int, str]]]:
+    if not scripts or not task_ids or not benchmark_types:
+        return {}
 
-    if screener_task_ids and seed_screener_runs:
-        created += await _seed_script_task_subset(
-            db,
-            script=script,
-            task_ids=screener_task_ids,
-            task_repeats=task_repeats,
-            now=now,
-            benchmark_types=_SCREENING_BENCHMARK_TYPES,
+    script_ids = [int(script.script_id) for script in scripts]
+    miner_ids = [int(script.miner_fk) for script in scripts]
+    rows = (
+        await db.execute(
+            select(
+                SweBenchRun.script_fk,
+                SweBenchRun.miner_fk,
+                SweBenchRun.task_fk,
+                SweBenchRun.attempt_no,
+                SweBenchRun.benchmark_type,
+            )
+            .where(SweBenchRun.baseline_run.is_(False))
+            .where(SweBenchRun.script_fk.in_(script_ids))
+            .where(SweBenchRun.miner_fk.in_(miner_ids))
+            .where(SweBenchRun.task_fk.in_(task_ids))
+            .where(SweBenchRun.benchmark_type.in_(benchmark_types))
         )
+    ).all()
 
-    if not allow_full_runs:
-        # Upload phase: screening runs only; full evaluation runs are seeded
-        # once the evaluation window opens.
-        return created
-
-    screening_complete, screening_passed = await _evaluate_screening_for_script(
-        screener_task_ids=screener_task_ids,
-        task_repeats=task_repeats,
-        baseline_weighted_by_task_attempt=baseline_weighted_by_task_attempt,
-        screening_by_task_attempt=screening_by_task_attempt,
-    )
-
-    if not screening_complete or not screening_passed:
-        return created
-
-    created += await _seed_script_task_subset(
-        db,
-        script=script,
-        task_ids=all_task_ids,
-        task_repeats=task_repeats,
-        now=now,
-    )
-    return created
+    by_script: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
+    for row in rows:
+        script_fk = _coerce_optional_int(row[0])
+        miner_fk = _coerce_optional_int(row[1])
+        if script_fk is None or miner_fk is None:
+            continue
+        script_key = (script_fk, miner_fk)
+        if script_key not in by_script:
+            by_script[script_key] = set()
+        by_script[script_key].add((int(row[2]), int(row[3]), str(row[4])))
+    return by_script
 
 
-async def _seed_script_task_subset(
+async def _seed_script_task_subset_from_existing(
     db: AsyncSession,
     *,
     script: _ScriptRef,
     task_ids: list[int],
     task_repeats: dict[int, int],
+    benchmark_types: tuple[str, ...],
+    existing: set[tuple[int, int, str]],
     now: datetime,
-    benchmark_types: tuple[str, ...] = _BENCHMARK_TYPES,
 ) -> int:
-    if not task_ids:
+    if not task_ids or not benchmark_types:
         return 0
 
-    existing = set(
-        (int(row[0]), int(row[1]), str(row[2]))
-        for row in (
-            await db.execute(
-                select(SweBenchRun.task_fk, SweBenchRun.attempt_no, SweBenchRun.benchmark_type)
-                .where(SweBenchRun.baseline_run.is_(False))
-                .where(SweBenchRun.script_fk == script.script_id)
-                .where(SweBenchRun.miner_fk == script.miner_fk)
-                .where(SweBenchRun.task_fk.in_(task_ids))
-            )
-        ).all()
-    )
-
+    existing_keys = set(existing)
     created = 0
     for task_id in task_ids:
         repeats = max(1, int(task_repeats.get(int(task_id), 1)))
         for attempt_no in range(1, repeats + 1):
             for benchmark_type in benchmark_types:
                 key = (int(task_id), attempt_no, benchmark_type)
-                if key in existing:
+                if key in existing_keys:
                     continue
                 await _create_run_and_validation(
                     db,
@@ -760,7 +778,7 @@ async def _seed_script_task_subset(
                     script_fk=script.script_id,
                     now=now,
                 )
-                existing.add(key)
+                existing_keys.add(key)
                 created += 1
     return created
 
