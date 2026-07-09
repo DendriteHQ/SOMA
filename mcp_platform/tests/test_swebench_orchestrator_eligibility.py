@@ -140,14 +140,21 @@ async def test_seed_upload_phase_seeds_screener_baseline_and_screening_runs_only
     load_scripts_mock = AsyncMock(
         return_value=[orchestrator._ScriptRef(script_id=501, miner_fk=11)]
     )
-    seed_script_runs_mock = AsyncMock(return_value=0)
+    load_existing_runs_mock = AsyncMock(return_value={(501, 11): set()})
+    seed_subset_mock = AsyncMock(return_value=0)
 
     monkeypatch.setattr(orchestrator, "_seed_baseline_runs", seed_baseline_mock)
     monkeypatch.setattr(
         orchestrator, "_is_screener_baseline_complete", screener_baseline_complete_mock
     )
     monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
-    monkeypatch.setattr(orchestrator, "_seed_script_runs", seed_script_runs_mock)
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_screening_baseline_weighted_tokens",
+        AsyncMock(return_value={(1, 1, "swebench_verified"): 100.0}),
+    )
+    monkeypatch.setattr(orchestrator, "_load_existing_non_baseline_run_keys_for_scripts", load_existing_runs_mock)
+    monkeypatch.setattr(orchestrator, "_seed_script_task_subset_from_existing", seed_subset_mock)
 
     created = await orchestrator._seed_runs_for_competition(
         db,
@@ -161,10 +168,12 @@ async def test_seed_upload_phase_seeds_screener_baseline_and_screening_runs_only
     assert [task.id for task in baseline_kwargs["tasks"]] == [1]
     assert baseline_kwargs["benchmark_types"] == orchestrator._SCREENING_BENCHMARK_TYPES
 
-    script_kwargs = seed_script_runs_mock.await_args_list[0].kwargs
-    assert script_kwargs["seed_screener_runs"] is True
-    assert script_kwargs["allow_full_runs"] is False
-    assert script_kwargs["screener_task_ids"] == [1]
+    existing_kwargs = load_existing_runs_mock.await_args_list[0].kwargs
+    assert existing_kwargs["task_ids"] == [1]
+    assert existing_kwargs["benchmark_types"] == orchestrator._SCREENING_BENCHMARK_TYPES
+    seed_kwargs = seed_subset_mock.await_args_list[0].kwargs
+    assert seed_kwargs["task_ids"] == [1]
+    assert seed_kwargs["benchmark_types"] == orchestrator._SCREENING_BENCHMARK_TYPES
 
 
 @pytest.mark.asyncio
@@ -222,14 +231,40 @@ async def test_seed_eval_window_seeds_full_baseline_and_allows_full_runs(
     load_scripts_mock = AsyncMock(
         return_value=[orchestrator._ScriptRef(script_id=501, miner_fk=11)]
     )
-    seed_script_runs_mock = AsyncMock(return_value=0)
+    load_existing_runs_mock = AsyncMock(return_value={(501, 11): set()})
+    seed_subset_mock = AsyncMock(return_value=0)
 
     monkeypatch.setattr(orchestrator, "_seed_baseline_runs", seed_baseline_mock)
     monkeypatch.setattr(
         orchestrator, "_is_screener_baseline_complete", screener_baseline_complete_mock
     )
     monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
-    monkeypatch.setattr(orchestrator, "_seed_script_runs", seed_script_runs_mock)
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_screening_baseline_weighted_tokens",
+        AsyncMock(
+            return_value={
+                (1, 1, "swebench_verified"): 100.0,
+                (1, 2, "swebench_verified"): 100.0,
+                (1, 3, "swebench_verified"): 100.0,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_screening_miner_states_for_scripts",
+        AsyncMock(
+            return_value={
+                (501, 11): {
+                    (1, 1, "swebench_verified"): (True, now, 90.0),
+                    (1, 2, "swebench_verified"): (True, now, 90.0),
+                    (1, 3, "swebench_verified"): (True, now, 90.0),
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "_load_existing_non_baseline_run_keys_for_scripts", load_existing_runs_mock)
+    monkeypatch.setattr(orchestrator, "_seed_script_task_subset_from_existing", seed_subset_mock)
 
     created = await orchestrator._seed_runs_for_competition(
         db,
@@ -243,9 +278,14 @@ async def test_seed_eval_window_seeds_full_baseline_and_allows_full_runs(
     assert [task.id for task in baseline_kwargs["tasks"]] == [1, 2, 3]
     assert "benchmark_types" not in baseline_kwargs
 
-    script_kwargs = seed_script_runs_mock.await_args_list[0].kwargs
-    assert script_kwargs["seed_screener_runs"] is True
-    assert script_kwargs["allow_full_runs"] is True
+    assert load_existing_runs_mock.await_count == 2
+    first_existing_kwargs = load_existing_runs_mock.await_args_list[0].kwargs
+    second_existing_kwargs = load_existing_runs_mock.await_args_list[1].kwargs
+    assert first_existing_kwargs["task_ids"] == [1]
+    assert first_existing_kwargs["benchmark_types"] == orchestrator._SCREENING_BENCHMARK_TYPES
+    assert second_existing_kwargs["task_ids"] == [1, 2, 3]
+    assert second_existing_kwargs["benchmark_types"] == orchestrator._BENCHMARK_TYPES
+    assert seed_subset_mock.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -253,23 +293,6 @@ async def test_evaluate_screening_passes_with_weighted_token_saving_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime.now(timezone.utc)
-    db = AsyncMock()
-    db.execute = AsyncMock(
-        side_effect=[
-            _ExecuteResult(
-                all_rows=[
-                    (101, 1, True, now, None, 100, 300, 10),
-                    (102, 1, True, now, None, 80, 60, 10),
-                ]
-            ),
-            _ExecuteResult(
-                all_rows=[
-                    (101, 1, None, 150, 300, 20),
-                    (102, 1, None, 120, 120, 20),
-                ]
-            ),
-        ]
-    )
 
     monkeypatch.setattr(orchestrator.settings, "swebench_screening_pass_ratio", 1.0, raising=False)
     monkeypatch.setattr(orchestrator.settings, "swebench_screening_min_passed_tasks", 0, raising=False)
@@ -281,10 +304,16 @@ async def test_evaluate_screening_passes_with_weighted_token_saving_threshold(
     )
 
     complete, passed = await orchestrator._evaluate_screening_for_script(
-        db,
-        script=orchestrator._ScriptRef(script_id=2001, miner_fk=3001),
         screener_task_ids=[101, 102],
         task_repeats={101: 1, 102: 1},
+        baseline_weighted_by_task_attempt={
+            (101, 1, "swebench_verified"): 150.0,
+            (102, 1, "swebench_verified"): 120.0,
+        },
+        screening_by_task_attempt={
+            (101, 1, "swebench_verified"): (True, now, 100.0),
+            (102, 1, "swebench_verified"): (True, now, 80.0),
+        },
     )
 
     assert (complete, passed) == (True, True)
@@ -295,21 +324,6 @@ async def test_evaluate_screening_fails_when_weighted_token_saving_is_below_thre
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime.now(timezone.utc)
-    db = AsyncMock()
-    db.execute = AsyncMock(
-        side_effect=[
-            _ExecuteResult(
-                all_rows=[
-                    (101, 1, True, now, None, 95, 0, 0),
-                ]
-            ),
-            _ExecuteResult(
-                all_rows=[
-                    (101, 1, None, 100, 0, 0),
-                ]
-            ),
-        ]
-    )
 
     monkeypatch.setattr(orchestrator.settings, "swebench_screening_pass_ratio", 1.0, raising=False)
     monkeypatch.setattr(orchestrator.settings, "swebench_screening_min_passed_tasks", 1, raising=False)
@@ -321,10 +335,14 @@ async def test_evaluate_screening_fails_when_weighted_token_saving_is_below_thre
     )
 
     complete, passed = await orchestrator._evaluate_screening_for_script(
-        db,
-        script=orchestrator._ScriptRef(script_id=2002, miner_fk=3002),
         screener_task_ids=[101],
         task_repeats={101: 1},
+        baseline_weighted_by_task_attempt={
+            (101, 1, "swebench_verified"): 100.0,
+        },
+        screening_by_task_attempt={
+            (101, 1, "swebench_verified"): (True, now, 95.0),
+        },
     )
 
     assert (complete, passed) == (True, False)
