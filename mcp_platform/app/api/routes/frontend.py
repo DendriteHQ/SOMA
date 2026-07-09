@@ -1990,6 +1990,7 @@ async def _build_swe_status_overrides(
             {
                 "has_dispatched_screener": False,
                 "has_dispatched_non_screener": False,
+                "has_scored_non_screener": False,
                 "scored_run_ids": set(),
                 "screener_states": {},
             },
@@ -2004,6 +2005,8 @@ async def _build_swe_status_overrides(
             scored_ids = stats["scored_run_ids"]
             if isinstance(scored_ids, set):
                 scored_ids.add(int(row.run_id))
+            if not is_screener:
+                stats["has_scored_non_screener"] = True
         if is_screener:
             states = stats["screener_states"]
             if isinstance(states, dict):
@@ -2028,6 +2031,7 @@ async def _build_swe_status_overrides(
             {
                 "has_dispatched_screener": False,
                 "has_dispatched_non_screener": False,
+                "has_scored_non_screener": False,
                 "scored_run_ids": set(),
                 "screener_states": {},
             },
@@ -2098,8 +2102,10 @@ async def _build_swe_status_overrides(
 
         has_dispatched_non_screener = bool(pair_stats["has_dispatched_non_screener"])
         has_dispatched_screener = bool(pair_stats["has_dispatched_screener"])
+        has_scored_non_screener = bool(pair_stats["has_scored_non_screener"])
 
-        if fully_scored:
+        # Quick guard: prevent screener-only completion from showing as "scored".
+        if fully_scored and has_scored_non_screener:
             status_by_hotkey[ss58] = "scored"
         elif has_dispatched_non_screener:
             status_by_hotkey[ss58] = "evaluating"
