@@ -415,6 +415,15 @@ def _get_miner_download_timeout() -> float:
     return max(1.0, timeout_seconds)
 
 
+def _get_agent_timeout_grace_seconds() -> float:
+    raw_grace = os.getenv("COMPACT_BENCH_AGENT_TIMEOUT_GRACE_SECONDS", "120").strip()
+    try:
+        grace_seconds = float(raw_grace)
+    except ValueError:
+        grace_seconds = 120.0
+    return max(0.0, grace_seconds)
+
+
 def _copy_plugin_template_checkout(*, template_path: Path, plugin_path: Path) -> None:
     """Deprecated: use CompactBenchExecutor._write_plugin_template() instead."""
     for child in template_path.iterdir():
@@ -917,8 +926,15 @@ class CompactBenchExecutor:
                     miner_module_path,
                 )
             effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
-            timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
-            openclaw_agent_timeout_seconds = int(timeout) if timeout is not None else None
+            agent_timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
+            openclaw_agent_timeout_seconds = int(agent_timeout) if agent_timeout is not None else None
+            timeout = agent_timeout
+            if agent_timeout is not None and task.agent_name != "openclaw":
+                # The copilot backend enforces the agent timeout itself (via
+                # SOMA_COPILOT_AGENT_TIMEOUT_SECONDS below) and needs extra time afterwards
+                # to collect proxy token usage and write the result row to output.jsonl;
+                # the outer kill is a backstop and must not race that graceful shutdown.
+                timeout = agent_timeout + _get_agent_timeout_grace_seconds()
 
             command = self._build_command(
                 task=task,
@@ -927,6 +943,8 @@ class CompactBenchExecutor:
                 openclaw_agent_timeout_seconds=openclaw_agent_timeout_seconds,
             )
             env = os.environ.copy()
+            if agent_timeout is not None and task.agent_name != "openclaw":
+                env["SOMA_COPILOT_AGENT_TIMEOUT_SECONDS"] = str(int(agent_timeout))
             copilot_compression_handle: CopilotCompressionHandle | None = None
             llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
             proxy_handle: NginxProxyHandle | None = None
@@ -998,7 +1016,36 @@ class CompactBenchExecutor:
                     duration,
                     timeout,
                 )
+                # Best-effort token collection: the agent may have written (part of) the
+                # result row before the SIGKILL, or its own internal timeout fired first.
+                total_tokens = input_tokens = cached_input_tokens = output_tokens = agent_steps = None
+                row_metadata: dict[str, Any] = {}
+                try:
+                    row = self._read_result_row(output_dir)
+                    row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                    total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps = (
+                        self._extract_execution_metrics(row=row, metadata=row_metadata)
+                    )
+                except Exception as metrics_exc:
+                    logger.warning(
+                        "Could not extract execution metrics after timeout: run_id=%s error=%s",
+                        task.run_id,
+                        metrics_exc,
+                    )
+                logger.info(
+                    (
+                        "Benchmark timeout metrics collected: run_id=%s "
+                        "total_tokens=%s input_tokens=%s cached_input_tokens=%s output_tokens=%s agent_steps=%s"
+                    ),
+                    task.run_id,
+                    total_tokens,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    agent_steps,
+                )
                 metadata = dict(task.metadata)
+                metadata.update(row_metadata)
                 metadata.update(
                     {
                         "benchmark": task.benchmark,
@@ -1006,6 +1053,10 @@ class CompactBenchExecutor:
                         "status": "timeout",
                         "command": shlex.join(command),
                         "output_dir": str(output_dir),
+                        "total_tokens": total_tokens,
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": cached_input_tokens,
+                        "output_tokens": output_tokens,
                     }
                 )
                 report = CompactBenchReportRequest(
@@ -1013,8 +1064,11 @@ class CompactBenchExecutor:
                     ok_status=False,
                     error=str(exc),
                     execution_time_seconds=duration,
-                    total_tokens=None,
-                    agent_steps=None,
+                    total_tokens=total_tokens,
+                    input_tokens=input_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    output_tokens=output_tokens,
+                    agent_steps=agent_steps,
                     patch_capture_status=False,
                     patch_diff=None,
                     metadata=metadata,
