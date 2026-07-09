@@ -413,6 +413,16 @@ async def _seed_runs_for_competition(
         )
 
     scripts = await _load_latest_scripts_for_competition(db, competition_id)
+    screening_rows_by_script: dict[
+        tuple[int, int],
+        dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]],
+    ] = {}
+    if in_eval_window and screener_task_ids and scripts:
+        screening_rows_by_script = await _load_screening_miner_states_for_scripts(
+            db,
+            scripts=scripts,
+            screener_task_ids=screener_task_ids,
+        )
     for script in scripts:
         created += await _seed_script_runs(
             db,
@@ -423,6 +433,10 @@ async def _seed_runs_for_competition(
             seed_screener_runs=screener_baseline_complete,
             allow_full_runs=in_eval_window,
             baseline_weighted_by_task_attempt=baseline_weighted_by_task_attempt,
+            screening_by_task_attempt=screening_rows_by_script.get(
+                (script.script_id, script.miner_fk),
+                {},
+            ),
             now=now,
         )
 
@@ -584,6 +598,75 @@ async def _load_screening_baseline_weighted_tokens(
     return baseline_weighted_by_task_attempt
 
 
+async def _load_screening_miner_states_for_scripts(
+    db: AsyncSession,
+    *,
+    scripts: list[_ScriptRef],
+    screener_task_ids: list[int],
+) -> dict[tuple[int, int], dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]]]:
+    if not scripts or not screener_task_ids:
+        return {}
+
+    input_tokens_col = _model_attr(SweBenchRun, "input_tokens")
+    cached_input_tokens_col = _model_attr(SweBenchRun, "cached_input_tokens")
+    output_tokens_col = _model_attr(SweBenchRun, "output_tokens")
+
+    script_ids = [int(script.script_id) for script in scripts]
+    miner_ids = [int(script.miner_fk) for script in scripts]
+
+    rows = (
+        await db.execute(
+            select(
+                SweBenchRun.script_fk,
+                SweBenchRun.miner_fk,
+                SweBenchRun.task_fk,
+                SweBenchRun.attempt_no,
+                SweBenchRun.benchmark_type,
+                SweBenchVerifiedValidation.resolved.label("resolved"),
+                SweBenchRunValidation.scored_at,
+                SweBenchRun.tokens_used,
+                (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
+                (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
+                (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
+            )
+            .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
+            .outerjoin(
+                SweBenchVerifiedValidation,
+                SweBenchVerifiedValidation.validation_fk == SweBenchRunValidation.id,
+            )
+            .where(SweBenchRun.baseline_run.is_(False))
+            .where(SweBenchRun.benchmark_type.in_(_SCREENING_BENCHMARK_TYPES))
+            .where(SweBenchRun.task_fk.in_(screener_task_ids))
+            .where(SweBenchRun.script_fk.in_(script_ids))
+            .where(SweBenchRun.miner_fk.in_(miner_ids))
+        )
+    ).all()
+
+    by_script: dict[
+        tuple[int, int],
+        dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]],
+    ] = {}
+    for row in rows:
+        script_fk = _coerce_optional_int(row[0])
+        miner_fk = _coerce_optional_int(row[1])
+        if script_fk is None or miner_fk is None:
+            continue
+        script_key = (script_fk, miner_fk)
+        if script_key not in by_script:
+            by_script[script_key] = {}
+        by_script[script_key][(int(row[2]), int(row[3]), str(row[4]))] = (
+            row[5],
+            row[6],
+            _weighted_tokens_for_screening(
+                total_tokens=_coerce_optional_int(row[7]),
+                input_tokens=_coerce_optional_int(row[8]),
+                cached_input_tokens=_coerce_optional_int(row[9]),
+                output_tokens=_coerce_optional_int(row[10]),
+            ),
+        )
+    return by_script
+
+
 async def _seed_script_runs(
     db: AsyncSession,
     *,
@@ -594,6 +677,7 @@ async def _seed_script_runs(
     seed_screener_runs: bool,
     allow_full_runs: bool,
     baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None],
+    screening_by_task_attempt: dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]],
     now: datetime,
 ) -> int:
     created = 0
@@ -614,11 +698,10 @@ async def _seed_script_runs(
         return created
 
     screening_complete, screening_passed = await _evaluate_screening_for_script(
-        db,
-        script=script,
         screener_task_ids=screener_task_ids,
         task_repeats=task_repeats,
         baseline_weighted_by_task_attempt=baseline_weighted_by_task_attempt,
+        screening_by_task_attempt=screening_by_task_attempt,
     )
 
     if not screening_complete or not screening_passed:
@@ -683,58 +766,14 @@ async def _seed_script_task_subset(
 
 
 async def _evaluate_screening_for_script(
-    db: AsyncSession,
     *,
-    script: _ScriptRef,
     screener_task_ids: list[int],
     task_repeats: dict[int, int],
     baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None],
+    screening_by_task_attempt: dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]],
 ) -> tuple[bool, bool]:
     if not screener_task_ids:
         return True, True
-
-    input_tokens_col = _model_attr(SweBenchRun, "input_tokens")
-    cached_input_tokens_col = _model_attr(SweBenchRun, "cached_input_tokens")
-    output_tokens_col = _model_attr(SweBenchRun, "output_tokens")
-
-    rows = (
-        await db.execute(
-            select(
-                SweBenchRun.task_fk,
-                SweBenchRun.attempt_no,
-                SweBenchRun.benchmark_type,
-                SweBenchVerifiedValidation.resolved.label("resolved"),
-                SweBenchRunValidation.scored_at,
-                SweBenchRun.tokens_used,
-                (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
-                (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
-                (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
-            )
-            .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
-            .outerjoin(
-                SweBenchVerifiedValidation,
-                SweBenchVerifiedValidation.validation_fk == SweBenchRunValidation.id,
-            )
-            .where(SweBenchRun.baseline_run.is_(False))
-            .where(SweBenchRun.script_fk == script.script_id)
-            .where(SweBenchRun.miner_fk == script.miner_fk)
-            .where(SweBenchRun.benchmark_type.in_(_SCREENING_BENCHMARK_TYPES))
-            .where(SweBenchRun.task_fk.in_(screener_task_ids))
-        )
-    ).all()
-
-    by_task_attempt: dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]] = {}
-    for row in rows:
-        by_task_attempt[(int(row[0]), int(row[1]), str(row[2]))] = (
-            row[3],
-            row[4],
-            _weighted_tokens_for_screening(
-                total_tokens=_coerce_optional_int(row[5]),
-                input_tokens=_coerce_optional_int(row[6]),
-                cached_input_tokens=_coerce_optional_int(row[7]),
-                output_tokens=_coerce_optional_int(row[8]),
-            ),
-        )
 
     passed_task_count = 0
     miner_weighted_total = 0.0
@@ -744,7 +783,7 @@ async def _evaluate_screening_for_script(
         attempt_resolved: list[bool] = []
         for attempt_no in range(1, repeats + 1):
             for benchmark_type in _SCREENING_BENCHMARK_TYPES:
-                state = by_task_attempt.get((int(task_id), attempt_no, benchmark_type))
+                state = screening_by_task_attempt.get((int(task_id), attempt_no, benchmark_type))
                 if state is None:
                     return False, False
                 resolved_value, scored_at, miner_weighted_tokens = state

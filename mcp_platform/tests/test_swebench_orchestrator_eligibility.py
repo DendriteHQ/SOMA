@@ -152,6 +152,11 @@ async def test_seed_upload_phase_seeds_screener_baseline_and_screening_runs_only
         "_load_screening_baseline_weighted_tokens",
         AsyncMock(return_value={(1, 1, "swebench_verified"): 100.0}),
     )
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_screening_miner_states_for_scripts",
+        AsyncMock(return_value={(501, 11): {(1, 1, "swebench_verified"): (True, now, 90.0)}}),
+    )
     monkeypatch.setattr(orchestrator, "_seed_script_runs", seed_script_runs_mock)
 
     created = await orchestrator._seed_runs_for_competition(
@@ -239,6 +244,11 @@ async def test_seed_eval_window_seeds_full_baseline_and_allows_full_runs(
         "_load_screening_baseline_weighted_tokens",
         AsyncMock(return_value={(1, 1, "swebench_verified"): 100.0}),
     )
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_screening_miner_states_for_scripts",
+        AsyncMock(return_value={(501, 11): {(1, 1, "swebench_verified"): (True, now, 90.0)}}),
+    )
     monkeypatch.setattr(orchestrator, "_seed_script_runs", seed_script_runs_mock)
 
     created = await orchestrator._seed_runs_for_competition(
@@ -256,6 +266,7 @@ async def test_seed_eval_window_seeds_full_baseline_and_allows_full_runs(
     script_kwargs = seed_script_runs_mock.await_args_list[0].kwargs
     assert script_kwargs["seed_screener_runs"] is True
     assert script_kwargs["allow_full_runs"] is True
+    assert script_kwargs["screening_by_task_attempt"] == {(1, 1, "swebench_verified"): (True, now, 90.0)}
 
 
 @pytest.mark.asyncio
@@ -263,17 +274,6 @@ async def test_evaluate_screening_passes_with_weighted_token_saving_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime.now(timezone.utc)
-    db = AsyncMock()
-    db.execute = AsyncMock(
-        side_effect=[
-            _ExecuteResult(
-                all_rows=[
-                    (101, 1, "swebench_verified", True, now, None, 100, 300, 10),
-                    (102, 1, "swebench_verified", True, now, None, 80, 60, 10),
-                ]
-            ),
-        ]
-    )
 
     monkeypatch.setattr(orchestrator.settings, "swebench_screening_pass_ratio", 1.0, raising=False)
     monkeypatch.setattr(orchestrator.settings, "swebench_screening_min_passed_tasks", 0, raising=False)
@@ -285,13 +285,15 @@ async def test_evaluate_screening_passes_with_weighted_token_saving_threshold(
     )
 
     complete, passed = await orchestrator._evaluate_screening_for_script(
-        db,
-        script=orchestrator._ScriptRef(script_id=2001, miner_fk=3001),
         screener_task_ids=[101, 102],
         task_repeats={101: 1, 102: 1},
         baseline_weighted_by_task_attempt={
             (101, 1, "swebench_verified"): 150.0,
             (102, 1, "swebench_verified"): 120.0,
+        },
+        screening_by_task_attempt={
+            (101, 1, "swebench_verified"): (True, now, 100.0),
+            (102, 1, "swebench_verified"): (True, now, 80.0),
         },
     )
 
@@ -303,16 +305,6 @@ async def test_evaluate_screening_fails_when_weighted_token_saving_is_below_thre
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime.now(timezone.utc)
-    db = AsyncMock()
-    db.execute = AsyncMock(
-        side_effect=[
-            _ExecuteResult(
-                all_rows=[
-                    (101, 1, "swebench_verified", True, now, None, 95, 0, 0),
-                ]
-            ),
-        ]
-    )
 
     monkeypatch.setattr(orchestrator.settings, "swebench_screening_pass_ratio", 1.0, raising=False)
     monkeypatch.setattr(orchestrator.settings, "swebench_screening_min_passed_tasks", 1, raising=False)
@@ -324,12 +316,13 @@ async def test_evaluate_screening_fails_when_weighted_token_saving_is_below_thre
     )
 
     complete, passed = await orchestrator._evaluate_screening_for_script(
-        db,
-        script=orchestrator._ScriptRef(script_id=2002, miner_fk=3002),
         screener_task_ids=[101],
         task_repeats={101: 1},
         baseline_weighted_by_task_attempt={
             (101, 1, "swebench_verified"): 100.0,
+        },
+        screening_by_task_attempt={
+            (101, 1, "swebench_verified"): (True, now, 95.0),
         },
     )
 
