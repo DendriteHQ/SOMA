@@ -1141,6 +1141,18 @@ class CompactBenchExecutor:
                 self._stop_copilot_run_compression_service(copilot_compression_handle)
             if task.agent_name != "openclaw":
                 self._cleanup_copilot_run_resources(run_id=task.run_id, output_dir=output_dir)
+            if 'tmp_run_dir' in locals() and tmp_run_dir:
+                # tmp_run_dir is the copilot backend's own run directory (holds the workspace
+                # snapshot used above to read the explore result) - it lives outside output_dir
+                # under soma-benchmark-copilot-runs and is otherwise never cleaned up.
+                if self._debug_preserve_outputs:
+                    logger.info(
+                        "Keeping copilot run directory for debug inspection: run_id=%s tmp_run_dir=%s",
+                        task.run_id,
+                        tmp_run_dir,
+                    )
+                else:
+                    shutil.rmtree(Path(tmp_run_dir).parent, ignore_errors=True)
             if self._debug_preserve_outputs:
                 logger.info(
                     "Keeping benchmark output directory for debug inspection: run_id=%s output_dir=%s",
