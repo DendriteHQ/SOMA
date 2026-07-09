@@ -68,6 +68,42 @@ EXPLORE_QUALITY_DELTA = 0.20
 EXPLORE_SCORE_FLOOR = -2.0
 
 
+def _normalize_explore_score(score: float | None) -> float | None:
+    """Normalize an explore score to [-1, 1].
+
+    compute_explore_task_score returns gate * tau with gate in [0, 1] and tau
+    clamped to [-2, 2] (or the floor itself), so the raw aggregate produced
+    by compute_explore_miner_total_score always lives in the symmetric range
+    [-2, 2]. That makes normalization a simple halving; the clamp is just a
+    safety net against floating point drift.
+    """
+    if score is None:
+        return None
+    return max(-1.0, min(1.0, score / 2.0))
+
+
+def _normalize_to_unit_interval(
+    score: float | None,
+    score_min: float,
+    score_max: float,
+) -> float | None:
+    """Linearly rescale ``score`` from ``[score_min, score_max]`` to ``[-1, 1]``.
+
+    The input is clamped to ``[score_min, score_max]`` first, so the output
+    is always within ``[-1, 1]`` even if ``score`` slightly exceeds the
+    expected range (e.g. due to floating point drift). ``None`` passes
+    through unchanged.
+    """
+    if score is None:
+        return None
+    if score_max <= score_min:
+        return 0.0
+
+    clamped = max(score_min, min(score_max, score))
+    span = score_max - score_min
+    return ((clamped - score_min) / span) * 2.0 - 1.0
+
+
 def compute_explore_task_score(
     miner_quality: float | None,
     baseline_quality: float | None,
@@ -118,6 +154,9 @@ def compute_explore_miner_total_score(
     total token usage are worse than baseline; otherwise blends the average
     per-task score toward the floor based on overall token savings, saturating
     once total savings reach +/-20%.
+
+    The raw aggregate lives in [-2, 2]; the value returned here is
+    normalized to [-1, 1] (a straight halving).
     """
     if not task_scores:
         return None
@@ -125,17 +164,19 @@ def compute_explore_miner_total_score(
     p_avg = sum(task_scores) / len(task_scores)
 
     if total_miner_weighted_tokens is None or total_baseline_weighted_tokens is None or total_baseline_weighted_tokens <= 0:
-        return p_avg
+        raw_score = p_avg
+    else:
+        margin_agg = sum(task_margins) / len(task_margins) if task_margins else None
+        s_ratio = 1.0 - (total_miner_weighted_tokens / total_baseline_weighted_tokens)
 
-    margin_agg = sum(task_margins) / len(task_margins) if task_margins else None
-    s_ratio = 1.0 - (total_miner_weighted_tokens / total_baseline_weighted_tokens)
+        if margin_agg is not None and margin_agg < 0 and s_ratio < 0:
+            raw_score = floor
+        else:
+            r = max(0.0, min(1.0, (s_ratio + 0.20) / 0.40))
+            m = (3 * r**2) - (2 * r**3)
+            raw_score = (m * p_avg) + ((1 - m) * floor)
 
-    if margin_agg is not None and margin_agg < 0 and s_ratio < 0:
-        return floor
-
-    r = max(0.0, min(1.0, (s_ratio + 0.20) / 0.40))
-    m = (3 * r**2) - (2 * r**3)
-    return (m * p_avg) + ((1 - m) * floor)
+    return _normalize_explore_score(raw_score)
 
 
 def _summarize_baseline_pass(baseline_runs: dict[int, dict[str, object]]) -> bool | None:
@@ -286,6 +327,9 @@ SCORING_R_MAX = 2.0
 SCORING_BONUS_CAP = 3.0       
 SCORING_PENALTY_FLOOR = -4.0  
 SCORING_PENALTY_CEIL = -2.0
+
+SWE_SCORE_MIN = SCORING_PENALTY_FLOOR
+SWE_SCORE_MAX = SCORING_BONUS_CAP
 
 
 def _compression_ratio(
@@ -510,11 +554,16 @@ def build_swe_miner_total_score(
     """Convenience wrapper mirroring build_swe_miner_scores's shape: returns
     the single combined new-scoring total (main_score + hard_boost) alongside
     the per-task breakdown.
+
+    The raw total (main_score + hard_boost) is clamped to
+    [SWE_SCORE_MIN, SWE_SCORE_MAX] and then linearly normalized to [-1, 1].
     """
     main_score, hard_boost, task_scores = build_swe_miner_scores(task_groups)
     if main_score is None or hard_boost is None:
         return None, task_scores
-    return main_score + hard_boost, task_scores
+    raw_score = main_score + hard_boost
+    normalized_score = _normalize_to_unit_interval(raw_score, SWE_SCORE_MIN, SWE_SCORE_MAX)
+    return normalized_score, task_scores
 
 
 def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultItem:
