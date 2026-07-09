@@ -1,150 +1,178 @@
 # SWE Scoring
 
-This document explains how SWE miner scores are computed. This logic is implemented in `mcp_platform/app/api/routes/scoring.py`.
+This document describes the current SWE scoring logic implemented in
+`mcp_platform/app/api/routes/scoring.py`.
 
-The scoring has two layers:
+## Task types and scoring paths
 
-1. A raw score is computed from the current run-vs-baseline formula.
-2. The final total score adds one extra multiplier based on total token savings.
+There are three benchmark task types:
+
+1. `swebench_verified`
+2. `swe_explorer_edit`
+3. `swe_explorer_explore`
+
+Scoring is split into two paths:
+
+- `swebench_verified` and `swe_explorer_edit` use the same SWE task-score path
+  (`compute_swe_task_score`, `build_swe_miner_scores`, `build_swe_miner_total_score`).
+- `swe_explorer_explore` uses a different explore-quality path
+  (`compute_explore_task_score`, `compute_explore_miner_total_score`).
 
 ## Token counting
 
-Token counts ($Tok_A$ and $Tok_B$) are computed as weighted totals using the token-type breakdown:
+Token totals are weighted from token-type breakdown:
 
 $$
 Tok = w_{\text{input}} \cdot T_{\text{input}} + w_{\text{cached}} \cdot T_{\text{cached}} + w_{\text{output}} \cdot T_{\text{output}}
 $$
 
-where the default weights are:
+Default weights:
 
 | Token type | Weight |
 |---|---|
 | Input (non-cached) | $1.0$ |
-| Cached input | $\frac{1}{3}$ |
+| Cached input | $\frac{1}{10}$ |
 | Output | $3.0$ |
 
-Cached tokens count less. Output tokens count more.
+Current behavior of `compute_weighted_tokens`:
+- requires `input_tokens` and `output_tokens`,
+- treats missing `cached_input_tokens` as `0`,
+- returns `None` for missing required values or negative values.
 
-## 1. Raw Run Score
+## SWE Path (`swebench_verified` + `swe_explorer_edit`)
 
-1. Every miner run is compared against baseline runs of the same task. Each comparison uses:
+### Per-task scoring inputs
 
-$$
-Score(T_{type}) + \lambda(T_{type}) \cdot Trim\left(\text{ln}\left(\frac{Tok_B}{Tok_A}\right), -2, 2\right)
-$$
+For each task:
+- $x$: number of resolved baseline runs (resolved baselines only),
+- $y$: number of resolved miner runs,
+- $Tok_B$: average weighted baseline tokens across resolved baseline runs,
+- $Tok_A$: average weighted miner tokens across miner runs with valid weighted token counts.
 
-where:
-
-- $Tok_B$ is the weighted token total for the baseline run,
-- $Tok_A$ is the weighted token total for the miner run,
-- $Trim(x, -2, 2)$ keeps $x$ in the interval $[-2, 2]$.
-
-2. If either token count is missing, non-positive, or otherwise invalid, the token component is treated as `0`.
-
-3. The base score and the coefficient $\lambda$ depend on the pass/fail outcome
-of the baseline run and the miner run:
-
-Case A: the baseline run passes and the miner run passes.
+Compression ratio term:
 
 $$
-Score(T_{type}) = 1.0, \qquad \lambda(T_{type}) = 0.5
+r = \text{clamp}\left(\ln\left(\frac{Tok_B}{Tok_A}\right), -2, 2\right)
 $$
 
-Case B: the baseline run passes and the miner run fails.
+If token inputs are invalid, $r=0$.
+
+Penalty threshold:
 
 $$
-Score(T_{type}) = -4.0, \qquad \lambda(T_{type}) = 0.0
+t = \lfloor 0.8x \rfloor
 $$
 
-Case C: the baseline run fails and the miner run passes.
+### Per-task score (`compute_swe_task_score`)
+
+Constants:
+- bonus cap: `3.0`,
+- penalty floor: `-4.0`,
+- penalty ceiling: `-2.0`.
+
+### 1) Hard tasks (`x <= 1`)
+
+- If `y == 0`: task is excluded (`score=None`, `pool=excluded`).
+- Else if `x == 1 and y == 1`: `score = r` (maintain zone).
+- Else: bonus path
 
 $$
-Score(T_{type}) = 2.0, \qquad \lambda(T_{type}) = 0.5
+score = \text{clamp}\left(r + \frac{y-x}{5-x}, -2, 3\right)
 $$
 
-Case D: the baseline run fails and the miner run fails.
+These tasks go to `pool=hard_boost`, with contribution:
 
 $$
-Score(T_{type}) = 0.0, \qquad \lambda(T_{type}) = 0.1
+\text{hard\_boost\_contribution} = \max(0, score)
 $$
 
-4. If either the baseline validation result or the miner validation result is unknown, that baseline-miner comparison does not contribute to the score.
+### 2) Standard tasks (`x >= 2`)
 
-5. A miner run may be compared against multiple baseline variants of the same task. In that case, the miner run score is the arithmetic average of all valid baseline-miner comparison scores for that run:
-
-$$
-RunScore(r)=\frac{1}{N_r}\sum_{i=1}^{N_r}PairScore(r, b_i)
-$$
-
-where $N_r$ is the number of valid baseline comparisons for run $r$.
-
-6. Each task may contain multiple miner runs. The task score is the arithmetic average of all valid run scores for that task:
+- If `y < t`: penalty zone
 
 $$
-TaskScore(t)=\frac{1}{M_t}\sum_{j=1}^{M_t}RunScore(r_j)
+score = \text{clamp}\left(-2 - 2\left(1 - \frac{y}{t}\right), -4, -2\right)
 $$
 
-where $M_t$ is the number of scored miner runs for task $t$.
-
-7. The miner raw total score is the arithmetic average of all valid run scores across all tasks, including screener tasks:
-
-$$
-RawTotalScore(m)=\frac{1}{K_m}\sum_{r \in AllRuns(m)}RunScore(r)
-$$
-
-where $K_m$ is the number of all scored runs of miner $m$.
-
-8. The miner raw screener score is computed separately, using only screener tasks:
+- Else if `y <= x`: maintain zone, `score = r`.
+- Else (`y > x`): bonus zone
 
 $$
-RawScreenerScore(m)=\frac{1}{S_m}\sum_{r \in ScreenerRuns(m)}RunScore(r)
+score = \text{clamp}\left(r + \frac{y-x}{5-x}, -2, 3\right)
 $$
 
-where $S_m$ is the number of scored screener runs of miner $m$.
+These tasks go to `pool=main`.
 
-## 2. Miner-Level Token Savings Multiplier
+### Miner aggregation (`build_swe_miner_scores`)
 
-1. After the raw total score is computed, one extra multiplier is applied from the miner's total token usage across the whole dataset. This is meant to penalize miners who do not compress, or who use more tokens than the baseline:
+Given all task scores for a miner:
 
-$$
-s = 1 - \frac{Tok_C}{Tok_B}
-$$
-
-where:
-
-- $Tok_C$ is the total weighted tokens over all compressed runs by that miner,
-- $Tok_B$ is the total weighted tokens over all baseline runs for the same miner dataset slice.
-
-2. The savings ratio is then normalized and clamped:
+1. `main_score` is weighted average over `pool=main` tasks:
 
 $$
-x = \min\left(1, \max\left(\frac{s + 0.20}{0.40}, 0\right)\right)
+main\_score = \frac{\sum score_i \cdot x_i^{1/3}}{\sum x_i^{1/3}}
 $$
 
-3. The smooth multiplier is:
+If there are no main tasks, `main_score = 0`.
+
+2. `hard_boost` is average hard contribution over total scored tasks:
 
 $$
-m(s) = -2x^3 + 3x^2
+hard\_boost = \frac{\sum \text{hard\_boost\_contribution}}{\#main\_tasks + \#hard\_boost\_tasks}
 $$
 
-4. This means:
+If there are no hard-boost contributions, `hard_boost = 0`.
 
-- if the miner saves at least $20\%$, then $m(s)=1$ and the raw total score stays the same,
-- if the miner increases token usage by at least $20\%$, then $m(s)=0$ and the final score becomes $-4$,
-- between those points, the score is adjusted smoothly toward $-4$.
-
-5. The final total score is:
+3. Raw miner total:
 
 $$
-FinalTotalScore(m) = -4 + (RawTotalScore(m) + 4) \cdot m(s)
+raw\_total = main\_score + hard\_boost
 $$
 
-6. The screener score is not changed by this penalty. Screener tasks still count inside $RawTotalScore(m)$, but the separate screener score remains:
+### Final normalized score (`build_swe_miner_total_score`)
+
+Raw total is clamped to range:
 
 $$
-ScreenerScore(m) = RawScreenerScore(m)
+[-4, 3]
 $$
 
-7. If the token totals are missing or invalid, the multiplier is $1$, so the raw total score stays unchanged.
+then linearly normalized to:
 
-7. If the weighted token totals are missing or invalid, the multiplier is $1$, so the raw total score stays unchanged.
+$$
+[-1, 1]
+$$
+
+This normalized value is what downstream category/leaderboard scoring consumes.
+
+## Explore Path (`swe_explorer_explore`)
+
+Explore uses a different objective: preserve exploration quality while reducing
+weighted tokens.
+
+Per task (`compute_explore_task_score`):
+
+- Quality margin:
+
+$$
+margin = miner\_quality - baseline\_quality
+$$
+
+where quality is `(hit_file_rate - noise_file_rate)`.
+
+- If `margin <= -delta` (`delta=0.20`), score is hard floor `-2.0`.
+- Otherwise, a smooth quality gate in `[0,1]` is applied, then multiplied by
+  token term:
+
+$$
+\tau = \text{clamp}\left(2\log_2\left(\frac{Tok_B}{Tok_A}\right), -2, 2\right)
+$$
+
+so per-task score is `gate * tau`.
+
+Miner aggregate (`compute_explore_miner_total_score`):
+
+- Starts from mean of per-task scores,
+- mixes toward floor based on total token savings ratio (with saturation at
+  `±20%`),
+- then normalizes to `[-1,1]`.
