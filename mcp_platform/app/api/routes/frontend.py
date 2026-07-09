@@ -83,9 +83,8 @@ from app.db.views import (
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.api.routes.scoring import (
-    build_swe_miner_scores,
+    build_swe_miner_total_score,
     build_swe_category_scores,
-    build_swe_miner_penalty_summary,
     build_swe_task_groups,
     build_swe_task_result_item,
     compute_weighted_tokens,
@@ -1534,7 +1533,7 @@ async def _build_swe_miners_snapshot(
     miners_by_hotkey: dict[str, SweMinerSnapshotItem] = {}
     for hotkey, task_rows in miner_rows.items():
         task_groups = build_swe_task_groups(task_rows)
-        total_score, _ = build_swe_miner_scores(task_groups)
+        total_score, _ = build_swe_miner_total_score(task_groups)
         category_scores = _clean_swe_category_scores(
             build_swe_category_scores(task_groups, task_categories)
         )
@@ -2535,21 +2534,7 @@ async def _get_competition_aggregate_impl(
 
         miner_rows = rows_snapshot.rows_by_hotkey.get(hotkey, [])
         task_groups = build_swe_task_groups(miner_rows)
-        penalties_data = build_swe_miner_penalty_summary(
-            task_groups,
-            rows_snapshot.task_categories,
-        )
-        penalties_categories_raw = penalties_data.get("categories")
         penalties_categories: dict[str, float | None] = {}
-        if isinstance(penalties_categories_raw, dict):
-            penalties_categories = {
-                str(category): (
-                    float(value)
-                    if value is not None
-                    else None
-                )
-                for category, value in penalties_categories_raw.items()
-            }
 
         task_aggregate_items: list[SweMinerTaskAggregateItem] = []
         miner_baseline_weighted_total = 0.0
@@ -2733,11 +2718,7 @@ async def _get_competition_aggregate_impl(
                 rank=rank_by_hotkey.get(hotkey),
                 penalties=SweMinerPenaltySummary(
                     categories=penalties_categories,
-                    total=(
-                        float(penalties_data.get("total"))
-                        if penalties_data.get("total") is not None
-                        else None
-                    ),
+                    total=None,
                 ),
                 tasks=task_aggregate_items,
                 total_tasks=len(task_aggregate_items),
@@ -2967,7 +2948,7 @@ async def list_miners_by_competition(
             swe_miner_rows.setdefault(str(swe_row.hotkey), []).append(swe_row)
 
         swe_scores_by_hotkey = {
-            hotkey: build_swe_miner_scores(build_swe_task_groups(task_rows))[0]
+            hotkey: build_swe_miner_total_score(build_swe_task_groups(task_rows))[0]
             for hotkey, task_rows in swe_miner_rows.items()
         }
 
@@ -3874,12 +3855,15 @@ async def get_swe_miner_penalties(
             detail="Miner not found in this competition",
         )
 
-    task_groups = build_swe_task_groups(rows)
-    task_categories = await _fetch_swe_task_categories(db, comp_id=comp_id)
+    # New scoring folds token compression into each task's score
+    # directly instead of applying a separate global multiplier, so there is
+    # no more raw-vs-applied "penalty" to report. This endpoint is kept for
+    # backward compatibility but now always returns empty/neutral values.
     return {
         "comp_id": comp_id,
         "hotkey": hotkey,
-        **build_swe_miner_penalty_summary(task_groups, task_categories),
+        "categories": {},
+        "total": None,
     }
 
 
