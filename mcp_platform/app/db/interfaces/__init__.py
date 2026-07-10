@@ -1,7 +1,6 @@
 from .screener_eligibility import (
     compute_top_screener_limit,
     fetch_swebench_eligible_ss58_for_competition,
-    fetch_swebench_screening_passed_ss58_for_competition,
     fetch_top_screener_miner_ids_for_competition,
     fetch_top_screener_ss58_for_competition,
     get_screener_total_eligible_for_competition,
@@ -14,7 +13,6 @@ __all__ = [
     "db_query_interface",
     "discover_db_query_interfaces",
     "fetch_swebench_eligible_ss58_for_competition",
-    "fetch_swebench_screening_passed_ss58_for_competition",
     "fetch_top_screener_miner_ids_for_competition",
     "fetch_top_screener_ss58_for_competition",
     "get_screener_total_eligible_for_competition",

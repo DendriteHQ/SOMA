@@ -47,7 +47,7 @@ from app.api.routes.utils import (
 )
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.db.interfaces import fetch_swebench_screening_passed_ss58_for_competition
+from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.db.interfaces.burn_weight_queries import get_active_top_miner_rows
 from app.db.interfaces.competition_queries import (
     get_active_competition_upload_starts_at,
@@ -248,11 +248,13 @@ async def _load_top_screener_uids_for_competition(
     request_id: str | None,
     competition_id: int,
     source: str,
+    min_resolved: int,
     hotkey_to_uid: dict[str, int],
 ) -> list[int]:
-    top_hotkeys = await fetch_swebench_screening_passed_ss58_for_competition(
+    top_hotkeys = await fetch_swebench_eligible_ss58_for_competition(
         db,
         competition_id=competition_id,
+        min_resolved=min_resolved,
     )
 
     selected_uids: list[int] = []
@@ -267,7 +269,8 @@ async def _load_top_screener_uids_for_competition(
             "request_id": request_id,
             "competition_id": competition_id,
             "source": source,
-            "screening_passed_count": len(top_hotkeys),
+            "eligible_count": len(top_hotkeys),
+            "min_resolved": min_resolved,
             "selected_count": len(selected_uids),
             "selected_uids": selected_uids,
         },
@@ -316,6 +319,10 @@ async def _collect_top_screener_uids(
     active_competition_id: int,
     hotkey_to_uid: dict[str, int],
 ) -> tuple[list[int], list[int], list[int]]:
+    min_resolved = max(
+        1,
+        settings.screener_min_resolved,
+    )
     previous_competition_grace_hours = max(
         0.0,
         float(
@@ -331,6 +338,7 @@ async def _collect_top_screener_uids(
         extra={
             "request_id": request_id,
             "active_competition_id": active_competition_id,
+            "min_resolved": min_resolved,
             "previous_competition_grace_hours": previous_competition_grace_hours,
         },
     )
@@ -340,6 +348,7 @@ async def _collect_top_screener_uids(
         request_id=request_id,
         competition_id=active_competition_id,
         source="current_competition",
+        min_resolved=min_resolved,
         hotkey_to_uid=hotkey_to_uid,
     )
     previous_top_screener_miners: list[int] = []
@@ -388,6 +397,7 @@ async def _collect_top_screener_uids(
                     request_id=request_id,
                     competition_id=previous_competition_id,
                     source="previous_competition",
+                    min_resolved=min_resolved,
                     hotkey_to_uid=hotkey_to_uid,
                 )
             )
