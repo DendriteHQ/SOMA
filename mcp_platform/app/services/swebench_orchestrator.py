@@ -15,6 +15,7 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.services.blob.s3 import S3BlobStorage
 from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
+from app.services import swebench_screening as screening_shared
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
@@ -907,6 +908,25 @@ def _compute_weighted_token_savings_ratio(
     if baseline_weighted_total <= 0:
         return None
     return (baseline_weighted_total - miner_weighted_total) / baseline_weighted_total
+
+
+# Keep orchestrator and validator on the exact same screening helpers.
+_ScriptRef = screening_shared.ScriptRef
+_SCREENING_BENCHMARK_TYPES = screening_shared.SCREENING_BENCHMARK_TYPES
+_non_baseline_eligibility_sql = screening_shared.non_baseline_eligibility_sql
+_load_latest_scripts_for_competition = screening_shared.load_latest_scripts_for_competition
+_load_screening_baseline_weighted_tokens = (
+    screening_shared.load_screening_baseline_weighted_tokens
+)
+_load_screening_miner_states_for_scripts = (
+    screening_shared.load_screening_miner_states_for_scripts
+)
+_evaluate_screening_for_script = screening_shared.evaluate_screening_for_script
+_required_screening_task_passes = screening_shared.required_screening_task_passes
+_weighted_tokens_for_screening = screening_shared.weighted_tokens_for_screening
+_compute_weighted_token_savings_ratio = (
+    screening_shared.compute_weighted_token_savings_ratio
+)
 
 
 async def _create_run_and_validation(
