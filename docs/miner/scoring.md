@@ -21,17 +21,16 @@ Scoring is split into two paths:
 
 ## Token counting
 
-Token totals are calculated from the token-type breakdown using weighted token
-counts:
+Token totals are computed from a weighted token-type breakdown.
+
+Let:
+
+- `T_i` be non-cached input tokens,
+- `T_c` be cached input tokens,
+- `T_o` be output tokens.
 
 ```math
-Tok
-=
-w_{\mathrm{input}} T_{\mathrm{input}}
-+
-w_{\mathrm{cached}} T_{\mathrm{cached}}
-+
-w_{\mathrm{output}} T_{\mathrm{output}}
+T = w_i T_i + w_c T_c + w_o T_o
 ```
 
 Default weights:
@@ -39,19 +38,19 @@ Default weights:
 | Token type | Weight |
 |---|---:|
 | Input, non-cached | `1.0` |
-| Cached input | `0.1` (`1/10`) |
+| Cached input | `0.1` |
 | Output | `3.0` |
 
 Current behavior of `compute_weighted_tokens`:
 
 - `input_tokens` and `output_tokens` are required.
-- A missing `cached_input_tokens` value is treated as `0`.
-- The function returns `None` when a required value is missing or any supplied
+- Missing `cached_input_tokens` is treated as `0`.
+- The function returns `None` if a required value is missing or any supplied
   token count is negative.
 
 ## SWE path
 
-This scoring path is used for:
+This path is used for:
 
 - `swebench_verified`
 - `swe_explorer_edit`
@@ -60,26 +59,19 @@ This scoring path is used for:
 
 For each task:
 
-- $x$ is the number of resolved baseline runs. Only resolved baselines are
-  counted.
-- $y$ is the number of resolved miner runs.
-- $Tok_B$ is the average weighted token count across resolved baseline runs.
-- $Tok_A$ is the average weighted token count across miner runs that have valid
+- `x` is the number of resolved baseline runs. Only resolved baselines count.
+- `y` is the number of resolved miner runs.
+- `T_B` is the average weighted token count across resolved baseline runs.
+- `T_A` is the average weighted token count across miner runs with valid
   weighted token counts.
 
 ### Compression ratio
 
-The token-compression term is:
+The compression-ratio term is the natural logarithm of the baseline-to-miner
+weighted-token ratio, clamped to `[-2, 2]`:
 
 ```math
-r
-=
-\operatorname{clamp}
-\left(
-\ln\left(\frac{Tok_B}{Tok_A}\right),
--2,
-2
-\right)
+r = \max\left(-2,\min\left(\ln\left(\frac{T_B}{T_A}\right),2\right)\right)
 ```
 
 If the token inputs are invalid:
@@ -90,8 +82,6 @@ r = 0
 
 ### Penalty threshold
 
-The penalty threshold is:
-
 ```math
 t = \left\lfloor 0.8x \right\rfloor
 ```
@@ -99,8 +89,6 @@ t = \left\lfloor 0.8x \right\rfloor
 ### Per-task score
 
 The per-task score is calculated by `compute_swe_task_score`.
-
-Constants:
 
 | Constant | Value |
 |---|---:|
@@ -110,7 +98,7 @@ Constants:
 
 ### Hard tasks
 
-A task is considered hard when `x <= 1`.
+A task is hard when `x <= 1`.
 
 #### Excluded task
 
@@ -131,17 +119,10 @@ s = r
 
 #### Bonus zone
 
-All other non-excluded hard tasks use the bonus formula:
+All other non-excluded hard tasks use:
 
 ```math
-s
-=
-\operatorname{clamp}
-\left(
-r + \frac{y-x}{5-x},
--2,
-3
-\right)
+s = \max\left(-2,\min\left(r+\frac{y-x}{5-x},3\right)\right)
 ```
 
 Hard tasks are assigned to `pool=hard_boost`.
@@ -149,28 +130,21 @@ Hard tasks are assigned to `pool=hard_boost`.
 Their hard-boost contribution is:
 
 ```math
-h = \max(0, s)
+h = \max(0,s)
 ```
 
 Only the positive part of the hard-task score contributes to the boost.
 
 ### Standard tasks
 
-A task is considered standard when `x >= 2`.
+A task is standard when `x >= 2`.
 
 #### Penalty zone
 
 If `y < t`:
 
 ```math
-s
-=
-\operatorname{clamp}
-\left(
--2 - 2\left(1-\frac{y}{t}\right),
--4,
--2
-\right)
+s = \max\left(-4,\min\left(-2-2\left(1-\frac{y}{t}\right),-2\right)\right)
 ```
 
 #### Maintain zone
@@ -186,14 +160,7 @@ s = r
 If `y > x`:
 
 ```math
-s
-=
-\operatorname{clamp}
-\left(
-r + \frac{y-x}{5-x},
--2,
-3
-\right)
+s = \max\left(-2,\min\left(r+\frac{y-x}{5-x},3\right)\right)
 ```
 
 Standard tasks are assigned to `pool=main`.
@@ -210,97 +177,65 @@ For every task in `pool=main`, the aggregation weight is:
 w_i = x_i^{1/3}
 ```
 
-The `main_score` is the weighted average of the main-task scores:
+The `main_score` is the weighted average of main-task scores:
 
 ```math
-S_{\mathrm{main}}
-=
-\frac{
-\sum_i s_i x_i^{1/3}
-}{
-\sum_i x_i^{1/3}
-}
+S_M = \frac{\sum_i s_i x_i^{1/3}}{\sum_i x_i^{1/3}}
 ```
 
 If the miner has no tasks in `pool=main`:
 
 ```math
-S_{\mathrm{main}} = 0
+S_M = 0
 ```
 
 ### Hard boost
 
 The `hard_boost` is the sum of positive hard-task contributions divided by the
-total number of scored main and hard tasks:
+number of scored main and hard tasks:
 
 ```math
-B_{\mathrm{hard}}
-=
-\frac{
-\sum_i h_i
-}{
-N_{\mathrm{main}} + N_{\mathrm{hard}}
-}
+B_H = \frac{\sum_i h_i}{N_M+N_H}
 ```
 
 Where:
 
-- $N_{\mathrm{main}}$ is the number of tasks in `pool=main`.
-- $N_{\mathrm{hard}}$ is the number of tasks in `pool=hard_boost`.
-- $h_i$ is the hard-boost contribution for hard task $i$.
+- `N_M` is the number of tasks in `pool=main`.
+- `N_H` is the number of tasks in `pool=hard_boost`.
+- `h_i` is the hard-boost contribution of hard task `i`.
 
 If there are no hard-boost contributions:
 
 ```math
-B_{\mathrm{hard}} = 0
+B_H = 0
 ```
 
 ### Raw miner total
 
-The raw miner total is:
-
 ```math
-S_{\mathrm{raw}}
-=
-S_{\mathrm{main}}
-+
-B_{\mathrm{hard}}
+S_R = S_M + B_H
 ```
 
 ## Final normalized SWE score
 
 Final normalization is performed by `build_swe_miner_total_score`.
 
-First, the raw total is clamped to the range $[-4,3]$:
+First, the raw total is clamped to `[-4, 3]`:
 
 ```math
-S_{\mathrm{clamped}}
-=
-\operatorname{clamp}
-\left(
-S_{\mathrm{raw}},
--4,
-3
-\right)
+S_C = \max\left(-4,\min\left(S_R,3\right)\right)
 ```
 
-The clamped value is then linearly normalized from $[-4,3]$ to $[-1,1]$:
+The clamped value is then linearly normalized from `[-4, 3]` to `[-1, 1]`:
 
 ```math
-S_{\mathrm{normalized}}
-=
-2\left(
-\frac{S_{\mathrm{clamped}} + 4}{7}
-\right)
--1
+S_N = 2\left(\frac{S_C+4}{7}\right)-1
 ```
 
 Equivalently:
 
 ```math
-S_{\mathrm{normalized}}
-=
-\frac{2S_{\mathrm{clamped}} + 1}{7}
+S_N = \frac{2S_C+1}{7}
 ```
 
 This normalized value is consumed by downstream category and leaderboard
@@ -308,7 +243,7 @@ scoring.
 
 ## Explore path
 
-This scoring path is used for:
+This path is used for:
 
 - `swe_explorer_explore`
 
@@ -321,26 +256,27 @@ The per-task score is calculated by `compute_explore_task_score`.
 
 ### Exploration quality
 
-Quality is defined as:
+Let:
+
+- `f` be the hit-file rate,
+- `n` be the noise-file rate.
+
+Quality is:
 
 ```math
-q
-=
-\operatorname{hitFileRate}
--
-\operatorname{noiseFileRate}
+q = f-n
 ```
 
 The quality margin is:
 
 ```math
-m = q_A - q_B
+m = q_A-q_B
 ```
 
 Where:
 
-- $q_A$ is miner quality.
-- $q_B$ is baseline quality.
+- `q_A` is miner quality.
+- `q_B` is baseline quality.
 
 The default quality threshold is:
 
@@ -350,43 +286,26 @@ The default quality threshold is:
 
 ### Hard quality floor
 
-If the quality margin is at or below the negative threshold:
+If `m <= -delta`, the task receives the hard-floor score:
 
 ```math
-m \leq -\delta
-```
-
-the task receives the hard-floor score:
-
-```math
-s_{\mathrm{explore}} = -2
+s_E = -2
 ```
 
 ### Quality-gated token score
 
-Otherwise, a smooth quality gate is calculated:
-
-```math
-g \in [0,1]
-```
+Otherwise, a smooth quality gate `g` in `[0, 1]` is applied to the token term.
 
 The token term is:
 
 ```math
-\tau
-=
-\operatorname{clamp}
-\left(
-2\log_2\left(\frac{Tok_B}{Tok_A}\right),
--2,
-2
-\right)
+\tau = \max\left(-2,\min\left(2\log_2\left(\frac{T_B}{T_A}\right),2\right)\right)
 ```
 
 The final per-task explore score is:
 
 ```math
-s_{\mathrm{explore}} = g\tau
+s_E = g\tau
 ```
 
 ## Explore miner aggregation
@@ -399,5 +318,5 @@ The aggregate:
 1. starts from the mean of the per-task explore scores,
 2. mixes that mean toward the score floor based on the total token-savings
    ratio,
-3. saturates the token-savings influence at $\pm 20\%$,
-4. normalizes the resulting score to $[-1,1]$.
+3. saturates the token-savings influence at `+/-20%`,
+4. normalizes the resulting score to `[-1, 1]`.
