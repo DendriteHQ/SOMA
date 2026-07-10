@@ -44,6 +44,23 @@ class RemoteCompactBenchManager:
         self._submission_timeout_seconds = submission_timeout_seconds
         self._default_model = (default_model or "").strip() or None
 
+    def resolve_openclaw_timeout_seconds(self, task_context: dict[str, Any] | None = None) -> int:
+        """Effective execution timeout forwarded to the sandbox for a task.
+
+        Single source of truth: also used by the orchestrator to size the expiry
+        of the presigned trajectory PUT URL, so both always stay in sync.
+        """
+        context = task_context or {}
+        if context.get("openclaw_timeout") is not None:
+            return int(context["openclaw_timeout"])
+        return int(
+            max(
+                1.0,
+                float(self._execution_timeout_seconds),
+                float(_SWEBENCH_OPENCLAW_TIMEOUT_FALLBACK_SECONDS),
+            )
+        )
+
     def _pick_sandbox_urls(self) -> list[str]:
         if not self._sandbox_service_urls:
             raise RuntimeError("No sandbox service URLs configured")
@@ -156,25 +173,20 @@ class RemoteCompactBenchManager:
         model_override = str(task_context.get("model")).strip() if task_context.get("model") else None
         model = model_override or self._default_model
 
+        trajectory_presigned_url = task_context.get("trajectory_presigned_url")
+        if trajectory_presigned_url is not None:
+            trajectory_presigned_url = str(trajectory_presigned_url).strip() or None
+
         return CompactBenchRunTaskRequest(
             benchmark=benchmark,
             instance_id=instance_id,
             run_id=run_id,
             script_presigned_url=script_presigned_url,
+            trajectory_presigned_url=trajectory_presigned_url,
             agent_name=str(task_context.get("agent_name") or "copilot").strip() or "copilot",
             benchmark_type=str(task_context.get("benchmark_type") or "swebench_verified").strip() or "swebench_verified",
             model=model,
-            openclaw_timeout=(
-                int(task_context["openclaw_timeout"])
-                if task_context.get("openclaw_timeout") is not None
-                else int(
-                    max(
-                        1.0,
-                        float(self._execution_timeout_seconds),
-                        float(_SWEBENCH_OPENCLAW_TIMEOUT_FALLBACK_SECONDS),
-                    )
-                )
-            ),
+            openclaw_timeout=self.resolve_openclaw_timeout_seconds(task_context),
             openclaw_disable_somarizer=bool(task_context.get("openclaw_disable_somarizer", False)),
             metadata=metadata,
         )
@@ -232,12 +244,15 @@ class RemoteCompactBenchManager:
         instance_id: str,
         storage_uuid: str,
         script_presigned_url: str,
+        trajectory_presigned_url: str | None = None,
         task_context: dict[str, Any] | None = None,
     ) -> tuple[bool, str | None, bool]:
         context = dict(task_context or {})
         context.setdefault("benchmark", benchmark)
         context.setdefault("instance_id", instance_id)
         context.setdefault("run_id", int(run_id))
+        if trajectory_presigned_url is not None:
+            context.setdefault("trajectory_presigned_url", trajectory_presigned_url)
         payload = self._build_task_request(
             run_id=int(run_id),
             task_context=context,

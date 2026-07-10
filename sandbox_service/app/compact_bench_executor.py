@@ -415,6 +415,29 @@ def _get_miner_download_timeout() -> float:
     return max(1.0, timeout_seconds)
 
 
+def _get_trajectory_upload_timeout() -> float:
+    raw_timeout = os.getenv("COMPACT_BENCH_TRAJECTORY_UPLOAD_TIMEOUT_SECONDS", "60").strip()
+    try:
+        timeout_seconds = float(raw_timeout)
+    except ValueError:
+        timeout_seconds = 60.0
+    return max(1.0, timeout_seconds)
+
+
+def _upload_trajectory(*, trajectory_presigned_url: str, trajectory_file: Path) -> None:
+    """Upload the trajectory JSONL to the presigned S3 PUT URL provided by the platform."""
+    payload = trajectory_file.read_bytes()
+    upload_request = urllib_request.Request(
+        trajectory_presigned_url,
+        data=payload,
+        method="PUT",
+    )
+    with urllib_request.urlopen(upload_request, timeout=_get_trajectory_upload_timeout()) as response:
+        status = getattr(response, "status", None)
+        if status is not None and not (200 <= int(status) < 300):
+            raise RuntimeError(f"Trajectory upload returned HTTP {status}")
+
+
 def _copy_plugin_template_checkout(*, template_path: Path, plugin_path: Path) -> None:
     """Deprecated: use CompactBenchExecutor._write_plugin_template() instead."""
     for child in template_path.iterdir():
@@ -1048,6 +1071,47 @@ class CompactBenchExecutor:
                     patch_capture_status = True
                     patch_text = patch_file.read_text(encoding="utf-8")
 
+            trajectory_upload_status: bool | None = None
+            if task.trajectory_presigned_url:
+                trajectory_upload_status = False
+                resolved_trajectory_path = trajectory_path
+                if not resolved_trajectory_path:
+                    # The openclaw backend reports the trajectory location inside
+                    # token_usage instead of a top-level trajectory_path.
+                    token_usage = row_metadata.get("token_usage") if isinstance(row_metadata.get("token_usage"), dict) else {}
+                    candidate = token_usage.get("trajectory_file")
+                    if isinstance(candidate, str):
+                        resolved_trajectory_path = candidate
+                trajectory_file = Path(resolved_trajectory_path) if resolved_trajectory_path else None
+                if trajectory_file is not None and trajectory_file.is_file():
+                    try:
+                        _upload_trajectory(
+                            trajectory_presigned_url=task.trajectory_presigned_url,
+                            trajectory_file=trajectory_file,
+                        )
+                        trajectory_upload_status = True
+                        logger.info(
+                            "Trajectory uploaded to S3: run_id=%s instance_id=%s trajectory_bytes=%s",
+                            task.run_id,
+                            task.instance_id,
+                            trajectory_file.stat().st_size,
+                        )
+                    except Exception as upload_error:  # noqa: BLE001
+                        logger.warning(
+                            "Trajectory upload failed: run_id=%s instance_id=%s trajectory_path=%s error=%s",
+                            task.run_id,
+                            task.instance_id,
+                            resolved_trajectory_path,
+                            upload_error,
+                        )
+                else:
+                    logger.warning(
+                        "Trajectory upload skipped, file missing: run_id=%s instance_id=%s trajectory_path=%s",
+                        task.run_id,
+                        task.instance_id,
+                        resolved_trajectory_path,
+                    )
+
             status = str(row.get("status") or ("completed" if process.returncode == 0 else "runtime-error"))
             success = process.returncode == 0 and status == "completed"
             row_error_text = str(row.get("error") or "").strip() or None
@@ -1118,6 +1182,7 @@ class CompactBenchExecutor:
                     "input_tokens": input_tokens,
                     "cached_input_tokens": cached_input_tokens,
                     "output_tokens": output_tokens,
+                    "trajectory_upload_status": trajectory_upload_status,
                 }
             )
 
@@ -1131,6 +1196,7 @@ class CompactBenchExecutor:
                 cached_input_tokens=cached_input_tokens,
                 output_tokens=output_tokens,
                 agent_steps=agent_steps,
+                trajectory_upload_status=trajectory_upload_status,
                 patch_capture_status=patch_capture_status,
                 patch_diff=patch_text or None,
                 metadata=metadata,

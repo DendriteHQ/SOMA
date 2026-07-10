@@ -188,6 +188,13 @@ async def _persist_compact_bench_report(
                     "output_tokens": output_tokens,
                 },
             )
+    trajectory_uploaded = payload.trajectory_upload_status is True
+    if _model_attr(SweBenchRun, "trajectory_uuid") is not None and not trajectory_uploaded:
+        # Keep trajectory_uuid as a reference to an object that actually exists in S3:
+        # clear it when the sandbox did not confirm the trajectory upload (failed upload,
+        # older sandbox contract, or dispatch without a presigned trajectory URL).
+        run.trajectory_uuid = None
+
     extracted_error = _extract_compact_bench_error(payload)
     desired_status = "completed" if (payload.ok_status and payload.patch_capture_status) else "failed"
     if patch_save_error:
@@ -237,6 +244,7 @@ async def _persist_compact_bench_report(
             "ok_status": payload.ok_status,
             "patch_capture_status": payload.patch_capture_status,
             "patch_saved": patch_saved,
+            "trajectory_uploaded": trajectory_uploaded,
             "status": desired_status,
             "tokens_used": resolved_total_tokens,
             "input_tokens": input_tokens,
