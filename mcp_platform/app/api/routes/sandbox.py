@@ -188,12 +188,15 @@ async def _persist_compact_bench_report(
                     "output_tokens": output_tokens,
                 },
             )
+    # Keep the artifact UUID columns as references to objects that actually exist in
+    # S3: clear them when the sandbox did not confirm the upload (failed upload, older
+    # sandbox contract, or dispatch without a presigned URL).
     trajectory_uploaded = payload.trajectory_upload_status is True
     if _model_attr(SweBenchRun, "trajectory_uuid") is not None and not trajectory_uploaded:
-        # Keep trajectory_uuid as a reference to an object that actually exists in S3:
-        # clear it when the sandbox did not confirm the trajectory upload (failed upload,
-        # older sandbox contract, or dispatch without a presigned trajectory URL).
         run.trajectory_uuid = None
+    compression_logs_uploaded = payload.compression_logs_upload_status is True
+    if _model_attr(SweBenchRun, "compression_logs_uuid") is not None and not compression_logs_uploaded:
+        run.compression_logs_uuid = None
 
     extracted_error = _extract_compact_bench_error(payload)
     desired_status = "completed" if (payload.ok_status and payload.patch_capture_status) else "failed"
@@ -245,6 +248,7 @@ async def _persist_compact_bench_report(
             "patch_capture_status": payload.patch_capture_status,
             "patch_saved": patch_saved,
             "trajectory_uploaded": trajectory_uploaded,
+            "compression_logs_uploaded": compression_logs_uploaded,
             "status": desired_status,
             "tokens_used": resolved_total_tokens,
             "input_tokens": input_tokens,

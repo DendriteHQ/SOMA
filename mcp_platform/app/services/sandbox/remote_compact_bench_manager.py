@@ -48,7 +48,8 @@ class RemoteCompactBenchManager:
         """Effective execution timeout forwarded to the sandbox for a task.
 
         Single source of truth: also used by the orchestrator to size the expiry
-        of the presigned trajectory PUT URL, so both always stay in sync.
+        of the presigned artifact PUT URLs (trajectory, compression logs), so both
+        always stay in sync.
         """
         context = task_context or {}
         if context.get("openclaw_timeout") is not None:
@@ -176,6 +177,9 @@ class RemoteCompactBenchManager:
         trajectory_presigned_url = task_context.get("trajectory_presigned_url")
         if trajectory_presigned_url is not None:
             trajectory_presigned_url = str(trajectory_presigned_url).strip() or None
+        compression_logs_presigned_url = task_context.get("compression_logs_presigned_url")
+        if compression_logs_presigned_url is not None:
+            compression_logs_presigned_url = str(compression_logs_presigned_url).strip() or None
 
         return CompactBenchRunTaskRequest(
             benchmark=benchmark,
@@ -183,6 +187,7 @@ class RemoteCompactBenchManager:
             run_id=run_id,
             script_presigned_url=script_presigned_url,
             trajectory_presigned_url=trajectory_presigned_url,
+            compression_logs_presigned_url=compression_logs_presigned_url,
             agent_name=str(task_context.get("agent_name") or "copilot").strip() or "copilot",
             benchmark_type=str(task_context.get("benchmark_type") or "swebench_verified").strip() or "swebench_verified",
             model=model,
@@ -245,6 +250,7 @@ class RemoteCompactBenchManager:
         storage_uuid: str,
         script_presigned_url: str,
         trajectory_presigned_url: str | None = None,
+        compression_logs_presigned_url: str | None = None,
         task_context: dict[str, Any] | None = None,
     ) -> tuple[bool, str | None, bool]:
         context = dict(task_context or {})
@@ -253,6 +259,8 @@ class RemoteCompactBenchManager:
         context.setdefault("run_id", int(run_id))
         if trajectory_presigned_url is not None:
             context.setdefault("trajectory_presigned_url", trajectory_presigned_url)
+        if compression_logs_presigned_url is not None:
+            context.setdefault("compression_logs_presigned_url", compression_logs_presigned_url)
         payload = self._build_task_request(
             run_id=int(run_id),
             task_context=context,
