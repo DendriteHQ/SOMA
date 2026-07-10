@@ -99,7 +99,7 @@ from app.services.swe_difficulty_calculator import (
 )
 from app.services.dash_rows_cache import DashRowsFrozenCache
 from app.services.blob.s3 import S3BlobStorage
-from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
+from app.db.interfaces import fetch_swebench_screening_passed_ss58_for_competition
 from app.api.routes.utils import (
     _get_current_burn_state,
     _require_private_network,
@@ -1522,10 +1522,9 @@ async def _build_swe_miners_snapshot(
     for row in rows_snapshot.rows:
         miner_rows.setdefault(str(row.hotkey), []).append(row)
 
-    min_resolved = settings.screener_min_resolved
     eligible_hotkeys = set(
-        await fetch_swebench_eligible_ss58_for_competition(
-            db, competition_id=comp_id, min_resolved=min_resolved
+        await fetch_swebench_screening_passed_ss58_for_competition(
+            db, competition_id=comp_id
         )
     )
     task_categories = rows_snapshot.task_categories
@@ -2074,13 +2073,9 @@ async def _build_swe_status_overrides(
                         screening_passed = False
                         break
                     if miner_weighted_tokens is None:
-                        if bool(resolved_value):
-                            screening_complete = False
-                            screening_passed = False
-                            break
-                        # For failed attempts (e.g. timeout) with missing token metrics,
-                        # treat miner weighted tokens as zero so screening can complete.
-                        miner_weighted_tokens = 0.0
+                        screening_complete = False
+                        screening_passed = False
+                        break
                     miner_weighted_total += miner_weighted_tokens
                     baseline_weighted_total += baseline_weighted_tokens
                     attempt_resolved.append(bool(resolved_value))
