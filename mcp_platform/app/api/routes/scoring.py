@@ -270,6 +270,9 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
                 "output_tokens": _to_optional_int(
                     getattr(row, "baseline_output_tokens", None)
                 ),
+                "agent_steps": _to_optional_int(
+                    getattr(row, "baseline_agent_steps", None)
+                ),
             }
 
         run_id = _to_optional_int(row.run_id)
@@ -442,24 +445,46 @@ def compute_swe_task_score(
     }
 
 
+def _per_step(weighted: float | None, agent_steps: int | None) -> float | None:
+    """Normalize a run's weighted token total by its agent step count.
+
+    Scoring on weighted-tokens-PER-STEP (rather than the total) removes the
+    variance the score inherits from how many steps the agent happened to take
+    (step count varies ~CV 0.36 within a task; per-step usage is far more stable),
+    so the compression ratio reflects per-step efficiency instead of trajectory
+    length. Returns ``None`` when the weighted value or step count is
+    missing/non-positive, so that run is skipped from the average (same treatment
+    as a missing token count).
+    """
+    if weighted is None or agent_steps is None or agent_steps <= 0:
+        return None
+    return weighted / agent_steps
+
+
 def _task_inputs(
     group: dict[str, object],
 ) -> tuple[int, int, float | None, float | None]:
     """Derive the (x, y, tok_b, tok_a) inputs for compute_swe_task_score
     from a task group produced by build_swe_task_groups.
+
+    tok_b / tok_a are weighted tokens **per agent step** (see ``_per_step``),
+    averaged over the resolved baseline runs and the miner runs respectively.
     """
     baselines = list(group["baseline_runs"].values())
     resolved_baselines = [baseline for baseline in baselines if baseline["resolved"] is True]
     x = len(resolved_baselines)
 
     resolved_baseline_tokens = [
-        weighted
+        per_step
         for baseline in resolved_baselines
         if (
-            weighted := compute_weighted_tokens(
-                input_tokens=baseline["input_tokens"],
-                cached_input_tokens=baseline["cached_input_tokens"],
-                output_tokens=baseline["output_tokens"],
+            per_step := _per_step(
+                compute_weighted_tokens(
+                    input_tokens=baseline["input_tokens"],
+                    cached_input_tokens=baseline["cached_input_tokens"],
+                    output_tokens=baseline["output_tokens"],
+                ),
+                baseline.get("agent_steps"),
             )
         )
         is not None
@@ -474,10 +499,11 @@ def _task_inputs(
     y = sum(1 for run in runs if run["pass_with_compression"] is True)
 
     miner_tokens = [
-        float(run["weighted_tokens_with_compression"])
+        per_step
         for run in runs
-        if run.get("weighted_tokens_with_compression") is not None
-        and run["weighted_tokens_with_compression"] > 0
+        if (per_step := _per_step(run.get("weighted_tokens_with_compression"), run.get("agent_steps")))
+        is not None
+        and per_step > 0
     ]
     tok_a = sum(miner_tokens) / len(miner_tokens) if miner_tokens else None
 

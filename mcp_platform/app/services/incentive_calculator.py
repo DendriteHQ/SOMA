@@ -249,6 +249,7 @@ async def load_competition_incentive_inputs(
                 _nullable_col(SweBenchRun, "input_tokens", baseline_runs).label("baseline_input_tokens"),
                 _nullable_col(SweBenchRun, "cached_input_tokens", baseline_runs).label("baseline_cached_input_tokens"),
                 _nullable_col(SweBenchRun, "output_tokens", baseline_runs).label("baseline_output_tokens"),
+                baseline_runs.agent_steps.label("baseline_agent_steps"),
                 baseline_validations.resolved.label("baseline_resolved"),
                 miner_runs.id.label("run_id"),
                 miner_runs.attempt_no.label("attempt_no"),
