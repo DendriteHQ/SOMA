@@ -415,6 +415,122 @@ def _get_miner_download_timeout() -> float:
     return max(1.0, timeout_seconds)
 
 
+def _get_artifact_upload_timeout() -> float:
+    raw_timeout = os.getenv("COMPACT_BENCH_ARTIFACT_UPLOAD_TIMEOUT_SECONDS", "60").strip()
+    try:
+        timeout_seconds = float(raw_timeout)
+    except ValueError:
+        timeout_seconds = 60.0
+    return max(1.0, timeout_seconds)
+
+
+_COMPRESSOR_EXEC_MARKER = "[compression-service][compressor.exec] "
+_COMPRESSOR_EXEC_LOG_DEFAULT_MAX_BYTES = 1 * 1024 * 1024
+_TRAJECTORY_DEFAULT_MAX_BYTES = 1 * 1024 * 1024
+
+
+def _get_artifact_max_bytes(env_name: str, default: int) -> int:
+    raw = os.getenv(env_name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1024, value)
+
+
+def _get_compressor_exec_log_max_bytes() -> int:
+    return _get_artifact_max_bytes(
+        "COMPACT_BENCH_COMPRESSOR_EXEC_LOG_MAX_BYTES",
+        _COMPRESSOR_EXEC_LOG_DEFAULT_MAX_BYTES,
+    )
+
+
+def _get_trajectory_max_bytes() -> int:
+    return _get_artifact_max_bytes(
+        "COMPACT_BENCH_TRAJECTORY_MAX_BYTES",
+        _TRAJECTORY_DEFAULT_MAX_BYTES,
+    )
+
+
+def _cap_jsonl_tail(entries: list[str], max_bytes: int) -> tuple[list[str], int]:
+    """Cap JSONL entries to max_bytes, dropping the oldest ones first.
+
+    The newest entry is always kept, even if oversized. When anything was
+    dropped, a truncation-notice JSON line is prepended so the file stays
+    valid JSONL and the cut is visible.
+    """
+    kept: list[str] = []
+    kept_bytes = 0
+    for entry in reversed(entries):
+        entry_bytes = len(entry.encode("utf-8")) + 1
+        if kept and kept_bytes + entry_bytes > max_bytes:
+            break
+        kept.append(entry)
+        kept_bytes += entry_bytes
+    kept.reverse()
+
+    dropped = len(entries) - len(kept)
+    if dropped > 0:
+        kept.insert(
+            0,
+            json.dumps(
+                {
+                    "log_truncated": True,
+                    "dropped_oldest_entries": dropped,
+                    "max_bytes": max_bytes,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    return kept, dropped
+
+
+def _extract_compressor_exec_log(container_log_file: Path) -> str:
+    """Extract per-invocation compressor execution events from a container log.
+
+    The compression service emits one marked JSON line per miner-compressor
+    invocation (see compression_service/app/main.py); everything else in the
+    container log (uvicorn, message dumps) is dropped. The resulting JSONL is
+    capped at COMPACT_BENCH_COMPRESSOR_EXEC_LOG_MAX_BYTES: when a run produces
+    more events than fit, the oldest entries are dropped and a truncation
+    notice entry is prepended.
+    """
+    entries: list[str] = []
+    for line in container_log_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        idx = line.find(_COMPRESSOR_EXEC_MARKER)
+        if idx == -1:
+            continue
+        entry = line[idx + len(_COMPRESSOR_EXEC_MARKER):].strip()
+        if entry:
+            entries.append(entry)
+    if not entries:
+        return ""
+
+    kept, _ = _cap_jsonl_tail(entries, _get_compressor_exec_log_max_bytes())
+    return "\n".join(kept) + "\n"
+
+
+def _upload_run_artifact(*, presigned_url: str, artifact_file: Path) -> None:
+    """Upload a run artifact (trajectory, logs) to the presigned S3 PUT URL provided by the platform."""
+    payload = artifact_file.read_bytes()
+    upload_request = urllib_request.Request(
+        presigned_url,
+        data=payload,
+        method="PUT",
+    )
+    with urllib_request.urlopen(upload_request, timeout=_get_artifact_upload_timeout()) as response:
+        status = getattr(response, "status", None)
+        if status is not None and not (200 <= int(status) < 300):
+            raise RuntimeError(f"Artifact upload returned HTTP {status}")
+def _get_agent_timeout_grace_seconds() -> float:
+    raw_grace = os.getenv("COMPACT_BENCH_AGENT_TIMEOUT_GRACE_SECONDS", "120").strip()
+    try:
+        grace_seconds = float(raw_grace)
+    except ValueError:
+        grace_seconds = 120.0
+    return max(0.0, grace_seconds)
+
+
 def _copy_plugin_template_checkout(*, template_path: Path, plugin_path: Path) -> None:
     """Deprecated: use CompactBenchExecutor._write_plugin_template() instead."""
     for child in template_path.iterdir():
@@ -917,8 +1033,15 @@ class CompactBenchExecutor:
                     miner_module_path,
                 )
             effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
-            timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
-            openclaw_agent_timeout_seconds = int(timeout) if timeout is not None else None
+            agent_timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
+            openclaw_agent_timeout_seconds = int(agent_timeout) if agent_timeout is not None else None
+            timeout = agent_timeout
+            if agent_timeout is not None and task.agent_name != "openclaw":
+                # The copilot backend enforces the agent timeout itself (via
+                # SOMA_COPILOT_AGENT_TIMEOUT_SECONDS below) and needs extra time afterwards
+                # to collect proxy token usage and write the result row to output.jsonl;
+                # the outer kill is a backstop and must not race that graceful shutdown.
+                timeout = agent_timeout + _get_agent_timeout_grace_seconds()
 
             command = self._build_command(
                 task=task,
@@ -927,6 +1050,8 @@ class CompactBenchExecutor:
                 openclaw_agent_timeout_seconds=openclaw_agent_timeout_seconds,
             )
             env = os.environ.copy()
+            if agent_timeout is not None and task.agent_name != "openclaw":
+                env["SOMA_COPILOT_AGENT_TIMEOUT_SECONDS"] = str(int(agent_timeout))
             copilot_compression_handle: CopilotCompressionHandle | None = None
             llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
             proxy_handle: NginxProxyHandle | None = None
@@ -998,7 +1123,36 @@ class CompactBenchExecutor:
                     duration,
                     timeout,
                 )
+                # Best-effort token collection: the agent may have written (part of) the
+                # result row before the SIGKILL, or its own internal timeout fired first.
+                total_tokens = input_tokens = cached_input_tokens = output_tokens = agent_steps = None
+                row_metadata: dict[str, Any] = {}
+                try:
+                    row = self._read_result_row(output_dir)
+                    row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                    total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps = (
+                        self._extract_execution_metrics(row=row, metadata=row_metadata)
+                    )
+                except Exception as metrics_exc:
+                    logger.warning(
+                        "Could not extract execution metrics after timeout: run_id=%s error=%s",
+                        task.run_id,
+                        metrics_exc,
+                    )
+                logger.info(
+                    (
+                        "Benchmark timeout metrics collected: run_id=%s "
+                        "total_tokens=%s input_tokens=%s cached_input_tokens=%s output_tokens=%s agent_steps=%s"
+                    ),
+                    task.run_id,
+                    total_tokens,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    agent_steps,
+                )
                 metadata = dict(task.metadata)
+                metadata.update(row_metadata)
                 metadata.update(
                     {
                         "benchmark": task.benchmark,
@@ -1006,6 +1160,10 @@ class CompactBenchExecutor:
                         "status": "timeout",
                         "command": shlex.join(command),
                         "output_dir": str(output_dir),
+                        "total_tokens": total_tokens,
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": cached_input_tokens,
+                        "output_tokens": output_tokens,
                     }
                 )
                 report = CompactBenchReportRequest(
@@ -1013,8 +1171,11 @@ class CompactBenchExecutor:
                     ok_status=False,
                     error=str(exc),
                     execution_time_seconds=duration,
-                    total_tokens=None,
-                    agent_steps=None,
+                    total_tokens=total_tokens,
+                    input_tokens=input_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    output_tokens=output_tokens,
+                    agent_steps=agent_steps,
                     patch_capture_status=False,
                     patch_diff=None,
                     metadata=metadata,
@@ -1047,6 +1208,123 @@ class CompactBenchExecutor:
                 if patch_file.is_file():
                     patch_capture_status = True
                     patch_text = patch_file.read_text(encoding="utf-8")
+
+            trajectory_upload_status: bool | None = None
+            if task.trajectory_presigned_url:
+                trajectory_upload_status = False
+                resolved_trajectory_path = trajectory_path
+                if not resolved_trajectory_path:
+                    # The openclaw backend reports the trajectory location inside
+                    # token_usage instead of a top-level trajectory_path.
+                    token_usage = row_metadata.get("token_usage") if isinstance(row_metadata.get("token_usage"), dict) else {}
+                    candidate = token_usage.get("trajectory_file")
+                    if isinstance(candidate, str):
+                        resolved_trajectory_path = candidate
+                trajectory_file = Path(resolved_trajectory_path) if resolved_trajectory_path else None
+                if trajectory_file is not None and trajectory_file.is_file():
+                    try:
+                        trajectory_max_bytes = _get_trajectory_max_bytes()
+                        upload_file = trajectory_file
+                        if trajectory_file.stat().st_size > trajectory_max_bytes:
+                            trajectory_entries = [
+                                line
+                                for line in trajectory_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                                if line.strip()
+                            ]
+                            kept_entries, dropped_entries = _cap_jsonl_tail(trajectory_entries, trajectory_max_bytes)
+                            upload_file = output_dir / "trajectory-capped.jsonl"
+                            upload_file.write_text("\n".join(kept_entries) + "\n", encoding="utf-8")
+                            logger.info(
+                                "Trajectory capped before upload: run_id=%s instance_id=%s dropped_oldest_entries=%s max_bytes=%s",
+                                task.run_id,
+                                task.instance_id,
+                                dropped_entries,
+                                trajectory_max_bytes,
+                            )
+                        _upload_run_artifact(
+                            presigned_url=task.trajectory_presigned_url,
+                            artifact_file=upload_file,
+                        )
+                        trajectory_upload_status = True
+                        logger.info(
+                            "Trajectory uploaded to S3: run_id=%s instance_id=%s trajectory_bytes=%s",
+                            task.run_id,
+                            task.instance_id,
+                            upload_file.stat().st_size,
+                        )
+                    except Exception as upload_error:  # noqa: BLE001
+                        logger.warning(
+                            "Trajectory upload failed: run_id=%s instance_id=%s trajectory_path=%s error=%s",
+                            task.run_id,
+                            task.instance_id,
+                            resolved_trajectory_path,
+                            upload_error,
+                        )
+                else:
+                    logger.warning(
+                        "Trajectory upload skipped, file missing: run_id=%s instance_id=%s trajectory_path=%s",
+                        task.run_id,
+                        task.instance_id,
+                        resolved_trajectory_path,
+                    )
+
+            compression_logs_upload_status: bool | None = None
+            if task.compression_logs_presigned_url:
+                compression_logs_upload_status = False
+                # The copilot backend collects `docker compose logs compression-service`
+                # into tmp_run_dir and reports the path as compression-service_log. The
+                # compressor execution events (one marked JSON line per miner invocation,
+                # emitted by the compression service's /transform endpoint) are extracted
+                # from it; the rest of the container log is not uploaded.
+                compression_log_path = row_metadata.get("compression-service_log")
+                compression_log_file = (
+                    Path(compression_log_path)
+                    if isinstance(compression_log_path, str) and compression_log_path
+                    else None
+                )
+                if (compression_log_file is None or not compression_log_file.is_file()) and tmp_run_dir:
+                    fallback_log_file = Path(tmp_run_dir) / "compression-service.log"
+                    if fallback_log_file.is_file():
+                        compression_log_file = fallback_log_file
+                if compression_log_file is not None and compression_log_file.is_file():
+                    compressor_exec_log = _extract_compressor_exec_log(compression_log_file)
+                    if compressor_exec_log:
+                        compressor_exec_file = output_dir / "compressor-exec.jsonl"
+                        compressor_exec_file.write_text(compressor_exec_log, encoding="utf-8")
+                        try:
+                            _upload_run_artifact(
+                                presigned_url=task.compression_logs_presigned_url,
+                                artifact_file=compressor_exec_file,
+                            )
+                            compression_logs_upload_status = True
+                            logger.info(
+                                "Compressor execution log uploaded to S3: run_id=%s instance_id=%s events_bytes=%s",
+                                task.run_id,
+                                task.instance_id,
+                                compressor_exec_file.stat().st_size,
+                            )
+                        except Exception as upload_error:  # noqa: BLE001
+                            logger.warning(
+                                "Compressor execution log upload failed: run_id=%s instance_id=%s error=%s",
+                                task.run_id,
+                                task.instance_id,
+                                upload_error,
+                            )
+                    else:
+                        logger.warning(
+                            "Compressor execution log upload skipped, no compressor.exec events in container log "
+                            "(old compression-service image or no compressor invocations): run_id=%s instance_id=%s log_path=%s",
+                            task.run_id,
+                            task.instance_id,
+                            compression_log_file,
+                        )
+                else:
+                    logger.warning(
+                        "Compressor execution log upload skipped, container log missing: run_id=%s instance_id=%s log_path=%s",
+                        task.run_id,
+                        task.instance_id,
+                        compression_log_path,
+                    )
 
             status = str(row.get("status") or ("completed" if process.returncode == 0 else "runtime-error"))
             success = process.returncode == 0 and status == "completed"
@@ -1118,6 +1396,8 @@ class CompactBenchExecutor:
                     "input_tokens": input_tokens,
                     "cached_input_tokens": cached_input_tokens,
                     "output_tokens": output_tokens,
+                    "trajectory_upload_status": trajectory_upload_status,
+                    "compression_logs_upload_status": compression_logs_upload_status,
                 }
             )
 
@@ -1131,6 +1411,8 @@ class CompactBenchExecutor:
                 cached_input_tokens=cached_input_tokens,
                 output_tokens=output_tokens,
                 agent_steps=agent_steps,
+                trajectory_upload_status=trajectory_upload_status,
+                compression_logs_upload_status=compression_logs_upload_status,
                 patch_capture_status=patch_capture_status,
                 patch_diff=patch_text or None,
                 metadata=metadata,
