@@ -114,6 +114,19 @@ async def _persist_compact_bench_report(
         # after data resets / test cleanups on platform side.
         return True
 
+    logger.info(
+        "compact_bench_report_received",
+        extra={
+            "run_id": payload.run_id,
+            "ok_status": payload.ok_status,
+            "patch_capture_status": payload.patch_capture_status,
+            "trajectory_upload_status": payload.trajectory_upload_status,
+            "compression_logs_upload_status": payload.compression_logs_upload_status,
+            "prior_trajectory_uuid": getattr(run, "trajectory_uuid", None),
+            "prior_compression_logs_uuid": getattr(run, "compression_logs_uuid", None),
+        },
+    )
+
     patch_save_error: str | None = None
     patch_saved = False
     if payload.patch_diff is not None:
@@ -193,9 +206,27 @@ async def _persist_compact_bench_report(
     # sandbox contract, or dispatch without a presigned URL).
     trajectory_uploaded = payload.trajectory_upload_status is True
     if _model_attr(SweBenchRun, "trajectory_uuid") is not None and not trajectory_uploaded:
+        if run.trajectory_uuid is not None:
+            logger.warning(
+                "compact_bench_report_trajectory_uuid_cleared",
+                extra={
+                    "run_id": payload.run_id,
+                    "cleared_uuid": run.trajectory_uuid,
+                    "trajectory_upload_status": payload.trajectory_upload_status,
+                },
+            )
         run.trajectory_uuid = None
     compression_logs_uploaded = payload.compression_logs_upload_status is True
     if _model_attr(SweBenchRun, "compression_logs_uuid") is not None and not compression_logs_uploaded:
+        if run.compression_logs_uuid is not None:
+            logger.warning(
+                "compact_bench_report_compression_logs_uuid_cleared",
+                extra={
+                    "run_id": payload.run_id,
+                    "cleared_uuid": run.compression_logs_uuid,
+                    "compression_logs_upload_status": payload.compression_logs_upload_status,
+                },
+            )
         run.compression_logs_uuid = None
 
     extracted_error = _extract_compact_bench_error(payload)

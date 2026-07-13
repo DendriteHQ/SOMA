@@ -18,6 +18,8 @@ from typing import Any
 from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
+
 from soma_shared.contracts.sandbox.v1.messages import (
     CompactBenchReportRequest,
     CompactBenchRunTaskRequest,
@@ -513,15 +515,31 @@ def _extract_compressor_exec_log(container_log_file: Path) -> str:
 def _upload_run_artifact(*, presigned_url: str, artifact_file: Path) -> None:
     """Upload a run artifact (trajectory, logs) to the presigned S3 PUT URL provided by the platform."""
     payload = artifact_file.read_bytes()
-    upload_request = urllib_request.Request(
-        presigned_url,
-        data=payload,
-        method="PUT",
-    )
-    with urllib_request.urlopen(upload_request, timeout=_get_artifact_upload_timeout()) as response:
-        status = getattr(response, "status", None)
-        if status is not None and not (200 <= int(status) < 300):
-            raise RuntimeError(f"Artifact upload returned HTTP {status}")
+    # Deliberately NOT urllib.request: it auto-adds a
+    # "Content-Type: application/x-www-form-urlencoded" header to any PUT/POST
+    # with a body when none is set explicitly. The platform's presigned URLs
+    # are signed with SigV2 (HmacV1QueryAuth), which signs an *empty*
+    # Content-Type, so that auto-added header causes S3 to reject the upload
+    # with SignatureDoesNotMatch. httpx sends raw bytes with no default
+    # Content-Type, matching what was signed.
+    try:
+        response = httpx.put(
+            presigned_url,
+            content=payload,
+            timeout=_get_artifact_upload_timeout(),
+        )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Artifact upload transport error: {type(exc).__name__}: {exc}") from exc
+    if not (200 <= response.status_code < 300):
+        # response.text alone (not just the status code) is what tells an
+        # expired presigned URL apart from a signature/permission problem.
+        raise RuntimeError(
+            f"Artifact upload failed: HTTP {response.status_code}; "
+            f"presigned_url_host={urlsplit(presigned_url).netloc}; "
+            f"response_body={response.text[:2000]!r}"
+        )
+
+
 def _get_agent_timeout_grace_seconds() -> float:
     raw_grace = os.getenv("COMPACT_BENCH_AGENT_TIMEOUT_GRACE_SECONDS", "120").strip()
     try:
@@ -1210,6 +1228,12 @@ class CompactBenchExecutor:
                     patch_text = patch_file.read_text(encoding="utf-8")
 
             trajectory_upload_status: bool | None = None
+            if not task.trajectory_presigned_url:
+                logger.info(
+                    "Trajectory upload not attempted, no presigned URL on task: run_id=%s instance_id=%s",
+                    task.run_id,
+                    task.instance_id,
+                )
             if task.trajectory_presigned_url:
                 trajectory_upload_status = False
                 resolved_trajectory_path = trajectory_path
@@ -1269,6 +1293,12 @@ class CompactBenchExecutor:
                     )
 
             compression_logs_upload_status: bool | None = None
+            if not task.compression_logs_presigned_url:
+                logger.info(
+                    "Compressor execution log upload not attempted, no presigned URL on task: run_id=%s instance_id=%s",
+                    task.run_id,
+                    task.instance_id,
+                )
             if task.compression_logs_presigned_url:
                 compression_logs_upload_status = False
                 # The copilot backend collects `docker compose logs compression-service`

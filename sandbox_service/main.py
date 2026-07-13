@@ -305,9 +305,12 @@ async def _deliver_callback_once(report: CompactBenchReportRequest) -> tuple[boo
     """Deliver callback once and require HTTP 2xx + body.success == true."""
     report_url = _get_compact_bench_report_url()
     logger.info(
-        "Sending compact-bench report: run_id=%s ok_status=%s report_url=%s",
+        "Sending compact-bench report: run_id=%s ok_status=%s trajectory_upload_status=%s "
+        "compression_logs_upload_status=%s report_url=%s",
         report.run_id,
         report.ok_status,
+        report.trajectory_upload_status,
+        report.compression_logs_upload_status,
         report_url,
     )
     try:
@@ -447,10 +450,15 @@ async def _execute_compact_bench_task_in_background(request: CompactBenchRunTask
             else None
         )
         logger.info(
-            "Compact-bench execution finished: run_id=%s ok_status=%s patch_capture_status=%s error=%s gateway_transport_error=%s ws_close_code=%s ws_close_reason=%s last_hook_event=%s delta_to_fail_s=%s gateway_container_state_at_fail=%s execution_time_seconds=%s",
+            "Compact-bench execution finished: run_id=%s ok_status=%s patch_capture_status=%s "
+            "trajectory_upload_status=%s compression_logs_upload_status=%s error=%s "
+            "gateway_transport_error=%s ws_close_code=%s ws_close_reason=%s last_hook_event=%s "
+            "delta_to_fail_s=%s gateway_container_state_at_fail=%s execution_time_seconds=%s",
             request.run_id,
             output.report.ok_status,
             output.report.patch_capture_status,
+            output.report.trajectory_upload_status,
+            output.report.compression_logs_upload_status,
             output.report.error,
             has_gateway_transport_error,
             ws_close_code,
