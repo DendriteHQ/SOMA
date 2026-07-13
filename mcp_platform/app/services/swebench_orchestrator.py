@@ -13,7 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.blob.compression_log_artifact_storage import CompressionLogArtifactStorage
 from app.services.blob.s3 import S3BlobStorage
+from app.services.blob.text_artifact_storage import TextArtifactStorage
+from app.services.blob.trajectory_artifact_storage import TrajectoryArtifactStorage
 from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
@@ -928,6 +931,8 @@ async def _create_run_and_validation(
         miner_fk=miner_fk,
         script_fk=script_fk,
         diff_storage_uuid=str(uuid.uuid4()),
+        trajectory_uuid=str(uuid.uuid4()),
+        compression_logs_uuid=str(uuid.uuid4()),
         tokens_used=None,
         time_taken_seconds=None,
         agent_steps=None,
@@ -1026,6 +1031,8 @@ async def _dispatch_due_runs(
                     SELECT
                         r.id AS run_id,
                         r.diff_storage_uuid,
+                        r.trajectory_uuid,
+                        r.compression_logs_uuid,
                         r.attempt_no,
                         r.benchmark_type,
                         r.miner_fk,
@@ -1181,7 +1188,7 @@ async def _dispatch_due_runs(
 
         expires_in = int(max(60.0, float(settings.sandbox_timeout_per_task_seconds) + 300.0))
 
-        prepared_dispatches: list[tuple[dict, int, str]] = []
+        prepared_dispatches: list[tuple[dict, int, str, str | None, str | None]] = []
         for row in dispatch_rows:
             run_id = int(row["run_id"])
             try:
@@ -1204,10 +1211,30 @@ async def _dispatch_due_runs(
                 )
                 deferred += 1
                 continue
-            prepared_dispatches.append((row, run_id, script_presigned_url))
+            trajectory_presigned_url = await _resolve_run_artifact_presigned_url(
+                s3_storage=s3_storage,
+                artifact_storage=TrajectoryArtifactStorage(s3_storage),
+                artifact_uuid=row.get("trajectory_uuid"),
+                artifact_kind="trajectory",
+                manager=manager,
+                run_id=run_id,
+            )
+            compression_logs_presigned_url = await _resolve_run_artifact_presigned_url(
+                s3_storage=s3_storage,
+                artifact_storage=CompressionLogArtifactStorage(s3_storage),
+                artifact_uuid=row.get("compression_logs_uuid"),
+                artifact_kind="compression_logs",
+                manager=manager,
+                run_id=run_id,
+            )
+            prepared_dispatches.append(
+                (row, run_id, script_presigned_url, trajectory_presigned_url, compression_logs_presigned_url)
+            )
 
-        async def _dispatch_one(prepared: tuple[dict, int, str]) -> tuple[dict, int, bool, str | None, bool]:
-            row, run_id, script_presigned_url = prepared
+        async def _dispatch_one(
+            prepared: tuple[dict, int, str, str | None, str | None],
+        ) -> tuple[dict, int, bool, str | None, bool]:
+            row, run_id, script_presigned_url, trajectory_presigned_url, compression_logs_presigned_url = prepared
             try:
                 run_benchmark_type = str(row.get("benchmark_type") or "swebench_verified")
                 ok, error, retryable = await manager.dispatch_swebench_run(
@@ -1216,6 +1243,8 @@ async def _dispatch_due_runs(
                     instance_id=str(row["instance_id"]),
                     storage_uuid=str(row["diff_storage_uuid"]),
                     script_presigned_url=script_presigned_url,
+                    trajectory_presigned_url=trajectory_presigned_url,
+                    compression_logs_presigned_url=compression_logs_presigned_url,
                     task_context={
                         "competition_fk": int(row["competition_fk"]),
                         "miner_fk": row["miner_fk"],
@@ -1303,6 +1332,41 @@ async def _dispatch_due_runs(
         break
 
     return dispatched, deferred, failed
+
+
+async def _resolve_run_artifact_presigned_url(
+    *,
+    s3_storage: S3BlobStorage,
+    artifact_storage: TextArtifactStorage,
+    artifact_uuid,
+    artifact_kind: str,
+    manager: RemoteCompactBenchManager,
+    run_id: int,
+) -> str | None:
+    """Presign a PUT URL the sandbox uses to upload a run artifact (trajectory, logs).
+
+    Best-effort: runs created before the artifact UUID column existed carry no
+    UUID, and a presign failure must not block dispatching the run itself.
+    """
+    if not artifact_uuid:
+        return None
+    # The sandbox uploads artifacts only after the run finishes, so the URL must
+    # outlive the exact execution timeout the manager forwards to the sandbox,
+    # plus headroom for the callback/upload itself.
+    expires_in = manager.resolve_openclaw_timeout_seconds() + 900
+    key = artifact_storage.build_key(str(artifact_uuid))
+    try:
+        return await s3_storage.generate_presigned_url(
+            key,
+            "put_object",
+            expires_in=expires_in,
+        )
+    except Exception:
+        logger.exception(
+            f"swebench_{artifact_kind}_presign_failed",
+            extra={"run_id": run_id, "artifact_uuid": str(artifact_uuid)},
+        )
+        return None
 
 
 async def _resolve_script_presigned_url(
