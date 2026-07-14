@@ -293,8 +293,14 @@ async def evaluate_screening_for_script(
                 baseline_weighted_tokens = baseline_weighted_by_task_attempt.get(
                     (int(task_id), attempt_no, benchmark_type)
                 )
-                if miner_weighted_tokens is None or baseline_weighted_tokens is None:
+                if baseline_weighted_tokens is None:
                     return False, False
+                if miner_weighted_tokens is None:
+                    if bool(resolved_value):
+                        return False, False
+                    # Failed attempts (e.g. timeout, dispatch failure) may carry no
+                    # token metrics; count them as zero so screening can conclude.
+                    miner_weighted_tokens = 0.0
                 miner_weighted_total += miner_weighted_tokens
                 baseline_weighted_total += baseline_weighted_tokens
                 attempt_resolved.append(bool(resolved_value))
