@@ -98,6 +98,7 @@ from app.services.swe_difficulty_calculator import (
     derive_task_difficulties,
 )
 from app.services.dash_rows_cache import DashRowsFrozenCache
+from app.services import swebench_screening as screening_shared
 from app.services.blob.s3 import S3BlobStorage
 from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.api.routes.utils import (
@@ -1577,31 +1578,6 @@ async def _get_swe_miners_snapshot(
     return snapshot
 
 
-def _required_screener_task_passes(total_screener_tasks: int) -> int:
-    if total_screener_tasks <= 0:
-        return 0
-
-    ratio = float(settings.swebench_screening_pass_ratio)
-    ratio = min(1.0, max(0.0, ratio))
-    ratio_required = int(ceil(total_screener_tasks * ratio))
-    min_required = max(0, int(settings.swebench_screening_min_passed_tasks))
-    required = max(1, max(ratio_required, min_required))
-    return min(total_screener_tasks, required)
-
-
-def _required_screener_weighted_token_saving_ratio() -> float:
-    ratio = float(settings.swebench_screening_min_weighted_token_saving_ratio)
-    return min(1.0, max(0.0, ratio))
-
-
-def _screening_token_weights() -> tuple[float, float, float]:
-    return (
-        float(settings.swebench_screening_input_tokens_weight),
-        float(settings.swebench_screening_cached_input_tokens_weight),
-        float(settings.swebench_screening_output_tokens_weight),
-    )
-
-
 def _to_optional_int(value: object) -> int | None:
     if value is None:
         return None
@@ -1618,24 +1594,12 @@ def _weighted_tokens_for_screening(
     cached_input_tokens: object,
     output_tokens: object,
 ) -> float | None:
-    parsed_total = _to_optional_int(total_tokens)
-    parsed_input = _to_optional_int(input_tokens)
-    parsed_cached = _to_optional_int(cached_input_tokens)
-    parsed_output = _to_optional_int(output_tokens)
-
-    if parsed_input is not None and parsed_cached is not None and parsed_output is not None:
-        if parsed_input < 0 or parsed_cached < 0 or parsed_output < 0:
-            return None
-        input_weight, cached_input_weight, output_weight = _screening_token_weights()
-        return (
-            (input_weight * float(parsed_input))
-            + (cached_input_weight * float(parsed_cached))
-            + (output_weight * float(parsed_output))
-        )
-
-    if parsed_total is None or parsed_total < 0:
-        return None
-    return float(parsed_total)
+    return screening_shared.weighted_tokens_for_screening(
+        total_tokens=_to_optional_int(total_tokens),
+        input_tokens=_to_optional_int(input_tokens),
+        cached_input_tokens=_to_optional_int(cached_input_tokens),
+        output_tokens=_to_optional_int(output_tokens),
+    )
 
 
 def _group_weighted_token_totals(
@@ -1777,16 +1741,6 @@ def _round_optional_1dp(value: float | None) -> float | None:
         return None
     rounded = round(float(value), 1)
     return 0.0 if rounded == -0.0 else rounded
-
-
-def _weighted_token_savings_ratio(
-    *,
-    baseline_weighted_total: float,
-    miner_weighted_total: float,
-) -> float | None:
-    if baseline_weighted_total <= 0:
-        return None
-    return (baseline_weighted_total - miner_weighted_total) / baseline_weighted_total
 
 
 def _screener_passed_from_status(
@@ -1931,6 +1885,7 @@ async def _build_swe_status_overrides(
                 SWE_BENCH_RUNS.c.input_tokens,
                 SWE_BENCH_RUNS.c.cached_input_tokens,
                 SWE_BENCH_RUNS.c.output_tokens,
+                SWE_BENCH_RUNS.c.benchmark_type,
                 SWE_BENCH_TASKS.c.is_screener,
                 SWE_BENCH_VERIFIED_VALIDATIONS.c.resolved,
                 SWE_BENCH_RUN_VALIDATIONS.c.scored_at,
@@ -1947,18 +1902,19 @@ async def _build_swe_status_overrides(
             )
             .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
             .where(SWE_BENCH_RUNS.c.baseline_run.is_(False))
-            .where(SWE_BENCH_RUNS.c.benchmark_type == "swebench_verified")
+            .where(SWE_BENCH_RUNS.c.benchmark_type.in_(screening_shared.SCREENING_BENCHMARK_TYPES))
             .where(pair_expr.in_(pairs))
         )
     ).all()
 
-    baseline_weighted_by_attempt: dict[tuple[int, int], float | None] = {}
+    baseline_weighted_by_attempt: dict[tuple[int, int, str], float | None] = {}
     if screener_task_ids:
         baseline_rows = (
             await db.execute(
                 select(
                     SWE_BENCH_RUNS.c.task_fk,
                     SWE_BENCH_RUNS.c.attempt_no,
+                    SWE_BENCH_RUNS.c.benchmark_type,
                     SWE_BENCH_RUNS.c.tokens_used,
                     SWE_BENCH_RUNS.c.input_tokens,
                     SWE_BENCH_RUNS.c.cached_input_tokens,
@@ -1968,14 +1924,15 @@ async def _build_swe_status_overrides(
                 .join(SWE_BENCH_TASKS, SWE_BENCH_TASKS.c.id == SWE_BENCH_RUNS.c.task_fk)
                 .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
                 .where(SWE_BENCH_RUNS.c.baseline_run.is_(True))
-                .where(SWE_BENCH_RUNS.c.benchmark_type == "swebench_verified")
+                .where(SWE_BENCH_RUNS.c.benchmark_type.in_(screening_shared.SCREENING_BENCHMARK_TYPES))
                 .where(SWE_BENCH_RUNS.c.miner_fk.is_(None))
                 .where(SWE_BENCH_RUNS.c.script_fk.is_(None))
                 .where(SWE_BENCH_RUNS.c.task_fk.in_(screener_task_ids))
             )
         ).all()
         for row in baseline_rows:
-            baseline_weighted_by_attempt[(int(row.task_fk), int(row.attempt_no))] = _weighted_tokens_for_screening(
+            baseline_key = (int(row.task_fk), int(row.attempt_no), str(row.benchmark_type))
+            baseline_weighted_by_attempt[baseline_key] = _weighted_tokens_for_screening(
                 total_tokens=row.tokens_used,
                 input_tokens=row.input_tokens,
                 cached_input_tokens=row.cached_input_tokens,
@@ -2010,7 +1967,7 @@ async def _build_swe_status_overrides(
         if is_screener:
             states = stats["screener_states"]
             if isinstance(states, dict):
-                states[(int(row.task_fk), int(row.attempt_no))] = (
+                states[(int(row.task_fk), int(row.attempt_no), str(row.benchmark_type))] = (
                     bool(row.resolved) if row.resolved is not None else None,
                     row.scored_at,
                     _weighted_tokens_for_screening(
@@ -2021,7 +1978,6 @@ async def _build_swe_status_overrides(
                     ),
                 )
 
-    required_screener_passes = _required_screener_task_passes(len(screener_task_ids))
     for ss58, pair in script_refs.items():
         if status_by_hotkey.get(ss58) == "no api key":
             continue
@@ -2046,59 +2002,16 @@ async def _build_swe_status_overrides(
         screening_complete = True
         screening_passed = True
         if screener_task_ids:
-            screening_complete = True
-            screening_passed_count = 0
             states = pair_stats["screener_states"]
-            screener_states: dict[tuple[int, int], tuple[bool | None, datetime | None, float | None]] = (
+            screener_states: dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]] = (
                 states if isinstance(states, dict) else {}
             )
-            miner_weighted_total = 0.0
-            baseline_weighted_total = 0.0
-            for task_id in screener_task_ids:
-                repeats = max(1, int(task_repeats.get(task_id, 1)))
-                attempt_resolved: list[bool] = []
-                for attempt_no in range(1, repeats + 1):
-                    state = screener_states.get((task_id, attempt_no))
-                    if state is None:
-                        screening_complete = False
-                        screening_passed = False
-                        break
-                    resolved_value, _scored_at, miner_weighted_tokens = state
-                    if resolved_value is None:
-                        screening_complete = False
-                        screening_passed = False
-                        break
-                    baseline_weighted_tokens = baseline_weighted_by_attempt.get((task_id, attempt_no))
-                    if baseline_weighted_tokens is None:
-                        screening_complete = False
-                        screening_passed = False
-                        break
-                    if miner_weighted_tokens is None:
-                        if bool(resolved_value):
-                            screening_complete = False
-                            screening_passed = False
-                            break
-                        # For failed attempts (e.g. timeout) with missing token metrics,
-                        # treat miner weighted tokens as zero so screening can complete.
-                        miner_weighted_tokens = 0.0
-                    miner_weighted_total += miner_weighted_tokens
-                    baseline_weighted_total += baseline_weighted_tokens
-                    attempt_resolved.append(bool(resolved_value))
-                if not screening_complete:
-                    break
-                if sum(1 for value in attempt_resolved if value) > (len(attempt_resolved) // 2):
-                    screening_passed_count += 1
-            if screening_complete:
-                screening_passed = screening_passed_count >= required_screener_passes
-                if screening_passed:
-                    weighted_savings_ratio = _weighted_token_savings_ratio(
-                        baseline_weighted_total=baseline_weighted_total,
-                        miner_weighted_total=miner_weighted_total,
-                    )
-                    screening_passed = (
-                        weighted_savings_ratio is not None
-                        and weighted_savings_ratio >= _required_screener_weighted_token_saving_ratio()
-                    )
+            screening_complete, screening_passed = await screening_shared.evaluate_screening_for_script(
+                screener_task_ids=screener_task_ids,
+                task_repeats=task_repeats,
+                baseline_weighted_by_task_attempt=baseline_weighted_by_attempt,
+                screening_by_task_attempt=screener_states,
+            )
 
         has_dispatched_non_screener = bool(pair_stats["has_dispatched_non_screener"])
         has_dispatched_screener = bool(pair_stats["has_dispatched_screener"])
