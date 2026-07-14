@@ -277,7 +277,7 @@ class Settings(BaseSettings):
         alias="SWEBENCH_SCREENING_PASS_RATIO",
     )
     swebench_screening_min_weighted_token_saving_ratio: float = Field(
-        default=0.2,
+        default=0.1,
         alias="SWEBENCH_SCREENING_MIN_WEIGHTED_TOKEN_SAVING_RATIO",
     )
     swebench_screening_input_tokens_weight: float = Field(
