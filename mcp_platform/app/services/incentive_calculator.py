@@ -6,7 +6,7 @@ from itertools import combinations
 from math import isclose
 from typing import Mapping, Sequence
 
-from sqlalchemy import and_, func, literal, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -14,22 +14,41 @@ from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
+from soma_shared.db.models.swe_bench_verified_validation import SweBenchVerifiedValidation
+from soma_shared.db.models.swe_explorer_edit_validation import SweExplorerEditValidation
+from soma_shared.db.models.swe_explorer_validation import SweExplorerValidation
 from soma_shared.db.models.top_miner import TopMiner
 from app.db.interfaces.burn_weight_queries import (
     delete_unapproved_competition_top_miner_rows,
 )
-from app.services.swe_difficulty_calculator import (
-    DIFFICULTY_CATEGORIES,
-    CategoryValue,
-    MinerCategoryScores,
-    build_baseline_task_data,
-    derive_task_difficulties,
+
+
+BenchmarkType = str
+
+BENCHMARK_TYPES: tuple[BenchmarkType, ...] = (
+    "swebench_verified",
+    "swe_explorer_explore",
+    "swe_explorer_edit",
 )
+
+# Base benchmark weighting (docs/miner/INCENTIVE_MECHANISM.md): the aggregate
+# S_bench = 0.50*S_v + 0.25*S_x + 0.25*S_e. Subset scores renormalize these
+# weights over the subset members, so the full triple reduces to S_bench and
+# singles reduce to the plain per-benchmark score.
+BENCHMARK_WEIGHTS: dict[BenchmarkType, float] = {
+    "swebench_verified": 0.50,
+    "swe_explorer_explore": 0.25,
+    "swe_explorer_edit": 0.25,
+}
+
+# Static layer weights over benchmark-type subsets:
+# L0 (triple) -> 0.25, L1 (pairs) -> 0.45, L2 (singles) -> 0.30.
+LAYER_WEIGHTS_BY_SUBSET_SIZE: dict[int, float] = {3: 0.25, 2: 0.45, 1: 0.30}
 
 
 @dataclass(frozen=True)
 class IncentiveElementResult:
-    subset: tuple[CategoryValue, ...]
+    subset: tuple[BenchmarkType, ...]
     weight: float
     winners: tuple[str, ...]
     winning_score: float | None
@@ -38,7 +57,7 @@ class IncentiveElementResult:
 @dataclass(frozen=True)
 class IncentiveLayerResult:
     index: int
-    subsets: tuple[tuple[CategoryValue, ...], ...]
+    subsets: tuple[tuple[BenchmarkType, ...], ...]
     layer_weight: float
     element_weight: float
     elements: tuple[IncentiveElementResult, ...]
@@ -46,7 +65,7 @@ class IncentiveLayerResult:
 
 @dataclass(frozen=True)
 class IncentiveCalculationResult:
-    categories: tuple[CategoryValue, ...]
+    categories: tuple[BenchmarkType, ...]
     burn_ratio: float
     miners_share: float
     raw_weights: dict[str, float]
@@ -55,102 +74,103 @@ class IncentiveCalculationResult:
     layers: tuple[IncentiveLayerResult, ...]
 
 
-def _normalize_categories(categories: Sequence[str]) -> tuple[CategoryValue, ...]:
-    seen: set[CategoryValue] = set()
-    normalized: list[CategoryValue] = []
-    for category in categories:
-        category_name = str(category)
-        if category_name in seen:
+def _normalize_benchmark_types(benchmark_types: Sequence[str]) -> tuple[BenchmarkType, ...]:
+    seen: set[BenchmarkType] = set()
+    normalized: list[BenchmarkType] = []
+    for benchmark_type in benchmark_types:
+        name = str(benchmark_type)
+        if name in seen:
             continue
-        seen.add(category_name)
-        normalized.append(category_name)
+        seen.add(name)
+        normalized.append(name)
 
-    if seen.issubset(set(DIFFICULTY_CATEGORIES)):
-        return tuple(category for category in DIFFICULTY_CATEGORIES if category in seen)
+    if seen.issubset(set(BENCHMARK_TYPES)):
+        return tuple(benchmark for benchmark in BENCHMARK_TYPES if benchmark in seen)
     return tuple(normalized)
 
 
 def build_incentive_layers(
-    categories: Sequence[str],
-) -> tuple[tuple[tuple[CategoryValue, ...], ...], ...]:
-    normalized_categories = _normalize_categories(categories)
-    layers: list[tuple[tuple[CategoryValue, ...], ...]] = []
-    category_count = len(normalized_categories)
+    benchmark_types: Sequence[str],
+) -> tuple[tuple[tuple[BenchmarkType, ...], ...], ...]:
+    normalized = _normalize_benchmark_types(benchmark_types)
+    layers: list[tuple[tuple[BenchmarkType, ...], ...]] = []
 
-    for subset_size in range(category_count, 0, -1):
-        layer = tuple(combinations(normalized_categories, subset_size))
+    for subset_size in range(len(normalized), 0, -1):
+        layer = tuple(combinations(normalized, subset_size))
         if layer:
             layers.append(layer)
 
     return tuple(layers)
 
 
-def _subset_average_score(
-    miner_scores: Mapping[CategoryValue, float],
-    subset: Sequence[CategoryValue],
+def _layer_weights_for(
+    layers: Sequence[tuple[tuple[BenchmarkType, ...], ...]],
+) -> list[float]:
+    """Static layer weights keyed by subset size, renormalized to sum to 1.
+
+    For the full three-benchmark configuration the static weights already sum
+    to 1.0 and the renormalization is a no-op; with fewer benchmark types the
+    remaining layers keep their relative proportions.
+    """
+    raw = [
+        LAYER_WEIGHTS_BY_SUBSET_SIZE.get(len(layer[0]), 0.0) if layer else 0.0
+        for layer in layers
+    ]
+    total = sum(raw)
+    if total <= 0.0:
+        return [0.0 for _ in raw]
+    return [weight / total for weight in raw]
+
+
+def _subset_weighted_score(
+    miner_scores: Mapping[BenchmarkType, float],
+    subset: Sequence[BenchmarkType],
 ) -> float | None:
-    subset_scores: list[float] = []
-    for category in subset:
-        score = miner_scores.get(category)
+    """Benchmark-weighted average of the miner's scores over the subset.
+
+    Weights come from BENCHMARK_WEIGHTS renormalized over the subset members
+    (unknown benchmark names fall back to weight 1.0, i.e. a plain average).
+    Returns None when any member score is missing - the miner does not
+    compete on that element.
+    """
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for benchmark_type in subset:
+        score = miner_scores.get(benchmark_type)
         if score is None:
             return None
-        subset_scores.append(float(score))
-    if not subset_scores:
+        weight = float(BENCHMARK_WEIGHTS.get(benchmark_type, 1.0))
+        weighted_sum += weight * float(score)
+        weight_total += weight
+    if weight_total <= 0.0:
         return None
-    return sum(subset_scores) / len(subset_scores)
-
-
-def _miner_total_score_from_rows(rows: Sequence[object]) -> dict[str, float]:
-    from app.api.routes.scoring import build_swe_miner_scores, build_swe_task_groups
-
-    rows_by_hotkey: dict[str, list[object]] = {}
-    for row in rows:
-        hotkey = getattr(row, "hotkey", None)
-        if hotkey is None:
-            continue
-        rows_by_hotkey.setdefault(str(hotkey), []).append(row)
-
-    miner_total_scores: dict[str, float] = {}
-    for hotkey, hotkey_rows in rows_by_hotkey.items():
-        task_groups = build_swe_task_groups(hotkey_rows)
-        total_score, _ = build_swe_miner_scores(task_groups)
-        if total_score is not None:
-            miner_total_scores[hotkey] = float(total_score)
-
-    return miner_total_scores
+    return weighted_sum / weight_total
 
 
 def calculate_incentive_weights(
-    miner_category_scores: Mapping[str, Mapping[CategoryValue, float]],
-    categories: Sequence[str],
+    miner_benchmark_scores: Mapping[str, Mapping[BenchmarkType, float]],
+    benchmark_types: Sequence[str],
     *,
     burn_ratio: float,
-    miner_total_scores: Mapping[str, float] | None = None,
 ) -> IncentiveCalculationResult:
-    normalized_categories = _normalize_categories(categories)
+    normalized_types = _normalize_benchmark_types(benchmark_types)
     miners_share = max(0.0, 1.0 - float(burn_ratio))
-    layers = build_incentive_layers(normalized_categories)
+    layers = build_incentive_layers(normalized_types)
+    layer_weights = _layer_weights_for(layers)
     raw_weights: dict[str, float] = {}
     layer_results: list[IncentiveLayerResult] = []
 
     for layer_index, layer_subsets in enumerate(layers):
-        layer_weight = 1.0 / (2**layer_index)
+        layer_weight = layer_weights[layer_index]
         element_weight = layer_weight / len(layer_subsets)
         element_results: list[IncentiveElementResult] = []
 
         for subset in layer_subsets:
             subset_scores: dict[str, float] = {}
-            if miner_total_scores is not None and len(subset) == len(normalized_categories):
-                subset_scores = {
-                    hotkey: float(miner_total_scores[hotkey])
-                    for hotkey in miner_category_scores
-                    if hotkey in miner_total_scores
-                }
-            else:
-                for hotkey, scores in miner_category_scores.items():
-                    subset_score = _subset_average_score(scores, subset)
-                    if subset_score is not None:
-                        subset_scores[hotkey] = subset_score
+            for hotkey, scores in miner_benchmark_scores.items():
+                subset_score = _subset_weighted_score(scores, subset)
+                if subset_score is not None:
+                    subset_scores[hotkey] = subset_score
 
             if not subset_scores:
                 element_results.append(
@@ -208,7 +228,7 @@ def calculate_incentive_weights(
         burn_weight = 1.0
 
     return IncentiveCalculationResult(
-        categories=normalized_categories,
+        categories=normalized_types,
         burn_ratio=float(burn_ratio),
         miners_share=miners_share,
         raw_weights=dict(sorted(raw_weights.items())),
@@ -218,26 +238,44 @@ def calculate_incentive_weights(
     )
 
 
-def _nullable_col(model: type, attr: str, alias: object) -> object:
-    """Return the column from *alias* if *model* has it, otherwise a NULL literal."""
-    if hasattr(model, attr):
-        return getattr(alias, attr)
-    return literal(None)
+def _swe_scores_by_hotkey(rows: Sequence[object]) -> dict[str, float]:
+    """Normalized SWE-path miner totals ([-1, 1]) grouped by hotkey."""
+    from app.api.routes.scoring import build_swe_miner_total_score, build_swe_task_groups
+
+    rows_by_hotkey: dict[str, list[object]] = {}
+    for row in rows:
+        hotkey = getattr(row, "hotkey", None)
+        if hotkey is None:
+            continue
+        rows_by_hotkey.setdefault(str(hotkey), []).append(row)
+
+    scores: dict[str, float] = {}
+    for hotkey, hotkey_rows in rows_by_hotkey.items():
+        task_groups = build_swe_task_groups(hotkey_rows)
+        total_score, _ = build_swe_miner_total_score(task_groups)
+        if total_score is not None:
+            scores[hotkey] = float(total_score)
+    return scores
 
 
-async def load_competition_incentive_inputs(
+async def _load_swe_benchmark_rows(
     db: AsyncSession,
     *,
     competition_id: int,
-) -> tuple[tuple[CategoryValue, ...], MinerCategoryScores, dict[str, float]]:
-    from app.api.routes.scoring import build_swe_miner_category_scores_with_penalty
-
+    benchmark_type: BenchmarkType,
+    resolved_model: type,
+) -> Sequence[object]:
+    """Rows shaped for build_swe_task_groups, with `resolved` coming from the
+    benchmark's own validation table (swe_bench_verified_validations or
+    swe_explorer_edit_validations)."""
     baseline_runs = aliased(SweBenchRun, name="baseline_runs")
     baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
+    baseline_resolved = aliased(resolved_model, name="baseline_resolved_rows")
     miner_runs = aliased(SweBenchRun, name="miner_runs")
     miner_validations = aliased(SweBenchRunValidation, name="miner_validations")
+    miner_resolved = aliased(resolved_model, name="miner_resolved_rows")
 
-    rows = (
+    return (
         await db.execute(
             select(
                 SweBenchTask.id.label("task_id"),
@@ -246,19 +284,19 @@ async def load_competition_incentive_inputs(
                 Miner.ss58.label("hotkey"),
                 baseline_runs.id.label("baseline_run_id"),
                 baseline_runs.tokens_used.label("baseline_tokens_used"),
-                _nullable_col(SweBenchRun, "input_tokens", baseline_runs).label("baseline_input_tokens"),
-                _nullable_col(SweBenchRun, "cached_input_tokens", baseline_runs).label("baseline_cached_input_tokens"),
-                _nullable_col(SweBenchRun, "output_tokens", baseline_runs).label("baseline_output_tokens"),
-                baseline_validations.resolved.label("baseline_resolved"),
+                baseline_runs.input_tokens.label("baseline_input_tokens"),
+                baseline_runs.cached_input_tokens.label("baseline_cached_input_tokens"),
+                baseline_runs.output_tokens.label("baseline_output_tokens"),
+                baseline_resolved.resolved.label("baseline_resolved"),
                 miner_runs.id.label("run_id"),
                 miner_runs.attempt_no.label("attempt_no"),
                 miner_runs.tokens_used.label("run_tokens_used"),
-                _nullable_col(SweBenchRun, "input_tokens", miner_runs).label("run_input_tokens"),
-                _nullable_col(SweBenchRun, "cached_input_tokens", miner_runs).label("run_cached_input_tokens"),
-                _nullable_col(SweBenchRun, "output_tokens", miner_runs).label("run_output_tokens"),
+                miner_runs.input_tokens.label("run_input_tokens"),
+                miner_runs.cached_input_tokens.label("run_cached_input_tokens"),
+                miner_runs.output_tokens.label("run_output_tokens"),
                 miner_runs.time_taken_seconds.label("time_taken_seconds"),
                 miner_runs.agent_steps.label("agent_steps"),
-                miner_validations.resolved.label("run_resolved"),
+                miner_resolved.resolved.label("run_resolved"),
             )
             .select_from(SweBenchTask)
             .join(
@@ -266,21 +304,31 @@ async def load_competition_incentive_inputs(
                 and_(
                     baseline_runs.task_fk == SweBenchTask.id,
                     baseline_runs.baseline_run.is_(True),
+                    baseline_runs.benchmark_type == benchmark_type,
                 ),
             )
             .outerjoin(
                 baseline_validations,
                 baseline_validations.run_fk == baseline_runs.id,
             )
+            .outerjoin(
+                baseline_resolved,
+                baseline_resolved.validation_fk == baseline_validations.id,
+            )
             .join(
                 miner_runs,
                 and_(
                     miner_runs.task_fk == SweBenchTask.id,
                     miner_runs.baseline_run.is_(False),
+                    miner_runs.benchmark_type == benchmark_type,
                 ),
             )
             .join(Miner, Miner.id == miner_runs.miner_fk)
             .outerjoin(miner_validations, miner_validations.run_fk == miner_runs.id)
+            .outerjoin(
+                miner_resolved,
+                miner_resolved.validation_fk == miner_validations.id,
+            )
             .where(
                 SweBenchTask.competition_fk == competition_id,
                 Miner.miner_banned_status.is_(False),
@@ -294,10 +342,219 @@ async def load_competition_incentive_inputs(
         )
     ).all()
 
-    task_difficulties = derive_task_difficulties(build_baseline_task_data(rows))
-    miner_category_scores = build_swe_miner_category_scores_with_penalty(rows, task_difficulties)
-    miner_total_scores = _miner_total_score_from_rows(rows)
-    return DIFFICULTY_CATEGORIES, miner_category_scores, miner_total_scores
+
+def _to_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _average(values: Sequence[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+async def _load_explore_scores_by_hotkey(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> dict[str, float]:
+    """Per-miner swe_explorer_explore totals via the explore-quality path."""
+    from app.api.routes.scoring import (
+        compute_explore_miner_total_score,
+        compute_explore_task_score,
+        compute_weighted_tokens,
+    )
+
+    baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
+    baseline_explore = aliased(SweExplorerValidation, name="baseline_explore_rows")
+    baseline_rows = (
+        await db.execute(
+            select(
+                SweBenchTask.id.label("task_id"),
+                SweBenchRun.input_tokens.label("input_tokens"),
+                SweBenchRun.cached_input_tokens.label("cached_input_tokens"),
+                SweBenchRun.output_tokens.label("output_tokens"),
+                baseline_explore.hit_file_rate.label("hit_file_rate"),
+                baseline_explore.noise_file_rate.label("noise_file_rate"),
+            )
+            .select_from(SweBenchTask)
+            .join(
+                SweBenchRun,
+                and_(
+                    SweBenchRun.task_fk == SweBenchTask.id,
+                    SweBenchRun.baseline_run.is_(True),
+                    SweBenchRun.benchmark_type == "swe_explorer_explore",
+                ),
+            )
+            .outerjoin(
+                baseline_validations,
+                baseline_validations.run_fk == SweBenchRun.id,
+            )
+            .outerjoin(
+                baseline_explore,
+                baseline_explore.validation_fk == baseline_validations.id,
+            )
+            .where(SweBenchTask.competition_fk == competition_id)
+        )
+    ).all()
+
+    baseline_qualities: dict[int, list[float]] = {}
+    baseline_weighted: dict[int, list[float]] = {}
+    for row in baseline_rows:
+        task_id = int(row.task_id)
+        hit = _to_optional_float(row.hit_file_rate)
+        noise = _to_optional_float(row.noise_file_rate)
+        if hit is not None and noise is not None:
+            baseline_qualities.setdefault(task_id, []).append(hit - noise)
+        weighted = compute_weighted_tokens(
+            input_tokens=row.input_tokens,
+            cached_input_tokens=row.cached_input_tokens,
+            output_tokens=row.output_tokens,
+        )
+        if weighted is not None:
+            baseline_weighted.setdefault(task_id, []).append(float(weighted))
+
+    baseline_quality_by_task = {
+        task_id: _average(values) for task_id, values in baseline_qualities.items()
+    }
+    baseline_weighted_by_task = {
+        task_id: _average(values) for task_id, values in baseline_weighted.items()
+    }
+
+    miner_validations = aliased(SweBenchRunValidation, name="miner_validations")
+    miner_explore = aliased(SweExplorerValidation, name="miner_explore_rows")
+    miner_rows = (
+        await db.execute(
+            select(
+                SweBenchTask.id.label("task_id"),
+                Miner.ss58.label("hotkey"),
+                SweBenchRun.input_tokens.label("input_tokens"),
+                SweBenchRun.cached_input_tokens.label("cached_input_tokens"),
+                SweBenchRun.output_tokens.label("output_tokens"),
+                miner_explore.hit_file_rate.label("hit_file_rate"),
+                miner_explore.noise_file_rate.label("noise_file_rate"),
+            )
+            .select_from(SweBenchTask)
+            .join(
+                SweBenchRun,
+                and_(
+                    SweBenchRun.task_fk == SweBenchTask.id,
+                    SweBenchRun.baseline_run.is_(False),
+                    SweBenchRun.benchmark_type == "swe_explorer_explore",
+                ),
+            )
+            .join(Miner, Miner.id == SweBenchRun.miner_fk)
+            .outerjoin(miner_validations, miner_validations.run_fk == SweBenchRun.id)
+            .outerjoin(
+                miner_explore,
+                miner_explore.validation_fk == miner_validations.id,
+            )
+            .where(
+                SweBenchTask.competition_fk == competition_id,
+                Miner.miner_banned_status.is_(False),
+            )
+        )
+    ).all()
+
+    miner_qualities: dict[str, dict[int, list[float]]] = {}
+    miner_weighted: dict[str, dict[int, list[float]]] = {}
+    miner_tasks: dict[str, set[int]] = {}
+    for row in miner_rows:
+        hotkey = str(row.hotkey)
+        task_id = int(row.task_id)
+        miner_tasks.setdefault(hotkey, set()).add(task_id)
+        hit = _to_optional_float(row.hit_file_rate)
+        noise = _to_optional_float(row.noise_file_rate)
+        if hit is not None and noise is not None:
+            miner_qualities.setdefault(hotkey, {}).setdefault(task_id, []).append(hit - noise)
+        weighted = compute_weighted_tokens(
+            input_tokens=row.input_tokens,
+            cached_input_tokens=row.cached_input_tokens,
+            output_tokens=row.output_tokens,
+        )
+        if weighted is not None:
+            miner_weighted.setdefault(hotkey, {}).setdefault(task_id, []).append(float(weighted))
+
+    scores: dict[str, float] = {}
+    for hotkey, task_ids in miner_tasks.items():
+        task_scores: list[float] = []
+        task_margins: list[float] = []
+        miner_weighted_total = 0.0
+        baseline_weighted_total = 0.0
+        has_miner_weighted = False
+        has_baseline_weighted = False
+
+        for task_id in sorted(task_ids):
+            miner_quality = _average(miner_qualities.get(hotkey, {}).get(task_id, []))
+            baseline_quality = baseline_quality_by_task.get(task_id)
+            miner_weighted_avg = _average(miner_weighted.get(hotkey, {}).get(task_id, []))
+            baseline_weighted_avg = baseline_weighted_by_task.get(task_id)
+
+            task_score = compute_explore_task_score(
+                miner_quality,
+                baseline_quality,
+                miner_weighted_avg,
+                baseline_weighted_avg,
+            )
+            if task_score is not None:
+                task_scores.append(task_score)
+            if miner_quality is not None and baseline_quality is not None:
+                task_margins.append(miner_quality - baseline_quality)
+            if miner_weighted_avg is not None:
+                miner_weighted_total += miner_weighted_avg
+                has_miner_weighted = True
+            if baseline_weighted_avg is not None:
+                baseline_weighted_total += baseline_weighted_avg
+                has_baseline_weighted = True
+
+        total_score = compute_explore_miner_total_score(
+            task_scores,
+            task_margins,
+            miner_weighted_total if has_miner_weighted else None,
+            baseline_weighted_total if has_baseline_weighted else None,
+        )
+        if total_score is not None:
+            scores[hotkey] = float(total_score)
+
+    return scores
+
+
+async def load_competition_incentive_inputs(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> tuple[tuple[BenchmarkType, ...], dict[str, dict[BenchmarkType, float]]]:
+    verified_rows = await _load_swe_benchmark_rows(
+        db,
+        competition_id=competition_id,
+        benchmark_type="swebench_verified",
+        resolved_model=SweBenchVerifiedValidation,
+    )
+    edit_rows = await _load_swe_benchmark_rows(
+        db,
+        competition_id=competition_id,
+        benchmark_type="swe_explorer_edit",
+        resolved_model=SweExplorerEditValidation,
+    )
+
+    scores_by_benchmark: dict[BenchmarkType, dict[str, float]] = {
+        "swebench_verified": _swe_scores_by_hotkey(verified_rows),
+        "swe_explorer_edit": _swe_scores_by_hotkey(edit_rows),
+        "swe_explorer_explore": await _load_explore_scores_by_hotkey(
+            db,
+            competition_id=competition_id,
+        ),
+    }
+
+    miner_benchmark_scores: dict[str, dict[BenchmarkType, float]] = {}
+    for benchmark_type, scores in scores_by_benchmark.items():
+        for hotkey, score in scores.items():
+            miner_benchmark_scores.setdefault(hotkey, {})[benchmark_type] = score
+
+    return BENCHMARK_TYPES, miner_benchmark_scores
 
 
 async def calculate_competition_incentive_weights(
@@ -306,15 +563,14 @@ async def calculate_competition_incentive_weights(
     competition_id: int,
     burn_ratio: float,
 ) -> IncentiveCalculationResult:
-    categories, miner_category_scores, miner_total_scores = await load_competition_incentive_inputs(
+    benchmark_types, miner_benchmark_scores = await load_competition_incentive_inputs(
         db,
         competition_id=competition_id,
     )
     return calculate_incentive_weights(
-        miner_category_scores,
-        categories,
+        miner_benchmark_scores,
+        benchmark_types,
         burn_ratio=burn_ratio,
-        miner_total_scores=miner_total_scores,
     )
 
 
