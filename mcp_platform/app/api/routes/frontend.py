@@ -1029,11 +1029,14 @@ def _inject_screener_summary_per_miner(
     payload: dict[str, Any],
     miners_snapshot: SweMinersSnapshot,
 ) -> None:
-    """Attach the screener-only miner-vs-baseline summary to each miner entry."""
+    """Attach the screener-only miner-vs-baseline summary to each miner summary."""
     for miner_dict in payload.get("miners", []):
-        hotkey = str(miner_dict.get("miner", {}).get("hotkey", ""))
+        miner_summary = miner_dict.get("miner")
+        if not isinstance(miner_summary, dict):
+            continue
+        hotkey = str(miner_summary.get("hotkey", ""))
         item = miners_snapshot.miners_by_hotkey.get(hotkey)
-        miner_dict["screener"] = {
+        miner_summary["screener"] = {
             "score": item.screener_score if item is not None else None,
             "baseline_weighted_tokens": (
                 _round_optional_1dp(item.screener_baseline_weighted_tokens)
