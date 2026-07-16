@@ -351,16 +351,16 @@ def create_app() -> FastAPI:
         except BaseException as exc:
             _log_startup_failure("heartbeat_start", exc)
             raise
-        try:
-            start_batch_cleanup_task(app)
-        except BaseException as exc:
-            _log_startup_failure("batch_cleanup_start", exc)
-            raise
-        try:
-            start_mv_refresh_task(app)
-        except BaseException as exc:
-            _log_startup_failure("mv_refresh_start", exc)
-            raise
+        # try:
+        #     start_batch_cleanup_task(app)
+        # except BaseException as exc:
+        #     _log_startup_failure("batch_cleanup_start", exc)
+        #     raise
+        # try:
+        #     start_mv_refresh_task(app)
+        # except BaseException as exc:
+        #     _log_startup_failure("mv_refresh_start", exc)
+        #     raise
         try:
             start_swebench_orchestrator_task(app)
         except BaseException as exc:
@@ -387,8 +387,8 @@ def create_app() -> FastAPI:
                 logger.exception("sandbox_manager_shutdown_failed")
 
         stop_heartbeat_thread(app)
-        await stop_batch_cleanup_task(app)
-        await stop_mv_refresh_task(app)
+        # await stop_batch_cleanup_task(app)
+        # await stop_mv_refresh_task(app)
         await stop_swebench_orchestrator_task(app)
         await close_db()
         logger.info("shutdown_complete")
