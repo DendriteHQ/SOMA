@@ -296,6 +296,44 @@ class Settings(BaseSettings):
         default=3,
         alias="SWEBENCH_DYNAMIC_SCREENER_TASK_COUNT",
     )
+    # Two-stage screening. Stage 1 is a liveness / non-regression gate that runs
+    # during the upload window on public tasks and has NO saving threshold — it
+    # only requires that quality does not regress below baseline by more than
+    # the per-benchmark epsilon. Stage 2 keeps the existing pass-ratio + weighted
+    # saving threshold on hidden tasks after the upload window closes.
+    #
+    # Quality-drop tolerance for stage 1, per benchmark type. Stage 1 pools the
+    # quality of the WHOLE stage-1 sample per benchmark type (all tasks × all
+    # attempts, e.g. 5 tasks × 5 runs = 25 samples) and passes the type when
+    # pooled_miner_mean >= pooled_baseline_mean - epsilon. Verified/edit quality
+    # is a resolved fraction (0..1); with a 25-run pool one run ≈ 0.04, so the
+    # default tolerates roughly a two-run swing from baseline (variance floor)
+    # without letting a real regression through. Explore quality is a continuous
+    # (hit_file_rate - noise_file_rate) value in [-1, 1], so a small absolute
+    # margin suffices. Epsilon is an absolute margin on the pooled mean, NOT a
+    # per-task tolerance.
+    swebench_screening_stage1_quality_epsilon_verified: float = Field(
+        default=0.08,
+        alias="SWEBENCH_SCREENING_STAGE1_QUALITY_EPSILON_VERIFIED",
+    )
+    swebench_screening_stage1_quality_epsilon_explore: float = Field(
+        default=0.05,
+        alias="SWEBENCH_SCREENING_STAGE1_QUALITY_EPSILON_EXPLORE",
+    )
+    swebench_screening_stage1_quality_epsilon_edit: float = Field(
+        default=0.08,
+        alias="SWEBENCH_SCREENING_STAGE1_QUALITY_EPSILON_EDIT",
+    )
+    # Stage-1 token ceiling: besides non-regressing quality, a script must not
+    # inflate weighted tokens beyond baseline by more than this ratio. Pooled
+    # over the whole stage-1 sample (all tasks × attempts × types), a script
+    # fails when (miner_total - baseline_total) / baseline_total > epsilon, i.e.
+    # miner_total > baseline_total * (1 + epsilon). This is a "don't make it
+    # worse" gate, NOT the stage-2 saving threshold; default 5% absorbs variance.
+    swebench_screening_stage1_token_epsilon_ratio: float = Field(
+        default=0.05,
+        alias="SWEBENCH_SCREENING_STAGE1_TOKEN_EPSILON_RATIO",
+    )
 
     @field_validator("log_levels", mode="before")
     @classmethod
@@ -557,6 +595,35 @@ class Settings(BaseSettings):
         if value < 0:
             raise ValueError("SWEBENCH screening token weights must be non-negative")
         return float(value)
+
+    @field_validator(
+        "swebench_screening_stage1_quality_epsilon_verified",
+        "swebench_screening_stage1_quality_epsilon_explore",
+        "swebench_screening_stage1_quality_epsilon_edit",
+        "swebench_screening_stage1_token_epsilon_ratio",
+        mode="before",
+    )
+    @classmethod
+    def _parse_swebench_screening_stage1_quality_epsilon(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.0
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SWEBENCH_SCREENING_STAGE1_* epsilon settings must be a number"
+            ) from exc
+        # Accept percent-style input (e.g. "5" -> 0.05) for consistency with the
+        # other screening ratio settings; quality metrics never exceed magnitude 1.
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
 
     @field_validator("previous_competition_screeners_grace_hours", mode="before")
     @classmethod
