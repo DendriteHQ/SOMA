@@ -264,10 +264,17 @@ async def _load_swe_benchmark_rows(
     competition_id: int,
     benchmark_type: BenchmarkType,
     resolved_model: type,
+    task_stage_filter,
 ) -> Sequence[object]:
     """Rows shaped for build_swe_task_groups, with `resolved` coming from the
     benchmark's own validation table (swe_bench_verified_validations or
-    swe_explorer_edit_validations)."""
+    swe_explorer_edit_validations).
+
+    ``task_stage_filter`` is a SweBenchTask filter clause that selects which
+    screener tier(s) to include:
+      - final score:  screener_stage IS DISTINCT FROM 1  (eval + stage-2)
+      - stage-2 rank: screener_stage == 2                (stage-2 only)
+    """
     baseline_runs = aliased(SweBenchRun, name="baseline_runs")
     baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
     baseline_resolved = aliased(resolved_model, name="baseline_resolved_rows")
@@ -332,6 +339,7 @@ async def _load_swe_benchmark_rows(
             .where(
                 SweBenchTask.competition_fk == competition_id,
                 Miner.miner_banned_status.is_(False),
+                task_stage_filter,
             )
             .order_by(
                 SweBenchTask.instance_id.asc(),
@@ -360,6 +368,7 @@ async def _load_explore_scores_by_hotkey(
     db: AsyncSession,
     *,
     competition_id: int,
+    task_stage_filter,
 ) -> dict[str, float]:
     """Per-miner swe_explorer_explore totals via the explore-quality path."""
     from app.api.routes.scoring import (
@@ -397,7 +406,10 @@ async def _load_explore_scores_by_hotkey(
                 baseline_explore,
                 baseline_explore.validation_fk == baseline_validations.id,
             )
-            .where(SweBenchTask.competition_fk == competition_id)
+            .where(
+                SweBenchTask.competition_fk == competition_id,
+                task_stage_filter,
+            )
         )
     ).all()
 
@@ -455,6 +467,7 @@ async def _load_explore_scores_by_hotkey(
             .where(
                 SweBenchTask.competition_fk == competition_id,
                 Miner.miner_banned_status.is_(False),
+                task_stage_filter,
             )
         )
     ).all()
@@ -522,22 +535,27 @@ async def _load_explore_scores_by_hotkey(
     return scores
 
 
-async def load_competition_incentive_inputs(
+async def _load_benchmark_scores(
     db: AsyncSession,
     *,
     competition_id: int,
-) -> tuple[tuple[BenchmarkType, ...], dict[str, dict[BenchmarkType, float]]]:
+    task_stage_filter,
+) -> dict[str, dict[BenchmarkType, float]]:
+    """Per-miner, per-benchmark-type scores for the tasks selected by
+    ``task_stage_filter`` (see ``_load_swe_benchmark_rows``)."""
     verified_rows = await _load_swe_benchmark_rows(
         db,
         competition_id=competition_id,
         benchmark_type="swebench_verified",
         resolved_model=SweBenchVerifiedValidation,
+        task_stage_filter=task_stage_filter,
     )
     edit_rows = await _load_swe_benchmark_rows(
         db,
         competition_id=competition_id,
         benchmark_type="swe_explorer_edit",
         resolved_model=SweExplorerEditValidation,
+        task_stage_filter=task_stage_filter,
     )
 
     scores_by_benchmark: dict[BenchmarkType, dict[str, float]] = {
@@ -546,6 +564,7 @@ async def load_competition_incentive_inputs(
         "swe_explorer_explore": await _load_explore_scores_by_hotkey(
             db,
             competition_id=competition_id,
+            task_stage_filter=task_stage_filter,
         ),
     }
 
@@ -553,6 +572,50 @@ async def load_competition_incentive_inputs(
     for benchmark_type, scores in scores_by_benchmark.items():
         for hotkey, score in scores.items():
             miner_benchmark_scores.setdefault(hotkey, {})[benchmark_type] = score
+
+    return miner_benchmark_scores
+
+
+async def load_stage2_miner_total_scores(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> dict[str, float]:
+    """Per-hotkey total SWE score computed from stage-2 tasks only.
+
+    Uses the exact same benchmark-weighted-average formula as the final
+    competition score (``_subset_weighted_score`` over the full
+    ``BENCHMARK_TYPES`` triple), restricted to ``screener_stage == 2``. This
+    is the ranking key for stage-2 top-N + delta selection, so stage-2
+    standing predicts full-eval standing.
+    """
+    miner_benchmark_scores = await _load_benchmark_scores(
+        db,
+        competition_id=competition_id,
+        task_stage_filter=(SweBenchTask.screener_stage == 2),
+    )
+
+    scores: dict[str, float] = {}
+    for hotkey, benchmark_scores in miner_benchmark_scores.items():
+        total_score = _subset_weighted_score(benchmark_scores, BENCHMARK_TYPES)
+        if total_score is not None:
+            scores[hotkey] = total_score
+    return scores
+
+
+async def load_competition_incentive_inputs(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> tuple[tuple[BenchmarkType, ...], dict[str, dict[BenchmarkType, float]]]:
+    # Full score = eval tasks (screener_stage IS NULL) + stage-2 qualification
+    # tasks (screener_stage = 2). IS DISTINCT FROM keeps NULL and 2, drops
+    # stage-1 (liveness) tasks.
+    miner_benchmark_scores = await _load_benchmark_scores(
+        db,
+        competition_id=competition_id,
+        task_stage_filter=SweBenchTask.screener_stage.is_distinct_from(1),
+    )
 
     return BENCHMARK_TYPES, miner_benchmark_scores
 
