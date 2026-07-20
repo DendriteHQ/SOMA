@@ -183,11 +183,50 @@ def calculate_incentive_weights(
                 )
                 continue
 
-            winning_score = max(subset_scores.values())
+            # Reward flattening: the top-scoring tier on this element is
+            # excluded from winning it, so the element's weight flows to the
+            # next-highest tier of remaining miners instead. This is decided
+            # per element (one of the triple/pairs/singles combinations), not
+            # globally -- a miner who is #1 here can still win a different
+            # element where they aren't the top scorer, so nothing prevents a
+            # strong miner from earning weight overall. It only prevents one
+            # miner from sweeping every element outright by being #1
+            # everywhere at once. Ties at the top are excluded as a whole
+            # tier, matching how ties are already handled below.
+            top_score = max(subset_scores.values())
+            top_tier = {
+                hotkey
+                for hotkey, score in subset_scores.items()
+                if isclose(score, top_score, rel_tol=1e-12, abs_tol=1e-12)
+            }
+            remaining_scores = {
+                hotkey: score
+                for hotkey, score in subset_scores.items()
+                if hotkey not in top_tier
+            }
+
+            if not remaining_scores:
+                # No runner-up exists for this element (e.g. only one miner
+                # has a valid score here) -- the weight goes unclaimed rather
+                # than falling back to the excluded top miner, which would
+                # defeat the purpose. It isn't wasted: raw_weights normalizes
+                # against whatever total IS claimed, so this element's share
+                # flows proportionally to miners who won elsewhere instead.
+                element_results.append(
+                    IncentiveElementResult(
+                        subset=subset,
+                        weight=element_weight,
+                        winners=(),
+                        winning_score=None,
+                    )
+                )
+                continue
+
+            winning_score = max(remaining_scores.values())
             winners = tuple(
                 sorted(
                     hotkey
-                    for hotkey, score in subset_scores.items()
+                    for hotkey, score in remaining_scores.items()
                     if isclose(score, winning_score, rel_tol=1e-12, abs_tol=1e-12)
                 )
             )
