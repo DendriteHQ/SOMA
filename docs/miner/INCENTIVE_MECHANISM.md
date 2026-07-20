@@ -56,6 +56,16 @@ So:
 - `L1` has 3 elements, each worth `0.45 / 3 = 0.15`
 - `L2` has 3 elements, each worth `0.30 / 3 = 0.10`
 
+### Subset score
+
+The score of miner $m$ on a subset is the base-weighted average over the subset members, with the base benchmark weights renormalized within the subset:
+
+$$
+S_{subset}(m)=\frac{\sum_{b\in subset} w_b \cdot S_b(m)}{\sum_{b\in subset} w_b}
+$$
+
+where $w_v=0.50$, $w_x=0.25$, $w_e=0.25$. For the `L0` triple this reduces to $S_{bench}(m)$; for singles it is the raw per-benchmark score. A miner with no score on any member benchmark does not compete on that element.
+
 For each element, winner(s) are miner(s) with the top score on that subset. If tied, element weight is split evenly.
 
 ## Miner raw incentive weight
