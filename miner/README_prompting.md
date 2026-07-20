@@ -105,7 +105,7 @@ Allowed exact strings:
 - `[[/BLOCK X]]`
 - `Same response as in [[BLOCK X]].`
 - `[[CMP]] source line N [[/CMP]]`
-- `[[CMP]] source line N ~ source line M Omitted [[/CMP]]`
+- `[[Omitted]] source line N ~ source line M Omitted [[/Omitted]]`
 
 ### 5.2 Loop Detection
 
