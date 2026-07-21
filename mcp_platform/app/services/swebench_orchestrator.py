@@ -95,6 +95,59 @@ def _non_baseline_eligibility_sql(
     ).strip()
 
 
+def _competition_within_active_timeframe_sql(competition_fk_expr: str) -> str:
+    """EXISTS snippet: does competition_fk_expr still have a non-expired,
+    active timeframe? Used to stop dispatching/keeping runs whose
+    competition has since been superseded (deactivated or past eval_ends_at),
+    even if the run itself was seeded while the competition was still live.
+    """
+    return (
+        f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM competition_configs cc
+                        JOIN competition_timeframes ctf
+                          ON ctf.competition_config_fk = cc.id
+                        WHERE cc.competition_fk = {competition_fk_expr}
+                          AND cc.is_active = TRUE
+                          AND ctf.eval_ends_at >= :now
+                    )
+        """
+    ).strip()
+
+
+def _screener_stage_baseline_scored_sql(*, task_expr: str, run_expr: str) -> str:
+    """Boolean snippet: is it safe to dispatch run_expr given task_expr's
+    screener stage? Non-baseline runs on a screener-stage task must wait for
+    every baseline run of that same (competition, screener_stage) to be
+    scored — the baseline is the quality reference stage1/stage2 evaluation
+    reads from. Baseline runs themselves, and full-evaluation tasks
+    (screener_stage IS NULL), are never gated here.
+
+    Seeding now creates miner runs alongside the baseline (see
+    _seed_runs_for_competition) instead of waiting for it to score, so this
+    is the actual enforcement point instead of a seed-time gate.
+    """
+    return (
+        f"""
+                    (
+                        {run_expr}.baseline_run = TRUE
+                        OR {task_expr}.screener_stage IS NULL
+                        OR NOT EXISTS (
+                            SELECT 1
+                            FROM swe_bench_runs br
+                            JOIN swe_bench_tasks bt ON bt.id = br.task_fk
+                            LEFT JOIN swe_bench_run_validations bv ON bv.run_fk = br.id
+                            WHERE br.baseline_run = TRUE
+                              AND bt.competition_fk = {task_expr}.competition_fk
+                              AND bt.screener_stage = {task_expr}.screener_stage
+                              AND (bv.id IS NULL OR bv.scored_at IS NULL)
+                        )
+                    )
+        """
+    ).strip()
+
+
 def start_swebench_orchestrator_task(app) -> None:
     interval = max(0.5, float(settings.swebench_orchestrator_interval_seconds))
     task = asyncio.create_task(_run_orchestrator_loop(app, interval))
@@ -635,6 +688,118 @@ def _select_stage2_advancers(
     return selected
 
 
+async def _classify_stage1_scripts(
+    db: AsyncSession,
+    *,
+    scripts: list[_ScriptRef],
+    stage1_ids: list[int],
+    task_repeats: dict[int, int],
+) -> dict[tuple[int, int], tuple[bool, bool]]:
+    """(script_id, miner_fk) -> (complete, passed) from the stage-1 quality +
+    saving gate (evaluate_stage1_for_script). Extracted so orchestrator
+    seeding and frontend status share one source of truth for who has
+    passed stage 1, instead of drifting apart.
+
+    When stage1_ids is empty, every script vacuously passes (complete=True,
+    passed=True) — matches "no stage-1 configured" seeding behavior.
+    """
+    if not stage1_ids:
+        return {(s.script_id, s.miner_fk): (True, True) for s in scripts}
+
+    stage1_baseline_states = await _load_screening_baseline_states(db, task_ids=stage1_ids)
+    stage1_miner_states = await _load_screening_miner_run_states(
+        db, scripts=scripts, task_ids=stage1_ids
+    )
+
+    result: dict[tuple[int, int], tuple[bool, bool]] = {}
+    for script in scripts:
+        (
+            baseline_quality,
+            miner_quality,
+            baseline_weighted,
+            miner_weighted,
+        ) = _stage1_quality_inputs(
+            stage1_baseline_states,
+            stage1_miner_states.get((script.script_id, script.miner_fk), {}),
+        )
+        complete, passed = await screening_shared.evaluate_stage1_for_script(
+            stage1_task_ids=stage1_ids,
+            task_repeats=task_repeats,
+            benchmark_types=_SCREENING_BENCHMARK_TYPES,
+            baseline_quality_by_task_attempt=baseline_quality,
+            stage1_quality_by_task_attempt=miner_quality,
+            baseline_weighted_by_task_attempt=baseline_weighted,
+            stage1_weighted_by_task_attempt=miner_weighted,
+        )
+        result[(script.script_id, script.miner_fk)] = (complete, passed)
+    return result
+
+
+async def _classify_stage2_scripts(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+    stage1_passers: list[_ScriptRef],
+    stage2_ids: list[int],
+    task_repeats: dict[int, int],
+) -> tuple[bool, list[_ScriptRef]]:
+    """Returns (cohort_complete, advancers). advancers is only meaningful
+    once cohort_complete is True (empty otherwise). Extracted so
+    orchestrator seeding and frontend status share one source of truth for
+    stage-2 ranking/advancement.
+
+    When stage2_ids is empty, every stage-1 passer advances directly
+    (matches "no stage-2 configured" seeding behavior).
+    """
+    if not stage2_ids:
+        return True, list(stage1_passers)
+
+    if not await _is_screener_baseline_complete(
+        db, screener_task_ids=stage2_ids, task_repeats=task_repeats
+    ):
+        return False, []
+
+    # No pass/fail gate on stage 2: quality is already gated at stage 1 and
+    # the SWE score (which blends quality + saving) drives selection. We only
+    # need every stage-1 passer's stage-2 runs to be scored before ranking,
+    # because top-N is relative across the whole cohort — ranking on partial
+    # data would advance the wrong set (and full-eval seeding is one-shot).
+    stage2_miner_states = await _load_screening_miner_run_states(
+        db, scripts=stage1_passers, task_ids=stage2_ids
+    )
+    cohort_complete = all(
+        _stage2_runs_complete(
+            task_ids=stage2_ids,
+            task_repeats=task_repeats,
+            benchmark_types=_SCREENING_BENCHMARK_TYPES,
+            miner_state=stage2_miner_states.get((script.script_id, script.miner_fk), {}),
+        )
+        for script in stage1_passers
+    )
+    if stage1_passers and not cohort_complete:
+        return False, []
+
+    # Rank by the canonical SWE total score (quality + saving) computed from
+    # stage-2 tasks only — the same formula as the final competition score,
+    # so stage-2 standing predicts full-eval standing. Top-N + delta advance.
+    from app.services import incentive_calculator
+
+    stage2_scores_by_hotkey = (
+        await incentive_calculator.load_stage2_miner_total_scores(
+            db, competition_id=competition_id
+        )
+        if stage1_passers
+        else {}
+    )
+    # A miner with no computable score (e.g. all stage-2 runs failed) sorts last.
+    scored_passers = [
+        (script, float(stage2_scores_by_hotkey.get(script.ss58, -1.0)))
+        for script in stage1_passers
+    ]
+    advancers = _select_stage2_advancers(scored_passers)
+    return True, advancers
+
+
 async def _seed_runs_for_competition(
     db: AsyncSession,
     *,
@@ -678,15 +843,14 @@ async def _seed_runs_for_competition(
             now=now,
             benchmark_types=_SCREENING_BENCHMARK_TYPES,
         )
-        if not await _is_screener_baseline_complete(
-            db, screener_task_ids=stage1_ids, task_repeats=task_repeats
-        ):
-            # Stage-1 baseline is the quality reference; wait for it to be scored
-            # before loading scripts or seeding any miner runs.
-            return created
-
+        # Miner runs are seeded regardless of baseline completeness — the
+        # baseline is only the *quality reference*, not a precondition for run
+        # existence. _classify_stage1_scripts() below reports complete=False
+        # per script until its baseline/miner data is actually scored, so
+        # stage1_passers naturally stays empty until then. Dispatch is what
+        # actually withholds these runs until baseline is scored (see
+        # _screener_stage_baseline_scored_sql in _dispatch_due_runs).
         scripts = await _load_latest_scripts_for_competition(db, competition_id)
-        stage1_baseline_states = await _load_screening_baseline_states(db, task_ids=stage1_ids)
         if scripts:
             existing_stage1 = await _load_existing_non_baseline_run_keys_for_scripts(
                 db, scripts=scripts, task_ids=stage1_ids, benchmark_types=_SCREENING_BENCHMARK_TYPES
@@ -702,31 +866,14 @@ async def _seed_runs_for_competition(
                     now=now,
                 )
 
-        stage1_miner_states = await _load_screening_miner_run_states(
-            db, scripts=scripts, task_ids=stage1_ids
+        stage1_results = await _classify_stage1_scripts(
+            db, scripts=scripts, stage1_ids=stage1_ids, task_repeats=task_repeats
         )
-        stage1_passers = []
-        for script in scripts:
-            (
-                baseline_quality,
-                miner_quality,
-                baseline_weighted,
-                miner_weighted,
-            ) = _stage1_quality_inputs(
-                stage1_baseline_states,
-                stage1_miner_states.get((script.script_id, script.miner_fk), {}),
-            )
-            complete, passed = await screening_shared.evaluate_stage1_for_script(
-                stage1_task_ids=stage1_ids,
-                task_repeats=task_repeats,
-                benchmark_types=_SCREENING_BENCHMARK_TYPES,
-                baseline_quality_by_task_attempt=baseline_quality,
-                stage1_quality_by_task_attempt=miner_quality,
-                baseline_weighted_by_task_attempt=baseline_weighted,
-                stage1_weighted_by_task_attempt=miner_weighted,
-            )
-            if complete and passed:
-                stage1_passers.append(script)
+        stage1_passers = [
+            script
+            for script in scripts
+            if stage1_results.get((script.script_id, script.miner_fk)) == (True, True)
+        ]
     else:
         # No stage-1 configured: every eligible script proceeds to stage 2.
         stage1_passers = list(scripts)
@@ -736,7 +883,6 @@ async def _seed_runs_for_competition(
         return created
 
     # ── Stage 2: baseline → seed (stage-1 passers) → evaluate → rank ─────────
-    advancers: list[_ScriptRef]
     if stage2_ids:
         created += await _seed_baseline_runs(
             db,
@@ -745,11 +891,9 @@ async def _seed_runs_for_competition(
             now=now,
             benchmark_types=_SCREENING_BENCHMARK_TYPES,
         )
-        if not await _is_screener_baseline_complete(
-            db, screener_task_ids=stage2_ids, task_repeats=task_repeats
-        ):
-            return created
-
+        # Seed stage-2 miner runs for stage-1 passers regardless of stage-2
+        # baseline completeness (same rationale as stage 1: existence isn't
+        # gated on the baseline being scored, only ranking/advancement is).
         if stage1_passers:
             existing_stage2 = await _load_existing_non_baseline_run_keys_for_scripts(
                 db, scripts=stage1_passers, task_ids=stage2_ids, benchmark_types=_SCREENING_BENCHMARK_TYPES
@@ -765,48 +909,18 @@ async def _seed_runs_for_competition(
                     now=now,
                 )
 
-        # No pass/fail gate on stage 2: quality is already gated at stage 1 and
-        # the SWE score (which blends quality + saving) drives selection. We only
-        # need every stage-1 passer's stage-2 runs to be scored before ranking,
-        # because top-N is relative across the whole cohort — ranking on partial
-        # data would advance the wrong set (and full-eval seeding is one-shot).
-        stage2_miner_states = await _load_screening_miner_run_states(
-            db, scripts=stage1_passers, task_ids=stage2_ids
-        )
-        cohort_complete = all(
-            _stage2_runs_complete(
-                task_ids=stage2_ids,
-                task_repeats=task_repeats,
-                benchmark_types=_SCREENING_BENCHMARK_TYPES,
-                miner_state=stage2_miner_states.get((script.script_id, script.miner_fk), {}),
-            )
-            for script in stage1_passers
-        )
-        if stage1_passers and not cohort_complete:
-            # Wait for the stage-2 cohort to finish before ranking.
-            return created
-
-        # Rank by the canonical SWE total score (quality + saving) computed from
-        # stage-2 tasks only — the same formula as the final competition score,
-        # so stage-2 standing predicts full-eval standing. Top-N + delta advance.
-        from app.services import incentive_calculator
-
-        stage2_scores_by_hotkey = (
-            await incentive_calculator.load_stage2_miner_total_scores(
-                db, competition_id=competition_id
-            )
-            if stage1_passers
-            else {}
-        )
-        # A miner with no computable score (e.g. all stage-2 runs failed) sorts last.
-        scored_passers = [
-            (script, float(stage2_scores_by_hotkey.get(script.ss58, -1.0)))
-            for script in stage1_passers
-        ]
-        advancers = _select_stage2_advancers(scored_passers)
-    else:
-        # No stage-2 configured: all stage-1 passers advance to full evaluation.
-        advancers = list(stage1_passers)
+    cohort_complete, advancers = await _classify_stage2_scripts(
+        db,
+        competition_id=competition_id,
+        stage1_passers=stage1_passers,
+        stage2_ids=stage2_ids,
+        task_repeats=task_repeats,
+    )
+    if not cohort_complete:
+        # Stage-2 baseline/cohort still incomplete (or, if stage2_ids is
+        # non-empty, the classify call itself covers both). Wait before
+        # seeding full evaluation.
+        return created
 
     # ── Full evaluation: baseline(eval) + full matrix for advancers only ─────
     if advancers and eval_task_ids:
@@ -878,7 +992,7 @@ async def _load_latest_scripts_for_competition(
         await db.execute(
             text(
                 """
-                SELECT s.id, s.miner_fk, u.created_at
+                SELECT s.id, s.miner_fk, m.ss58, u.created_at
                 FROM scripts s
                 JOIN miner_uploads u ON u.script_fk = s.id
                 JOIN miners m ON m.id = s.miner_fk
@@ -896,9 +1010,10 @@ async def _load_latest_scripts_for_competition(
     for row in rows:
         script_id = int(row[0])
         miner_fk = int(row[1])
+        ss58 = str(row[2]) if row[2] is not None else None
         if miner_fk in by_miner:
             continue
-        by_miner[miner_fk] = _ScriptRef(script_id=script_id, miner_fk=miner_fk)
+        by_miner[miner_fk] = _ScriptRef(script_id=script_id, miner_fk=miner_fk, ss58=ss58)
     return list(by_miner.values())
 
 
@@ -1365,6 +1480,8 @@ async def _dispatch_due_runs(
         miner_fk_expr="r.miner_fk",
         competition_fk_expr="t.competition_fk",
     )
+    active_timeframe_sql = _competition_within_active_timeframe_sql("t.competition_fk")
+    baseline_scored_sql = _screener_stage_baseline_scored_sql(task_expr="t", run_expr="r")
 
     async for db in get_db_session():
         banned_pending_result = await db.execute(
@@ -1432,6 +1549,8 @@ async def _dispatch_due_runs(
                     FROM swe_bench_runs r
                     JOIN swe_bench_tasks t ON t.id = r.task_fk
                     WHERE r.status = 'pending'
+                      AND ({active_timeframe_sql})
+                      AND ({baseline_scored_sql})
                       AND (
                           r.baseline_run = TRUE
                           OR ({eligibility_sql})
@@ -1451,9 +1570,11 @@ async def _dispatch_due_runs(
                     LIMIT :limit
                     """.format(
                         eligibility_sql=eligibility_sql,
+                        active_timeframe_sql=active_timeframe_sql,
+                        baseline_scored_sql=baseline_scored_sql,
                     )
                 ),
-                {"limit": fetch_limit},
+                {"limit": fetch_limit, "now": now},
             )
         ).mappings().all()
 
