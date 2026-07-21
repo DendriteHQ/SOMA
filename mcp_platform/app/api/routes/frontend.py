@@ -84,7 +84,6 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.api.routes.scoring import (
     build_swe_miner_total_score,
-    build_swe_category_scores,
     build_swe_task_groups,
     build_swe_task_result_item,
     compute_weighted_tokens,
@@ -202,6 +201,43 @@ class FrontendApiKeyContext:
     rate_limit_rpd: int | None
 
 
+SWE_BENCHMARK_TYPES = (
+    "swebench_verified",
+    "swe_explorer_explore",
+    "swe_explorer_edit",
+)
+
+# Base benchmark weighting (docs/miner/INCENTIVE_MECHANISM.md):
+# S_bench = 0.50 * S_v + 0.25 * S_x + 0.25 * S_e.
+SWE_BENCHMARK_WEIGHTS: dict[str, float] = {
+    "swebench_verified": 0.50,
+    "swe_explorer_explore": 0.25,
+    "swe_explorer_edit": 0.25,
+}
+
+
+def _weighted_total_score(category_scores: dict[str, float] | None) -> float | None:
+    """Benchmark-weighted average of the per-benchmark scores.
+
+    Weights are renormalized over the benchmarks the miner has a score for,
+    so a missing benchmark does not drag the total. Every component is
+    already normalized to [-1, 1], hence the result stays in [-1, 1].
+    """
+    if not category_scores:
+        return None
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for benchmark_type, score in category_scores.items():
+        weight = SWE_BENCHMARK_WEIGHTS.get(benchmark_type, 0.0)
+        if weight <= 0.0:
+            continue
+        weighted_sum += weight * float(score)
+        weight_total += weight
+    if weight_total <= 0.0:
+        return None
+    return weighted_sum / weight_total
+
+
 @dataclass(slots=True)
 class SweMinerSnapshotItem:
     hotkey: str
@@ -210,6 +246,10 @@ class SweMinerSnapshotItem:
     category_scores: dict[str, float] | None
     task_count: int
     screener_task_count: int
+    screener_score: float | None = None
+    screener_baseline_weighted_tokens: float | None = None
+    screener_miner_weighted_tokens: float | None = None
+    screener_token_savings_ratio: float | None = None
 
 
 @dataclass(slots=True)
@@ -237,7 +277,7 @@ class SweCompetitionMinerMeta:
 
 
 SWE_ROWS_SNAPSHOT_CACHE_VERSION = "v1"
-SWE_MINERS_SNAPSHOT_CACHE_VERSION = "v1"
+SWE_MINERS_SNAPSHOT_CACHE_VERSION = "v2"
 SWE_ROWS_SNAPSHOT_TTL_SECONDS = 300
 SWE_MINERS_SNAPSHOT_TTL_SECONDS = 300
 _swe_rows_snapshot_build_lock = asyncio.Lock()
@@ -1018,6 +1058,35 @@ def _inject_benchmark_tasks_per_miner(
         miner_dict["total_tasks"] = len(miner_dict["tasks"])
 
 
+def _inject_screener_summary_per_miner(
+    payload: dict[str, Any],
+    miners_snapshot: SweMinersSnapshot,
+) -> None:
+    """Attach the screener-only miner-vs-baseline summary to each miner summary."""
+    for miner_dict in payload.get("miners", []):
+        miner_summary = miner_dict.get("miner")
+        if not isinstance(miner_summary, dict):
+            continue
+        hotkey = str(miner_summary.get("hotkey", ""))
+        item = miners_snapshot.miners_by_hotkey.get(hotkey)
+        miner_summary["screener"] = {
+            "score": item.screener_score if item is not None else None,
+            "baseline_weighted_tokens": (
+                _round_optional_1dp(item.screener_baseline_weighted_tokens)
+                if item is not None
+                else None
+            ),
+            "miner_weighted_tokens": (
+                _round_optional_1dp(item.screener_miner_weighted_tokens)
+                if item is not None
+                else None
+            ),
+            "token_savings_ratio": (
+                item.screener_token_savings_ratio if item is not None else None
+            ),
+        }
+
+
 async def _get_competition_aggregate_payload(
     request: Request,
     db: AsyncSession,
@@ -1028,7 +1097,7 @@ async def _get_competition_aggregate_payload(
         latest_competition_id is not None and int(competition_id) == latest_competition_id
     )
     if is_latest_competition:
-        response_model = await _get_competition_aggregate_impl(
+        response_model, miners_snapshot = await _get_competition_aggregate_impl(
             request=request,
             db=db,
             competition_id=competition_id,
@@ -1059,7 +1128,7 @@ async def _get_competition_aggregate_payload(
             await _save_aggregate_snapshot_to_local(competition_id, s3_snapshot_payload)
             return s3_snapshot_payload
 
-        response_model = await _get_competition_aggregate_impl(
+        response_model, miners_snapshot = await _get_competition_aggregate_impl(
             request=request,
             db=db,
             competition_id=competition_id,
@@ -1461,6 +1530,243 @@ async def _fetch_swe_rows_live(
     return list(result)
 
 
+async def _fetch_swe_edit_rows_live(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+) -> list[sa.Row]:
+    """Mirror of _fetch_swe_rows_live for swe_explorer_edit: same row shape for
+    build_swe_task_groups, with `resolved` read from swe_explorer_edit_validations."""
+    baseline_runs = SWE_BENCH_RUNS.alias("baseline_runs")
+    baseline_validations = SWE_BENCH_RUN_VALIDATIONS.alias("baseline_validations")
+    baseline_edit = SWE_EXPLORER_EDIT_VALIDATIONS.alias("baseline_edit")
+    miner_runs = SWE_BENCH_RUNS.alias("miner_runs")
+    miner_validations = SWE_BENCH_RUN_VALIDATIONS.alias("miner_validations")
+    miner_edit = SWE_EXPLORER_EDIT_VALIDATIONS.alias("miner_edit")
+
+    query = (
+        select(
+            SWE_BENCH_TASKS.c.id.label("task_id"),
+            SWE_BENCH_TASKS.c.instance_id.label("task_name"),
+            SWE_BENCH_TASKS.c.is_screener.label("is_screener"),
+            Miner.ss58.label("hotkey"),
+            baseline_runs.c.id.label("baseline_run_id"),
+            baseline_runs.c.tokens_used.label("baseline_tokens_used"),
+            baseline_runs.c.input_tokens.label("baseline_input_tokens"),
+            baseline_runs.c.cached_input_tokens.label("baseline_cached_input_tokens"),
+            baseline_runs.c.output_tokens.label("baseline_output_tokens"),
+            baseline_edit.c.resolved.label("baseline_resolved"),
+            miner_runs.c.id.label("run_id"),
+            miner_runs.c.attempt_no.label("attempt_no"),
+            miner_runs.c.tokens_used.label("run_tokens_used"),
+            miner_runs.c.input_tokens.label("run_input_tokens"),
+            miner_runs.c.cached_input_tokens.label("run_cached_input_tokens"),
+            miner_runs.c.output_tokens.label("run_output_tokens"),
+            miner_runs.c.time_taken_seconds.label("time_taken_seconds"),
+            miner_runs.c.agent_steps.label("agent_steps"),
+            miner_edit.c.resolved.label("run_resolved"),
+        )
+        .select_from(SWE_BENCH_TASKS)
+        .join(
+            baseline_runs,
+            and_(
+                baseline_runs.c.task_fk == SWE_BENCH_TASKS.c.id,
+                baseline_runs.c.baseline_run.is_(True),
+                baseline_runs.c.benchmark_type == "swe_explorer_edit",
+            ),
+        )
+        .outerjoin(
+            baseline_validations,
+            baseline_validations.c.run_fk == baseline_runs.c.id,
+        )
+        .outerjoin(
+            baseline_edit,
+            baseline_edit.c.validation_fk == baseline_validations.c.id,
+        )
+        .join(
+            miner_runs,
+            and_(
+                miner_runs.c.task_fk == SWE_BENCH_TASKS.c.id,
+                miner_runs.c.baseline_run.is_(False),
+                miner_runs.c.benchmark_type == "swe_explorer_edit",
+            ),
+        )
+        .join(Miner, Miner.id == miner_runs.c.miner_fk)
+        .outerjoin(
+            miner_validations,
+            miner_validations.c.run_fk == miner_runs.c.id,
+        )
+        .outerjoin(
+            miner_edit,
+            miner_edit.c.validation_fk == miner_validations.c.id,
+        )
+        .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+        .order_by(
+            SWE_BENCH_TASKS.c.instance_id.asc(),
+            Miner.ss58.asc(),
+            miner_runs.c.attempt_no.asc(),
+            miner_runs.c.id.asc(),
+        )
+    )
+
+    try:
+        result = await db.execute(query)
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "swe_frontend_edit_query_failed",
+            extra={"competition_id": comp_id},
+            exc_info=exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SWE frontend data is unavailable",
+        ) from exc
+
+    return list(result)
+
+
+async def _compute_explore_scores_by_hotkey(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+) -> dict[str, float]:
+    """Per-miner swe_explorer_explore totals via the explore-quality path.
+
+    Mirrors the aggregation in _inject_benchmark_tasks_per_miner: miner run
+    quality/tokens are averaged per task before comparing to the (already
+    averaged) baseline, and the miner/baseline weighted-token totals only
+    cover tasks the miner has runs on.
+    """
+    baseline_by_task = await _fetch_baseline_explore_scores(db, comp_id=comp_id)
+    rows = await _fetch_non_screener_rows_swe_explorer_explore(db, comp_id=comp_id)
+
+    quality_by_hotkey: dict[str, dict[int, list[float]]] = {}
+    weighted_by_hotkey: dict[str, dict[int, list[float]]] = {}
+    tasks_by_hotkey: dict[str, set[int]] = {}
+    for row in rows:
+        hotkey = str(row.hotkey)
+        task_id = int(row.task_id)
+        tasks_by_hotkey.setdefault(hotkey, set()).add(task_id)
+        run_quality = _explore_run_score(
+            {
+                "hit_file_rate": row.hit_file_rate,
+                "noise_file_rate": row.noise_file_rate,
+            }
+        )
+        if run_quality is not None:
+            quality_by_hotkey.setdefault(hotkey, {}).setdefault(task_id, []).append(run_quality)
+        run_weighted = compute_weighted_tokens(
+            input_tokens=_to_optional_int(row.input_tokens),
+            cached_input_tokens=_to_optional_int(row.cached_input_tokens),
+            output_tokens=_to_optional_int(row.output_tokens),
+        )
+        if run_weighted is not None:
+            weighted_by_hotkey.setdefault(hotkey, {}).setdefault(task_id, []).append(float(run_weighted))
+
+    scores: dict[str, float] = {}
+    for hotkey, task_ids in tasks_by_hotkey.items():
+        task_scores: list[float] = []
+        task_margins: list[float] = []
+        miner_weighted_total = 0.0
+        baseline_weighted_total = 0.0
+        has_miner_weighted = False
+        has_baseline_weighted = False
+
+        for task_id in sorted(task_ids):
+            baseline_data = baseline_by_task.get(task_id) or {}
+            baseline_quality = baseline_data.get("score")
+            baseline_weighted_avg = baseline_data.get("weighted_tokens_avg")
+
+            quality_values = quality_by_hotkey.get(hotkey, {}).get(task_id, [])
+            miner_quality = (
+                sum(quality_values) / len(quality_values) if quality_values else None
+            )
+            weighted_values = weighted_by_hotkey.get(hotkey, {}).get(task_id, [])
+            miner_weighted_avg = (
+                sum(weighted_values) / len(weighted_values) if weighted_values else None
+            )
+
+            task_score = compute_explore_task_score(
+                miner_quality,
+                baseline_quality,
+                miner_weighted_avg,
+                baseline_weighted_avg,
+            )
+            if task_score is not None:
+                task_scores.append(task_score)
+            if miner_quality is not None and baseline_quality is not None:
+                task_margins.append(miner_quality - baseline_quality)
+            if miner_weighted_avg is not None:
+                miner_weighted_total += miner_weighted_avg
+                has_miner_weighted = True
+            if baseline_weighted_avg is not None:
+                baseline_weighted_total += baseline_weighted_avg
+                has_baseline_weighted = True
+
+        total_score = compute_explore_miner_total_score(
+            task_scores,
+            task_margins,
+            miner_weighted_total if has_miner_weighted else None,
+            baseline_weighted_total if has_baseline_weighted else None,
+        )
+        if total_score is not None:
+            scores[hotkey] = float(total_score)
+
+    return scores
+
+
+def _screener_comparison_from_groups(
+    task_groups: dict[int, dict[str, object]],
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Miner-vs-baseline summary over screener tasks only.
+
+    Returns (score, baseline_weighted_tokens, miner_weighted_tokens,
+    token_savings_ratio) where score is the normalized SWE total restricted
+    to screener task groups and the ratio is (baseline - miner) / baseline.
+    """
+    screener_groups = {
+        task_id: group
+        for task_id, group in task_groups.items()
+        if bool(group["is_screener"])
+    }
+    if not screener_groups:
+        return None, None, None, None
+
+    score, _ = build_swe_miner_total_score(screener_groups)
+
+    baseline_total = 0.0
+    has_baseline = False
+    miner_total = 0.0
+    has_miner = False
+    for group in screener_groups.values():
+        for baseline in group["baseline_runs"].values():
+            weighted = compute_weighted_tokens(
+                input_tokens=baseline["input_tokens"],
+                cached_input_tokens=baseline["cached_input_tokens"],
+                output_tokens=baseline["output_tokens"],
+            )
+            if weighted is not None:
+                baseline_total += float(weighted)
+                has_baseline = True
+        for run in group["runs"]:
+            weighted = run.get("weighted_tokens_with_compression")
+            if weighted is not None:
+                miner_total += float(weighted)
+                has_miner = True
+
+    savings_ratio = (
+        (baseline_total - miner_total) / baseline_total
+        if has_baseline and has_miner and baseline_total > 0
+        else None
+    )
+    return (
+        score,
+        baseline_total if has_baseline else None,
+        miner_total if has_miner else None,
+        savings_ratio,
+    )
+
+
 def _derive_swe_task_categories(rows: list[sa.Row]) -> dict[str, str]:
     return {
         difficulty.task_name: difficulty.category
@@ -1570,15 +1876,37 @@ async def _build_swe_miners_snapshot(
             db, competition_id=comp_id, min_resolved=min_resolved
         )
     )
-    task_categories = rows_snapshot.task_categories
 
+    edit_rows = await _fetch_swe_edit_rows_live(db, comp_id=comp_id)
+    edit_rows_by_hotkey: dict[str, list[sa.Row]] = {}
+    for row in edit_rows:
+        edit_rows_by_hotkey.setdefault(str(row.hotkey), []).append(row)
+    explore_scores_by_hotkey = await _compute_explore_scores_by_hotkey(db, comp_id=comp_id)
+
+    all_hotkeys = set(miner_rows) | set(edit_rows_by_hotkey) | set(explore_scores_by_hotkey)
     miners_by_hotkey: dict[str, SweMinerSnapshotItem] = {}
-    for hotkey, task_rows in miner_rows.items():
-        task_groups = build_swe_task_groups(task_rows)
-        total_score, _ = build_swe_miner_total_score(task_groups)
+    for hotkey in all_hotkeys:
+        task_groups = build_swe_task_groups(miner_rows.get(hotkey, []))
+        verified_score, _ = build_swe_miner_total_score(task_groups)
+        edit_groups = build_swe_task_groups(edit_rows_by_hotkey.get(hotkey, []))
+        edit_score, _ = build_swe_miner_total_score(edit_groups)
+        explore_score = explore_scores_by_hotkey.get(hotkey)
+
         category_scores = _clean_swe_category_scores(
-            build_swe_category_scores(task_groups, task_categories)
+            {
+                "swebench_verified": verified_score,
+                "swe_explorer_explore": explore_score,
+                "swe_explorer_edit": edit_score,
+            }
         )
+        total_score = _weighted_total_score(category_scores)
+        (
+            screener_score,
+            screener_baseline_weighted,
+            screener_miner_weighted,
+            screener_savings_ratio,
+        ) = _screener_comparison_from_groups(task_groups)
+
         miners_by_hotkey[hotkey] = SweMinerSnapshotItem(
             hotkey=hotkey,
             total_score=total_score,
@@ -1588,6 +1916,10 @@ async def _build_swe_miners_snapshot(
             screener_task_count=sum(
                 1 for group in task_groups.values() if bool(group["is_screener"])
             ),
+            screener_score=screener_score,
+            screener_baseline_weighted_tokens=screener_baseline_weighted,
+            screener_miner_weighted_tokens=screener_miner_weighted,
+            screener_token_savings_ratio=screener_savings_ratio,
         )
 
     ordered_hotkeys = [
@@ -2360,7 +2692,7 @@ async def _get_competition_aggregate_impl(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     competition_id: int = Path(..., ge=1),
-) -> SweCompetitionAggregateResponse:
+) -> tuple[SweCompetitionAggregateResponse, SweMinersSnapshot]:
     competition_name = await db.scalar(
         select(Competition.competition_name).where(Competition.id == competition_id)
     )
@@ -2461,6 +2793,8 @@ async def _get_competition_aggregate_impl(
 
         miner_rows = rows_snapshot.rows_by_hotkey.get(hotkey, [])
         task_groups = build_swe_task_groups(miner_rows)
+        # Penalty zones are already folded into each task's score by the new
+        # scoring, so there is no separate penalty to report.
         penalties_categories: dict[str, float | None] = {}
 
         task_aggregate_items: list[SweMinerTaskAggregateItem] = []
@@ -2693,7 +3027,7 @@ async def _get_competition_aggregate_impl(
         len(miners),
     )
 
-    return response
+    return response, miners_snapshot
 
 
 @frontend_router.get("/summary", response_model=FrontendSummaryResponse)

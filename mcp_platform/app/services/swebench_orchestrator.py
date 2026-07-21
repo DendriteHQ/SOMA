@@ -51,6 +51,7 @@ _LAST_WINDOW_LIMIT_LOG_AT: float | None = None
 _WINDOW_LIMIT_LOG_INTERVAL_SECONDS = 30.0
 _LAST_IDLE_DISPATCH_LOG_AT: float | None = None
 _DISPATCH_IDLE_LOG_INTERVAL_SECONDS = 30.0
+_DISPATCH_FETCH_LOOKAHEAD_MULTIPLIER = 200
 _DISPATCH_FETCH_LIMIT_CAP = 2000
 
 
@@ -1515,7 +1516,7 @@ async def _dispatch_due_runs(
         fetch_limit = (
             _DISPATCH_FETCH_LIMIT_CAP
             if strict_fifo_dispatch
-            else min(_DISPATCH_FETCH_LIMIT_CAP, batch_size * 5)
+            else min(_DISPATCH_FETCH_LIMIT_CAP, batch_size * _DISPATCH_FETCH_LOOKAHEAD_MULTIPLIER)
         )
         due_rows = (
             await db.execute(
@@ -1671,6 +1672,8 @@ async def _dispatch_due_runs(
                     continue
 
             dispatch_rows.append(row)
+            if max_dispatched_per_miner > 0 and miner_fk is not None:
+                active_dispatched_by_miner[int(miner_fk)] = active_for_miner + 1
             if (
                 strict_fifo_dispatch
                 or len(dispatch_rows) >= batch_size
@@ -1775,11 +1778,6 @@ async def _dispatch_due_runs(
                     {"run_id": run_id},
                 )
                 dispatched += 1
-                if max_dispatched_per_miner > 0 and row.get("miner_fk") is not None:
-                    miner_fk_int = int(row["miner_fk"])
-                    active_dispatched_by_miner[miner_fk_int] = (
-                        int(active_dispatched_by_miner.get(miner_fk_int, 0)) + 1
-                    )
                 if dispatch_window_quota > 0:
                     dispatches_this_window += 1
                     app.state.swebench_dispatches_this_window = dispatches_this_window
