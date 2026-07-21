@@ -246,7 +246,7 @@ def test_quality_for_benchmark_type_resolved_and_explore() -> None:
 _STAGE1_TYPES = ("swebench_verified", "swe_explorer_explore", "swe_explorer_edit")
 
 
-def _set_stage1_epsilons(monkeypatch: pytest.MonkeyPatch, *, verified=0.2, explore=0.05, edit=0.2) -> None:
+def _set_stage1_epsilons(monkeypatch: pytest.MonkeyPatch, *, verified=0.2, edit=0.2) -> None:
     monkeypatch.setattr(
         swebench_screening.settings,
         "swebench_screening_stage1_quality_epsilon_verified",
@@ -255,13 +255,22 @@ def _set_stage1_epsilons(monkeypatch: pytest.MonkeyPatch, *, verified=0.2, explo
     )
     monkeypatch.setattr(
         swebench_screening.settings,
-        "swebench_screening_stage1_quality_epsilon_explore",
-        explore,
+        "swebench_screening_stage1_quality_epsilon_edit",
+        edit,
+        raising=False,
+    )
+
+
+def _set_stage1_token_saving_ratios(monkeypatch: pytest.MonkeyPatch, *, verified=0.10, edit=0.05) -> None:
+    monkeypatch.setattr(
+        swebench_screening.settings,
+        "swebench_screening_stage1_token_saving_ratio_verified",
+        verified,
         raising=False,
     )
     monkeypatch.setattr(
         swebench_screening.settings,
-        "swebench_screening_stage1_quality_epsilon_edit",
+        "swebench_screening_stage1_token_saving_ratio_edit",
         edit,
         raising=False,
     )
@@ -329,12 +338,14 @@ async def test_stage1_tolerates_one_run_drop_but_fails_larger_regression(
 
 
 @pytest.mark.asyncio
-async def test_stage1_fails_on_explore_noise_regression(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_stage1_ignores_explore_quality_regression(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_stage1_epsilons(monkeypatch)
     now = datetime.now(timezone.utc)
     miner_map, base_map = _stage1_maps(
         now,
-        {"swebench_verified": 1.0, "swe_explorer_explore": 0.40, "swe_explorer_edit": 1.0},
+        # explore drops from 0.50 to -1.0 (max possible regression) but must
+        # never affect stage-1 pass/fail.
+        {"swebench_verified": 1.0, "swe_explorer_explore": -1.0, "swe_explorer_edit": 1.0},
         {"swebench_verified": 1.0, "swe_explorer_explore": 0.50, "swe_explorer_edit": 1.0},
     )
     result = await swebench_screening.evaluate_stage1_for_script(
@@ -344,7 +355,111 @@ async def test_stage1_fails_on_explore_noise_regression(monkeypatch: pytest.Monk
         baseline_quality_by_task_attempt=base_map,
         stage1_quality_by_task_attempt=miner_map,
     )
-    assert result == (True, False)  # 0.10 drop > epsilon_explore (0.05)
+    assert result == (True, True)
+
+
+# ── Stage-1 per-type weighted-token savings ────────────────────────────────
+
+
+def _stage1_weighted_maps(baseline: dict[str, float], miner: dict[str, float]):
+    baseline_map = {(1, 1, t): baseline[t] for t in _STAGE1_TYPES}
+    miner_map = {(1, 1, t): miner[t] for t in _STAGE1_TYPES}
+    return baseline_map, miner_map
+
+
+def _stage1_equal_quality_maps(now):
+    quality = {"swebench_verified": 1.0, "swe_explorer_explore": 0.5, "swe_explorer_edit": 1.0}
+    return _stage1_maps(now, quality, quality)
+
+
+@pytest.mark.asyncio
+async def test_stage1_requires_ten_percent_saving_on_verified(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_stage1_epsilons(monkeypatch)
+    _set_stage1_token_saving_ratios(monkeypatch)
+    now = datetime.now(timezone.utc)
+    miner_quality, base_quality = _stage1_equal_quality_maps(now)
+
+    # Exactly 10% saving on verified -> passes.
+    baseline_weighted, miner_weighted = _stage1_weighted_maps(
+        {"swebench_verified": 100.0, "swe_explorer_explore": 100.0, "swe_explorer_edit": 100.0},
+        {"swebench_verified": 90.0, "swe_explorer_explore": 100.0, "swe_explorer_edit": 95.0},
+    )
+    passes = await swebench_screening.evaluate_stage1_for_script(
+        stage1_task_ids=[1],
+        task_repeats={1: 1},
+        benchmark_types=_STAGE1_TYPES,
+        baseline_quality_by_task_attempt=base_quality,
+        stage1_quality_by_task_attempt=miner_quality,
+        baseline_weighted_by_task_attempt=baseline_weighted,
+        stage1_weighted_by_task_attempt=miner_weighted,
+    )
+    assert passes == (True, True)
+
+    # Just under 10% saving on verified -> fails, even though edit clears its
+    # own (lower) 5% bar.
+    baseline_weighted, miner_weighted = _stage1_weighted_maps(
+        {"swebench_verified": 100.0, "swe_explorer_explore": 100.0, "swe_explorer_edit": 100.0},
+        {"swebench_verified": 91.0, "swe_explorer_explore": 100.0, "swe_explorer_edit": 95.0},
+    )
+    fails = await swebench_screening.evaluate_stage1_for_script(
+        stage1_task_ids=[1],
+        task_repeats={1: 1},
+        benchmark_types=_STAGE1_TYPES,
+        baseline_quality_by_task_attempt=base_quality,
+        stage1_quality_by_task_attempt=miner_quality,
+        baseline_weighted_by_task_attempt=baseline_weighted,
+        stage1_weighted_by_task_attempt=miner_weighted,
+    )
+    assert fails == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_stage1_requires_five_percent_saving_on_edit(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_stage1_epsilons(monkeypatch)
+    _set_stage1_token_saving_ratios(monkeypatch)
+    now = datetime.now(timezone.utc)
+    miner_quality, base_quality = _stage1_equal_quality_maps(now)
+
+    # Verified clears its 10% bar, but edit only saves 4% -> fails.
+    baseline_weighted, miner_weighted = _stage1_weighted_maps(
+        {"swebench_verified": 100.0, "swe_explorer_explore": 100.0, "swe_explorer_edit": 100.0},
+        {"swebench_verified": 90.0, "swe_explorer_explore": 100.0, "swe_explorer_edit": 96.0},
+    )
+    fails = await swebench_screening.evaluate_stage1_for_script(
+        stage1_task_ids=[1],
+        task_repeats={1: 1},
+        benchmark_types=_STAGE1_TYPES,
+        baseline_quality_by_task_attempt=base_quality,
+        stage1_quality_by_task_attempt=miner_quality,
+        baseline_weighted_by_task_attempt=baseline_weighted,
+        stage1_weighted_by_task_attempt=miner_weighted,
+    )
+    assert fails == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_stage1_ignores_explore_token_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_stage1_epsilons(monkeypatch)
+    _set_stage1_token_saving_ratios(monkeypatch)
+    now = datetime.now(timezone.utc)
+    miner_quality, base_quality = _stage1_equal_quality_maps(now)
+
+    # Verified/edit both clear their bars; explore tokens balloon 5x but must
+    # not affect the outcome.
+    baseline_weighted, miner_weighted = _stage1_weighted_maps(
+        {"swebench_verified": 100.0, "swe_explorer_explore": 100.0, "swe_explorer_edit": 100.0},
+        {"swebench_verified": 90.0, "swe_explorer_explore": 500.0, "swe_explorer_edit": 95.0},
+    )
+    result = await swebench_screening.evaluate_stage1_for_script(
+        stage1_task_ids=[1],
+        task_repeats={1: 1},
+        benchmark_types=_STAGE1_TYPES,
+        baseline_quality_by_task_attempt=base_quality,
+        stage1_quality_by_task_attempt=miner_quality,
+        baseline_weighted_by_task_attempt=baseline_weighted,
+        stage1_weighted_by_task_attempt=miner_weighted,
+    )
+    assert result == (True, True)
 
 
 @pytest.mark.asyncio
