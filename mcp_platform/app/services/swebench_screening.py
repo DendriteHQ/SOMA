@@ -272,7 +272,15 @@ async def evaluate_screening_for_script(
     task_repeats: dict[int, int],
     baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None],
     screening_by_task_attempt: dict[tuple[int, int, str], tuple[bool | None, datetime | None, float | None]],
+    benchmark_types: tuple[str, ...] = SCREENING_BENCHMARK_TYPES,
 ) -> tuple[bool, bool]:
+    """Stage-2 screening gate: resolved pass-ratio across tasks AND weighted
+    token saving over baseline >= threshold.
+
+    ``benchmark_types`` defaults to the verified-only tuple for backward
+    compatibility; the two-stage orchestrator passes all screening benchmark
+    types so stage 2 evaluates verified, explore and edit together.
+    """
     if not screener_task_ids:
         return True, True
 
@@ -283,7 +291,7 @@ async def evaluate_screening_for_script(
         repeats = max(1, int(task_repeats.get(int(task_id), 1)))
         attempt_resolved: list[bool] = []
         for attempt_no in range(1, repeats + 1):
-            for benchmark_type in SCREENING_BENCHMARK_TYPES:
+            for benchmark_type in benchmark_types:
                 state = screening_by_task_attempt.get((int(task_id), attempt_no, benchmark_type))
                 if state is None:
                     return False, False
@@ -339,6 +347,179 @@ def required_screening_task_passes(total_screener_tasks: int) -> int:
 def required_screening_weighted_token_saving_ratio() -> float:
     ratio = float(settings.swebench_screening_min_weighted_token_saving_ratio)
     return min(1.0, max(0.0, ratio))
+
+
+# Only these benchmark types gate the stage-1 outcome; swe_explorer_explore
+# results never affect stage-1 pass/fail (quality or tokens).
+STAGE1_GATED_BENCHMARK_TYPES = ("swebench_verified", "swe_explorer_edit")
+
+
+def stage1_quality_epsilon_for_benchmark_type(benchmark_type: str) -> float:
+    """Per-benchmark quality-drop tolerance for stage-1 non-regression.
+
+    A stage-1 (task, benchmark_type) unit maintains quality when
+    ``mean_miner_quality >= mean_baseline_quality - epsilon``.
+    """
+    mapping = {
+        "swebench_verified": settings.swebench_screening_stage1_quality_epsilon_verified,
+        "swe_explorer_edit": settings.swebench_screening_stage1_quality_epsilon_edit,
+    }
+    return max(0.0, float(mapping.get(benchmark_type, 0.0)))
+
+
+def stage1_required_token_saving_ratio_for_benchmark_type(benchmark_type: str) -> float | None:
+    """Minimum required pooled weighted-token savings vs baseline for stage 1.
+
+    Returns ``None`` for benchmark types that are not gated on tokens at
+    stage 1 (i.e. anything other than swebench_verified / swe_explorer_edit).
+    """
+    mapping = {
+        "swebench_verified": settings.swebench_screening_stage1_token_saving_ratio_verified,
+        "swe_explorer_edit": settings.swebench_screening_stage1_token_saving_ratio_edit,
+    }
+    ratio = mapping.get(benchmark_type)
+    if ratio is None:
+        return None
+    return min(1.0, max(0.0, float(ratio)))
+
+
+def quality_for_benchmark_type(
+    benchmark_type: str,
+    *,
+    resolved: bool | None,
+    hit_file_rate: float | None,
+    noise_file_rate: float | None,
+) -> float | None:
+    """Normalize a validation row into a scalar quality value for stage-1.
+
+    - verified / edit: resolved -> 1.0, not-resolved -> 0.0, missing -> None
+    - explore: hit_file_rate - noise_file_rate in [-1, 1], missing -> None
+
+    ``None`` means "no quality signal available yet" (used to detect
+    incompleteness); a failed-but-scored run reports a concrete 0.0 / low value.
+    """
+    if benchmark_type == "swe_explorer_explore":
+        if hit_file_rate is None or noise_file_rate is None:
+            return None
+        return float(hit_file_rate) - float(noise_file_rate)
+    # verified / edit and any other resolved-based benchmark
+    if resolved is None:
+        return None
+    return 1.0 if bool(resolved) else 0.0
+
+
+async def evaluate_stage1_for_script(
+    *,
+    stage1_task_ids: list[int],
+    task_repeats: dict[int, int],
+    benchmark_types: tuple[str, ...],
+    baseline_quality_by_task_attempt: dict[tuple[int, int, str], float | None],
+    stage1_quality_by_task_attempt: dict[tuple[int, int, str], tuple[float | None, datetime | None]],
+    baseline_weighted_by_task_attempt: dict[tuple[int, int, str], float | None] | None = None,
+    stage1_weighted_by_task_attempt: dict[tuple[int, int, str], float | None] | None = None,
+) -> tuple[bool, bool]:
+    """Stage-1 liveness / non-regression + savings gate.
+
+    Only ``swebench_verified`` and ``swe_explorer_edit`` gate the stage-1
+    outcome (see ``STAGE1_GATED_BENCHMARK_TYPES``); ``swe_explorer_explore``
+    results never affect pass/fail here, whether in quality or in tokens.
+
+    Returns ``(complete, passed)``. Two gates, both evaluated per gated
+    benchmark type and pooled over the WHOLE stage-1 sample for that type:
+
+    1. Quality non-regression, per benchmark type: the miner's pooled mean
+       quality over all tasks × attempts of that type (e.g. 5 tasks × 5 runs =
+       25 samples) must not fall below the baseline's pooled mean by more than
+       the per-benchmark epsilon. Pooling shrinks per-run variance so epsilon
+       can be small.
+
+    2. Token savings (WEIGHTED tokens, not raw): pooled miner weighted tokens
+       for that type must be reduced from pooled baseline weighted tokens by
+       at least stage1_required_token_saving_ratio_for_benchmark_type, i.e.
+       (baseline_total - miner_total) / baseline_total >= required_ratio.
+       Verified and edit are never pooled together since their thresholds
+       differ. Skipped when the weighted maps are not provided (backward
+       compat).
+
+    ``complete`` is False while any required (task, attempt, benchmark_type)
+    miner run or baseline run has not been scored yet.
+    """
+    if not stage1_task_ids:
+        return True, True
+
+    gated_types = [bt for bt in benchmark_types if bt in STAGE1_GATED_BENCHMARK_TYPES]
+
+    for benchmark_type in gated_types:
+        miner_qualities: list[float] = []
+        baseline_qualities: list[float] = []
+        for task_id in stage1_task_ids:
+            repeats = max(1, int(task_repeats.get(int(task_id), 1)))
+            for attempt_no in range(1, repeats + 1):
+                state = stage1_quality_by_task_attempt.get(
+                    (int(task_id), attempt_no, benchmark_type)
+                )
+                if state is None:
+                    return False, False
+                miner_quality, scored_at = state
+                if scored_at is None:
+                    return False, False
+                baseline_quality = baseline_quality_by_task_attempt.get(
+                    (int(task_id), attempt_no, benchmark_type)
+                )
+                if baseline_quality is None:
+                    return False, False
+                # A scored-but-metric-less run (e.g. crash/timeout) is the worst
+                # possible quality, not "incomplete".
+                miner_qualities.append(
+                    float(miner_quality) if miner_quality is not None else 0.0
+                )
+                baseline_qualities.append(float(baseline_quality))
+
+        if not miner_qualities:
+            # No stage-1 runs of this benchmark type at all -> nothing to judge.
+            continue
+        miner_mean = sum(miner_qualities) / len(miner_qualities)
+        baseline_mean = sum(baseline_qualities) / len(baseline_qualities)
+        epsilon = stage1_quality_epsilon_for_benchmark_type(benchmark_type)
+        # Regression on any gated benchmark type (beyond epsilon) fails stage 1.
+        if miner_mean < baseline_mean - epsilon:
+            return True, False
+
+    # ── Per-type weighted-token savings ──────────────────────────────────────
+    if (
+        baseline_weighted_by_task_attempt is not None
+        and stage1_weighted_by_task_attempt is not None
+    ):
+        for benchmark_type in gated_types:
+            required_ratio = stage1_required_token_saving_ratio_for_benchmark_type(benchmark_type)
+            if required_ratio is None:
+                continue
+
+            miner_weighted_total = 0.0
+            baseline_weighted_total = 0.0
+            for task_id in stage1_task_ids:
+                repeats = max(1, int(task_repeats.get(int(task_id), 1)))
+                for attempt_no in range(1, repeats + 1):
+                    key = (int(task_id), attempt_no, benchmark_type)
+                    baseline_weighted = baseline_weighted_by_task_attempt.get(key)
+                    if baseline_weighted is None:
+                        continue
+                    miner_weighted = stage1_weighted_by_task_attempt.get(key)
+                    # A scored-but-metric-less run counts as zero tokens (it also
+                    # already tanked the quality gate above if it mattered).
+                    miner_weighted_total += float(miner_weighted) if miner_weighted is not None else 0.0
+                    baseline_weighted_total += float(baseline_weighted)
+
+            saving_ratio = compute_weighted_token_savings_ratio(
+                baseline_weighted_total=baseline_weighted_total,
+                miner_weighted_total=miner_weighted_total,
+            )
+            # saving_ratio is (baseline - miner) / baseline. None (no baseline
+            # tokens) means there is nothing to compare against -> no token failure.
+            if saving_ratio is not None and saving_ratio < required_ratio:
+                return True, False
+
+    return True, True
 
 
 def screening_token_weights() -> tuple[float, float, float]:
