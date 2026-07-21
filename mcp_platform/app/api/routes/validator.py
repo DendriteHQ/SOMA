@@ -6,7 +6,7 @@ from pathlib import Path
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +23,8 @@ from soma_shared.contracts.validator.v1.messages import (
     ValidatorRegisterRequest,
     ValidatorRegisterResponse,
 )
+from soma_shared.db.models.competition_config import CompetitionConfig
+from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
@@ -844,11 +846,26 @@ async def get_swebench_validation(
         now = datetime.now(timezone.utc)
         claim_expires_at = now + timedelta(seconds=claim_ttl_seconds)
 
+        active_timeframe_exists = exists(
+            select(1)
+            .select_from(CompetitionConfig)
+            .join(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+            )
+            .where(CompetitionConfig.competition_fk == SweBenchTask.competition_fk)
+            .where(CompetitionConfig.is_active.is_(True))
+            .where(CompetitionTimeframe.eval_ends_at >= now)
+        )
         query_unclaimed = (
             select(SweBenchRunValidation, SweBenchRun, SweBenchTask)
             .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
             .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
             .where(SweBenchRunValidation.scored_at.is_(None))
+            # Don't hand out (or churn through auto-scoring) validations whose
+            # competition has already ended its eval window; those results no
+            # longer feed dispatch/scoring for anything live.
+            .where(active_timeframe_exists)
         )
         if completed_condition is not None:
             query_unclaimed = query_unclaimed.where(completed_condition)
