@@ -59,6 +59,7 @@ _DISPATCH_FETCH_LIMIT_CAP = 2000
 class _ScriptRef:
     script_id: int
     miner_fk: int
+    ss58: str | None = None
 
 
 def _non_baseline_eligibility_sql(
