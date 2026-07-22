@@ -246,10 +246,14 @@ class SweMinerSnapshotItem:
     category_scores: dict[str, float] | None
     task_count: int
     screener_task_count: int
-    screener_score: float | None = None
-    screener_baseline_weighted_tokens: float | None = None
-    screener_miner_weighted_tokens: float | None = None
-    screener_token_savings_ratio: float | None = None
+    screener_stage1_score: float | None = None
+    screener_stage1_baseline_weighted_tokens: float | None = None
+    screener_stage1_miner_weighted_tokens: float | None = None
+    screener_stage1_token_savings_ratio: float | None = None
+    screener_stage2_score: float | None = None
+    screener_stage2_baseline_weighted_tokens: float | None = None
+    screener_stage2_miner_weighted_tokens: float | None = None
+    screener_stage2_token_savings_ratio: float | None = None
 
 
 @dataclass(slots=True)
@@ -1063,26 +1067,41 @@ def _inject_screener_summary_per_miner(
     miners_snapshot: SweMinersSnapshot,
 ) -> None:
     """Attach the screener-only miner-vs-baseline summary to each miner summary."""
+
+    def _stage_summary(
+        score: float | None,
+        baseline_weighted: float | None,
+        miner_weighted: float | None,
+        savings_ratio: float | None,
+    ) -> dict[str, float | None]:
+        return {
+            "score": score,
+            "baseline_weighted_tokens": _round_optional_1dp(baseline_weighted),
+            "miner_weighted_tokens": _round_optional_1dp(miner_weighted),
+            "token_savings_ratio": savings_ratio,
+        }
+
     for miner_dict in payload.get("miners", []):
         miner_summary = miner_dict.get("miner")
         if not isinstance(miner_summary, dict):
             continue
         hotkey = str(miner_summary.get("hotkey", ""))
         item = miners_snapshot.miners_by_hotkey.get(hotkey)
+
+        # Per-stage miner-vs-baseline breakdown. Stage 1 is the
+        # liveness/non-regression gate; stage 2 is the relative top-N ranking.
         miner_summary["screener"] = {
-            "score": item.screener_score if item is not None else None,
-            "baseline_weighted_tokens": (
-                _round_optional_1dp(item.screener_baseline_weighted_tokens)
-                if item is not None
-                else None
+            "stage1": _stage_summary(
+                item.screener_stage1_score if item is not None else None,
+                item.screener_stage1_baseline_weighted_tokens if item is not None else None,
+                item.screener_stage1_miner_weighted_tokens if item is not None else None,
+                item.screener_stage1_token_savings_ratio if item is not None else None,
             ),
-            "miner_weighted_tokens": (
-                _round_optional_1dp(item.screener_miner_weighted_tokens)
-                if item is not None
-                else None
-            ),
-            "token_savings_ratio": (
-                item.screener_token_savings_ratio if item is not None else None
+            "stage2": _stage_summary(
+                item.screener_stage2_score if item is not None else None,
+                item.screener_stage2_baseline_weighted_tokens if item is not None else None,
+                item.screener_stage2_miner_weighted_tokens if item is not None else None,
+                item.screener_stage2_token_savings_ratio if item is not None else None,
             ),
         }
 
@@ -1445,6 +1464,7 @@ async def _fetch_swe_rows_live(
             SWE_BENCH_TASKS.c.id.label("task_id"),
             SWE_BENCH_TASKS.c.instance_id.label("task_name"),
             SWE_BENCH_TASKS.c.is_screener.label("is_screener"),
+            SWE_BENCH_TASKS.c.screener_stage.label("screener_stage"),
             Miner.ss58.label("hotkey"),
             baseline_runs.c.id.label("baseline_run_id"),
             baseline_runs.c.tokens_used.label("baseline_tokens_used"),
@@ -1549,6 +1569,7 @@ async def _fetch_swe_edit_rows_live(
             SWE_BENCH_TASKS.c.id.label("task_id"),
             SWE_BENCH_TASKS.c.instance_id.label("task_name"),
             SWE_BENCH_TASKS.c.is_screener.label("is_screener"),
+            SWE_BENCH_TASKS.c.screener_stage.label("screener_stage"),
             Miner.ss58.label("hotkey"),
             baseline_runs.c.id.label("baseline_run_id"),
             baseline_runs.c.tokens_used.label("baseline_tokens_used"),
@@ -1717,17 +1738,24 @@ async def _compute_explore_scores_by_hotkey(
 
 def _screener_comparison_from_groups(
     task_groups: dict[int, dict[str, object]],
+    *,
+    stage: int | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None]:
     """Miner-vs-baseline summary over screener tasks only.
 
     Returns (score, baseline_weighted_tokens, miner_weighted_tokens,
     token_savings_ratio) where score is the normalized SWE total restricted
     to screener task groups and the ratio is (baseline - miner) / baseline.
+
+    When ``stage`` is given the summary is further restricted to screener
+    tasks whose ``screener_stage`` equals it (stage 1 = liveness gate,
+    stage 2 = relative top-N ranking); ``None`` covers all screener tasks.
     """
     screener_groups = {
         task_id: group
         for task_id, group in task_groups.items()
         if bool(group["is_screener"])
+        and (stage is None or group.get("screener_stage") == stage)
     }
     if not screener_groups:
         return None, None, None, None
@@ -1901,11 +1929,17 @@ async def _build_swe_miners_snapshot(
         )
         total_score = _weighted_total_score(category_scores)
         (
-            screener_score,
-            screener_baseline_weighted,
-            screener_miner_weighted,
-            screener_savings_ratio,
-        ) = _screener_comparison_from_groups(task_groups)
+            screener_stage1_score,
+            screener_stage1_baseline_weighted,
+            screener_stage1_miner_weighted,
+            screener_stage1_savings_ratio,
+        ) = _screener_comparison_from_groups(task_groups, stage=1)
+        (
+            screener_stage2_score,
+            screener_stage2_baseline_weighted,
+            screener_stage2_miner_weighted,
+            screener_stage2_savings_ratio,
+        ) = _screener_comparison_from_groups(task_groups, stage=2)
 
         miners_by_hotkey[hotkey] = SweMinerSnapshotItem(
             hotkey=hotkey,
@@ -1916,10 +1950,14 @@ async def _build_swe_miners_snapshot(
             screener_task_count=sum(
                 1 for group in task_groups.values() if bool(group["is_screener"])
             ),
-            screener_score=screener_score,
-            screener_baseline_weighted_tokens=screener_baseline_weighted,
-            screener_miner_weighted_tokens=screener_miner_weighted,
-            screener_token_savings_ratio=screener_savings_ratio,
+            screener_stage1_score=screener_stage1_score,
+            screener_stage1_baseline_weighted_tokens=screener_stage1_baseline_weighted,
+            screener_stage1_miner_weighted_tokens=screener_stage1_miner_weighted,
+            screener_stage1_token_savings_ratio=screener_stage1_savings_ratio,
+            screener_stage2_score=screener_stage2_score,
+            screener_stage2_baseline_weighted_tokens=screener_stage2_baseline_weighted,
+            screener_stage2_miner_weighted_tokens=screener_stage2_miner_weighted,
+            screener_stage2_token_savings_ratio=screener_stage2_savings_ratio,
         )
 
     ordered_hotkeys = [
