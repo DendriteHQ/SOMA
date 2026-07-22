@@ -105,6 +105,7 @@ from app.services.swebench_orchestrator import (
     _classify_stage2_scripts,
     _load_latest_scripts_for_competition,
 )
+from app.services.incentive_calculator import load_stage2_miner_total_scores
 from app.services.blob.s3 import S3BlobStorage
 from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.api.routes.utils import (
@@ -1065,45 +1066,109 @@ def _inject_benchmark_tasks_per_miner(
 def _inject_screener_summary_per_miner(
     payload: dict[str, Any],
     miners_snapshot: SweMinersSnapshot,
+    stage_cohort: "SweStageCohort",
 ) -> None:
-    """Attach the screener-only miner-vs-baseline summary to each miner summary."""
+    """Attach the screener-only miner-vs-baseline summary to each miner
+    summary. Replaces the legacy flat `miner.screener_passed` with a
+    per-stage `screener_passed` driven by the same stage-1/stage-2
+    classification that drives `status`.
+    """
 
     def _stage_summary(
         score: float | None,
         baseline_weighted: float | None,
         miner_weighted: float | None,
         savings_ratio: float | None,
+        screener_passed: bool | None,
     ) -> dict[str, float | None]:
         return {
             "score": score,
             "baseline_weighted_tokens": _round_optional_1dp(baseline_weighted),
             "miner_weighted_tokens": _round_optional_1dp(miner_weighted),
             "token_savings_ratio": savings_ratio,
+            "screener_passed": screener_passed,
         }
 
     for miner_dict in payload.get("miners", []):
         miner_summary = miner_dict.get("miner")
         if not isinstance(miner_summary, dict):
             continue
+        miner_summary.pop("screener_passed", None)
         hotkey = str(miner_summary.get("hotkey", ""))
         item = miners_snapshot.miners_by_hotkey.get(hotkey)
 
+        stage1_state = stage_cohort.stage1_state_by_ss58.get(hotkey)
+        if stage1_state is None:
+            stage1_passed = None
+        else:
+            complete1, passed1 = stage1_state
+            stage1_passed = passed1 if complete1 else None
+
+        if hotkey not in stage_cohort.stage1_passer_ss58:
+            # Didn't clear stage 1 (or wasn't classified yet) — stage 2
+            # ranking doesn't apply.
+            stage2_passed = None
+        elif not stage_cohort.cohort_complete:
+            stage2_passed = None
+        else:
+            stage2_passed = hotkey in stage_cohort.advancer_ss58
+
         # Per-stage miner-vs-baseline breakdown. Stage 1 is the
-        # liveness/non-regression gate; stage 2 is the relative top-N ranking.
+        # liveness/non-regression gate; stage 2 is the relative top-N ranking
+        # (screener_passed there means "qualified for full evaluation").
         miner_summary["screener"] = {
             "stage1": _stage_summary(
                 item.screener_stage1_score if item is not None else None,
                 item.screener_stage1_baseline_weighted_tokens if item is not None else None,
                 item.screener_stage1_miner_weighted_tokens if item is not None else None,
                 item.screener_stage1_token_savings_ratio if item is not None else None,
+                stage1_passed,
             ),
             "stage2": _stage_summary(
-                item.screener_stage2_score if item is not None else None,
+                # Full benchmark-weighted blend (verified+explore+edit) — the
+                # actual score stage-2 ranking/advancement is decided on, not
+                # the swebench_verified-only score used for stage 1.
+                stage_cohort.stage2_total_score_by_ss58.get(hotkey),
                 item.screener_stage2_baseline_weighted_tokens if item is not None else None,
                 item.screener_stage2_miner_weighted_tokens if item is not None else None,
                 item.screener_stage2_token_savings_ratio if item is not None else None,
+                stage2_passed,
             ),
         }
+
+
+async def _fetch_swe_task_screener_stage(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+) -> dict[int, int | None]:
+    rows = (
+        await db.execute(
+            select(
+                SWE_BENCH_TASKS.c.id,
+                SWE_BENCH_TASKS.c.screener_stage,
+            ).where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+        )
+    ).all()
+    return {int(row.id): _to_optional_int(row.screener_stage) for row in rows}
+
+
+def _inject_task_screener_stage(
+    payload: dict[str, Any],
+    screener_stage_by_task_id: dict[int, int | None],
+) -> None:
+    """Attach each task's screener_stage (1, 2, or None for non-screener /
+    full-eval tasks) alongside is_screener, across every benchmark type, so
+    the frontend can group tasks by stage."""
+    for miner_dict in payload.get("miners", []):
+        for task_entry in miner_dict.get("tasks", []):
+            task_dict = task_entry.get("task") if isinstance(task_entry, dict) else None
+            if not isinstance(task_dict, dict):
+                continue
+            task_id = task_dict.get("task_id")
+            if task_id is None:
+                continue
+            task_dict["screener_stage"] = screener_stage_by_task_id.get(int(task_id))
 
 
 async def _get_competition_aggregate_payload(
@@ -1122,12 +1187,16 @@ async def _get_competition_aggregate_payload(
             competition_id=competition_id,
         )
         payload = response_model.model_dump(mode="json")
+        stage_cohort = await _classify_swe_stage_cohort(db, comp_id=competition_id)
+        _inject_screener_summary_per_miner(payload, miners_snapshot, stage_cohort)
         benchmark_data = await _fetch_benchmark_non_screener_data(db, comp_id=competition_id)
         _inject_benchmark_tasks_per_miner(payload, benchmark_data)
         screener_benchmark_data = await _fetch_benchmark_non_screener_data(
             db, comp_id=competition_id, is_screener=True
         )
         _inject_benchmark_tasks_per_miner(payload, screener_benchmark_data, is_screener=True)
+        screener_stage_by_task_id = await _fetch_swe_task_screener_stage(db, comp_id=competition_id)
+        _inject_task_screener_stage(payload, screener_stage_by_task_id)
         return payload
 
     local_snapshot_payload = await _load_aggregate_snapshot_from_local(competition_id)
@@ -1153,12 +1222,16 @@ async def _get_competition_aggregate_payload(
             competition_id=competition_id,
         )
         payload = response_model.model_dump(mode="json")
+        stage_cohort = await _classify_swe_stage_cohort(db, comp_id=competition_id)
+        _inject_screener_summary_per_miner(payload, miners_snapshot, stage_cohort)
         benchmark_data = await _fetch_benchmark_non_screener_data(db, comp_id=competition_id)
         _inject_benchmark_tasks_per_miner(payload, benchmark_data)
         screener_benchmark_data = await _fetch_benchmark_non_screener_data(
             db, comp_id=competition_id, is_screener=True
         )
         _inject_benchmark_tasks_per_miner(payload, screener_benchmark_data, is_screener=True)
+        screener_stage_by_task_id = await _fetch_swe_task_screener_stage(db, comp_id=competition_id)
+        _inject_task_screener_stage(payload, screener_stage_by_task_id)
         await _save_aggregate_snapshot_to_local(competition_id, payload)
         await _save_aggregate_snapshot_to_s3(request, competition_id, payload)
         return payload
@@ -1736,6 +1809,89 @@ async def _compute_explore_scores_by_hotkey(
     return scores
 
 
+async def _fetch_stage_explore_weighted_token_totals(
+    db: AsyncSession,
+    *,
+    comp_id: int,
+    stage: int,
+) -> tuple[float | None, dict[str, float]]:
+    """(baseline_weighted_tokens_total, miner_weighted_tokens_total_by_ss58)
+    for swe_explorer_explore screener tasks in the given stage.
+
+    Token savings is just tokens spent vs. baseline — independent of
+    explore's hit/noise-rate quality formula — so it's tallied directly
+    from run token columns here rather than through the explore scoring
+    path, the same way verified/edit token totals are summed per run.
+    The baseline total doesn't vary by miner (same reference runs for
+    everyone), so it's returned once rather than per hotkey.
+    """
+    task_rows = (
+        await db.execute(
+            select(SWE_BENCH_TASKS.c.id)
+            .where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+            .where(SWE_BENCH_TASKS.c.is_screener.is_(True))
+            .where(SWE_BENCH_TASKS.c.screener_stage == stage)
+        )
+    ).all()
+    stage_task_ids = [int(row.id) for row in task_rows]
+    if not stage_task_ids:
+        return None, {}
+
+    baseline_rows = (
+        await db.execute(
+            select(
+                SWE_BENCH_RUNS.c.input_tokens,
+                SWE_BENCH_RUNS.c.cached_input_tokens,
+                SWE_BENCH_RUNS.c.output_tokens,
+            )
+            .where(SWE_BENCH_RUNS.c.task_fk.in_(stage_task_ids))
+            .where(SWE_BENCH_RUNS.c.baseline_run.is_(True))
+            .where(SWE_BENCH_RUNS.c.benchmark_type == "swe_explorer_explore")
+        )
+    ).all()
+    baseline_total = 0.0
+    has_baseline = False
+    for row in baseline_rows:
+        weighted = compute_weighted_tokens(
+            input_tokens=_to_optional_int(row.input_tokens),
+            cached_input_tokens=_to_optional_int(row.cached_input_tokens),
+            output_tokens=_to_optional_int(row.output_tokens),
+        )
+        if weighted is not None:
+            baseline_total += float(weighted)
+            has_baseline = True
+
+    miner_rows = (
+        await db.execute(
+            select(
+                Miner.ss58.label("hotkey"),
+                SWE_BENCH_RUNS.c.input_tokens,
+                SWE_BENCH_RUNS.c.cached_input_tokens,
+                SWE_BENCH_RUNS.c.output_tokens,
+            )
+            .select_from(SWE_BENCH_RUNS)
+            .join(Miner, Miner.id == SWE_BENCH_RUNS.c.miner_fk)
+            .where(SWE_BENCH_RUNS.c.task_fk.in_(stage_task_ids))
+            .where(SWE_BENCH_RUNS.c.baseline_run.is_(False))
+            .where(SWE_BENCH_RUNS.c.benchmark_type == "swe_explorer_explore")
+        )
+    ).all()
+    miner_total_by_hotkey: dict[str, float] = {}
+    for row in miner_rows:
+        weighted = compute_weighted_tokens(
+            input_tokens=_to_optional_int(row.input_tokens),
+            cached_input_tokens=_to_optional_int(row.cached_input_tokens),
+            output_tokens=_to_optional_int(row.output_tokens),
+        )
+        if weighted is not None:
+            hotkey = str(row.hotkey)
+            miner_total_by_hotkey[hotkey] = (
+                miner_total_by_hotkey.get(hotkey, 0.0) + float(weighted)
+            )
+
+    return (baseline_total if has_baseline else None), miner_total_by_hotkey
+
+
 def _screener_comparison_from_groups(
     task_groups: dict[int, dict[str, object]],
     *,
@@ -1910,6 +2066,10 @@ async def _build_swe_miners_snapshot(
     for row in edit_rows:
         edit_rows_by_hotkey.setdefault(str(row.hotkey), []).append(row)
     explore_scores_by_hotkey = await _compute_explore_scores_by_hotkey(db, comp_id=comp_id)
+    (
+        stage2_explore_baseline_weighted,
+        stage2_explore_miner_weighted_by_hotkey,
+    ) = await _fetch_stage_explore_weighted_token_totals(db, comp_id=comp_id, stage=2)
 
     all_hotkeys = set(miner_rows) | set(edit_rows_by_hotkey) | set(explore_scores_by_hotkey)
     miners_by_hotkey: dict[str, SweMinerSnapshotItem] = {}
@@ -1936,10 +2096,54 @@ async def _build_swe_miners_snapshot(
         ) = _screener_comparison_from_groups(task_groups, stage=1)
         (
             screener_stage2_score,
-            screener_stage2_baseline_weighted,
-            screener_stage2_miner_weighted,
-            screener_stage2_savings_ratio,
+            verified_stage2_baseline_weighted,
+            verified_stage2_miner_weighted,
+            _verified_stage2_savings_ratio,
         ) = _screener_comparison_from_groups(task_groups, stage=2)
+        (
+            _edit_stage2_score,
+            edit_stage2_baseline_weighted,
+            edit_stage2_miner_weighted,
+            _edit_stage2_savings_ratio,
+        ) = _screener_comparison_from_groups(edit_groups, stage=2)
+        explore_stage2_miner_weighted = stage2_explore_miner_weighted_by_hotkey.get(hotkey)
+
+        # Token savings is tokens-spent-vs-baseline, independent of each
+        # benchmark's quality formula, so stage 2 sums it across all three
+        # benchmark types (verified + explore + edit) rather than reporting
+        # verified alone.
+        stage2_baseline_parts = [
+            part
+            for part in (
+                verified_stage2_baseline_weighted,
+                edit_stage2_baseline_weighted,
+                stage2_explore_baseline_weighted,
+            )
+            if part is not None
+        ]
+        stage2_miner_parts = [
+            part
+            for part in (
+                verified_stage2_miner_weighted,
+                edit_stage2_miner_weighted,
+                explore_stage2_miner_weighted,
+            )
+            if part is not None
+        ]
+        screener_stage2_baseline_weighted = (
+            sum(stage2_baseline_parts) if stage2_baseline_parts else None
+        )
+        screener_stage2_miner_weighted = (
+            sum(stage2_miner_parts) if stage2_miner_parts else None
+        )
+        screener_stage2_savings_ratio = (
+            (screener_stage2_baseline_weighted - screener_stage2_miner_weighted)
+            / screener_stage2_baseline_weighted
+            if screener_stage2_baseline_weighted is not None
+            and screener_stage2_miner_weighted is not None
+            and screener_stage2_baseline_weighted > 0
+            else None
+        )
 
         miners_by_hotkey[hotkey] = SweMinerSnapshotItem(
             hotkey=hotkey,
@@ -2154,25 +2358,99 @@ def _round_optional_1dp(value: float | None) -> float | None:
     return 0.0 if rounded == -0.0 else rounded
 
 
-def _screener_passed_from_status(
+@dataclass(slots=True)
+class SweStageCohort:
+    """Stage-1/stage-2 screener classification for a whole competition
+    cohort. Shared by status computation and the per-miner screener
+    pass/fail summary so both stay derived from one source of truth.
+
+    ``stage1_state_by_ss58[ss58]`` is ``(complete, passed)`` from the
+    stage-1 quality+savings liveness gate. ``advancer_ss58`` is only
+    meaningful once ``cohort_complete`` is True — it's the top
+    ``settings.top_screener_scripts`` fraction (+ delta window) of stage-1
+    passers by stage-2 SWE score, i.e. those qualified for full evaluation.
+
+    ``stage2_total_score_by_ss58`` is the same benchmark-weighted blend
+    (0.50 swebench_verified + 0.25 swe_explorer_explore + 0.25
+    swe_explorer_edit) used to rank stage-2 advancement — the actual score
+    behind ``advancer_ss58``, as opposed to any single-benchmark score.
+    """
+
+    stage1_state_by_ss58: dict[str, tuple[bool, bool]]
+    stage1_passer_ss58: set[str]
+    cohort_complete: bool
+    advancer_ss58: set[str]
+    stage2_total_score_by_ss58: dict[str, float]
+
+
+async def _classify_swe_stage_cohort(
+    db: AsyncSession,
     *,
-    status_value: str,
-    fallback: bool,
-) -> bool:
-    normalized = str(status_value or "").strip().lower()
-    if normalized in {"scored", "evaluating", "qualified"}:
-        return True
-    if normalized in {
-        "not qualified",
-        "screening",
-        "failed review",
-        "no api key",
-        "in queue",
-        "idle",
-        "banned",
-    }:
-        return False
-    return bool(fallback)
+    comp_id: int,
+) -> SweStageCohort:
+    task_rows = (
+        await db.execute(
+            select(
+                SWE_BENCH_TASKS.c.id,
+                SWE_BENCH_TASKS.c.screener_stage,
+                SWE_BENCH_TASKS.c.planned_repeats,
+            ).where(SWE_BENCH_TASKS.c.competition_fk == comp_id)
+        )
+    ).all()
+
+    task_repeats: dict[int, int] = {}
+    stage1_ids: list[int] = []
+    stage2_ids: list[int] = []
+    for task_row in task_rows:
+        task_id = int(task_row.id)
+        task_repeats[task_id] = max(1, int(task_row.planned_repeats or 1))
+        stage = task_row.screener_stage
+        if stage == 1:
+            stage1_ids.append(task_id)
+        elif stage == 2:
+            stage2_ids.append(task_id)
+
+    # Classify the *whole* competition cohort (not just a page of hotkeys)
+    # through the exact same stage-1/stage-2 gates the orchestrator uses to
+    # seed runs — otherwise stage-2's top-N ranking would be computed over a
+    # partial cohort and give a different answer than the backend.
+    scripts = await _load_latest_scripts_for_competition(db, comp_id)
+    stage1_results = await _classify_stage1_scripts(
+        db, scripts=scripts, stage1_ids=stage1_ids, task_repeats=task_repeats
+    )
+    stage1_state_by_ss58: dict[str, tuple[bool, bool]] = {}
+    for script in scripts:
+        if script.ss58 is None:
+            continue
+        state = stage1_results.get((script.script_id, script.miner_fk))
+        if state is not None:
+            stage1_state_by_ss58[script.ss58] = state
+
+    stage1_passers = [
+        script
+        for script in scripts
+        if stage1_results.get((script.script_id, script.miner_fk)) == (True, True)
+    ]
+    cohort_complete, advancers = await _classify_stage2_scripts(
+        db,
+        competition_id=comp_id,
+        stage1_passers=stage1_passers,
+        stage2_ids=stage2_ids,
+        task_repeats=task_repeats,
+    )
+    stage2_total_score_by_ss58 = (
+        await load_stage2_miner_total_scores(db, competition_id=comp_id)
+        if stage1_passers
+        else {}
+    )
+
+    return SweStageCohort(
+        stage1_state_by_ss58=stage1_state_by_ss58,
+        stage1_passer_ss58={s.ss58 for s in stage1_passers if s.ss58 is not None},
+        cohort_complete=cohort_complete,
+        advancer_ss58={s.ss58 for s in advancers if s.ss58 is not None},
+        stage2_total_score_by_ss58=stage2_total_score_by_ss58,
+    )
 
 
 async def _build_swe_status_overrides(
@@ -2429,13 +2707,30 @@ async def _load_swe_aggregate_miner_meta(
         .subquery("miner_contests")
     )
 
+    # mv_miner_status.last_submit_at tracks legacy batch-challenge uploads and
+    # is never populated for SWE competitions, so last_submit is derived
+    # directly from this competition's miner_uploads instead.
+    swe_last_submit_sq = (
+        select(
+            Miner.ss58.label("ss58"),
+            func.max(MinerUpload.created_at).label("last_submit_at"),
+        )
+        .select_from(MinerUpload)
+        .join(Script, Script.id == MinerUpload.script_fk)
+        .join(Miner, Miner.id == Script.miner_fk)
+        .where(MinerUpload.competition_fk == comp_id)
+        .where(Miner.ss58.in_(hotkeys))
+        .group_by(Miner.ss58)
+        .subquery("swe_last_submit")
+    )
+
     rows = (
         await db.execute(
             select(
                 Miner.ss58.label("ss58"),
                 Miner.created_at.label("registered_at"),
                 MV_MINER_STATUS.c.status.label("status"),
-                MV_MINER_STATUS.c.last_submit_at.label("last_submit_at"),
+                swe_last_submit_sq.c.last_submit_at.label("last_submit_at"),
                 MV_MINER_COMPETITION_STATS.c.rank.label("rank"),
                 contests_sq.c.contests.label("contests"),
             )
@@ -2455,6 +2750,7 @@ async def _load_swe_aggregate_miner_meta(
                 ),
             )
             .outerjoin(contests_sq, contests_sq.c.ss58 == Miner.ss58)
+            .outerjoin(swe_last_submit_sq, swe_last_submit_sq.c.ss58 == Miner.ss58)
             .where(Miner.ss58.in_(hotkeys))
         )
     ).all()
@@ -3002,10 +3298,6 @@ async def _get_competition_aggregate_impl(
                 miner=SweMinerSummary(
                     hotkey=hotkey,
                     total_score=miner_snapshot.total_score,
-                    screener_passed=_screener_passed_from_status(
-                        status_value=miner_status,
-                        fallback=miner_snapshot.screener_passed,
-                    ),
                     category_scores=miner_snapshot.category_scores,
                     task_count=miner_snapshot.task_count,
                     screener_task_count=miner_snapshot.screener_task_count,
