@@ -589,6 +589,10 @@ def _organize_non_screener_rows(
         if score_fn is not None:
             raw_fields = {field: getattr(row, field, None) for field in extra_fields}
             run["platform_score"] = score_fn(raw_fields)
+            # Keep the raw metric fields on the run too (e.g. explore
+            # hit_file_rate / noise_file_rate), not just the derived score.
+            for field, raw in raw_fields.items():
+                run[field] = float(raw) if raw is not None else None
         else:
             for field in extra_fields:
                 raw = getattr(row, field, None)
@@ -915,6 +919,23 @@ def _inject_benchmark_tasks_per_miner(
                         sum(run_weighted_values) / len(run_weighted_values) if run_weighted_values else None
                     )
 
+                    # Explore quality rates (fractions in [0, 1]): hit_file_rate =
+                    # coverage of golden/core files, noise_file_rate = share of
+                    # visited files outside golden. Averaged over the miner's
+                    # repeats, mirroring platform_score above.
+                    hit_rate_values = [
+                        r["hit_file_rate"] for r in runs if r.get("hit_file_rate") is not None
+                    ]
+                    hit_file_rate_avg = (
+                        sum(hit_rate_values) / len(hit_rate_values) if hit_rate_values else None
+                    )
+                    noise_rate_values = [
+                        r["noise_file_rate"] for r in runs if r.get("noise_file_rate") is not None
+                    ]
+                    noise_file_rate_avg = (
+                        sum(noise_rate_values) / len(noise_rate_values) if noise_rate_values else None
+                    )
+
                     baseline_quality_task = task.get("baseline_score")
                     baseline_weighted_tokens_avg = task.get("baseline_weighted_tokens_avg")
 
@@ -963,6 +984,8 @@ def _inject_benchmark_tasks_per_miner(
                             "platform_score": task_platform_score,
                             "quality_margin": task_margin,
                             "score_without_compression": score_without_compression,
+                            "hit_file_rate_avg": hit_file_rate_avg,
+                            "noise_file_rate_avg": noise_file_rate_avg,
                             "run_count": len(runs),
                         },
                         "runs": runs,
