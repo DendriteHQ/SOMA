@@ -2832,13 +2832,17 @@ async def _build_swe_status_overrides(
             key,
             {
                 "has_dispatched_non_screener": False,
+                "has_dispatched_screener": False,
                 "has_scored_non_screener": False,
                 "scored_run_ids": set(),
             },
         )
         is_screener = bool(row.is_screener)
-        if row.status == "dispatched" and not is_screener:
-            stats["has_dispatched_non_screener"] = True
+        if row.status == "dispatched":
+            if is_screener:
+                stats["has_dispatched_screener"] = True
+            else:
+                stats["has_dispatched_non_screener"] = True
         if row.resolved is not None:
             scored_ids = stats["scored_run_ids"]
             if isinstance(scored_ids, set):
@@ -2880,6 +2884,7 @@ async def _build_swe_status_overrides(
             pair,
             {
                 "has_dispatched_non_screener": False,
+                "has_dispatched_screener": False,
                 "has_scored_non_screener": False,
                 "scored_run_ids": set(),
             },
@@ -2891,6 +2896,7 @@ async def _build_swe_status_overrides(
             and len(scored_ids) >= expected_full_runs
         )
         has_dispatched_non_screener = bool(pair_stats["has_dispatched_non_screener"])
+        has_dispatched_screener = bool(pair_stats["has_dispatched_screener"])
         has_scored_non_screener = bool(pair_stats["has_scored_non_screener"])
 
         # Quick guard: prevent screener-only completion from showing as "scored".
@@ -2898,6 +2904,8 @@ async def _build_swe_status_overrides(
             status_by_hotkey[ss58] = "scored"
         elif has_dispatched_non_screener:
             status_by_hotkey[ss58] = "evaluating"
+        elif has_dispatched_screener:
+            status_by_hotkey[ss58] = "screening"
         else:
             stage1_state = stage1_by_miner_fk.get(miner_fk)
             if stage1_state is None:
@@ -2907,11 +2915,15 @@ async def _build_swe_status_overrides(
                 continue
             complete1, passed1 = stage1_state
             if not complete1:
-                status_by_hotkey[ss58] = "screening"
+                # Stage-1 runs exist (created, pending) but none are
+                # currently dispatched — nothing actively running right now.
+                status_by_hotkey[ss58] = "in queue"
             elif not passed1:
                 status_by_hotkey[ss58] = "not qualified"
             elif not cohort_complete:
-                status_by_hotkey[ss58] = "screening"
+                # Passed stage 1; stage 2's top-N ranking can't resolve until
+                # the whole cohort's stage-2 runs are scored.
+                status_by_hotkey[ss58] = "qualifying"
             elif miner_fk in advancer_miner_fks:
                 status_by_hotkey[ss58] = "qualified"
             else:
