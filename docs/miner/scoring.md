@@ -292,9 +292,24 @@ If `m <= -delta`, the task receives the hard-floor score:
 s_E = -2
 ```
 
-### Quality-gated token score
+### Quality-aware token score
 
-Otherwise, a smooth quality gate `g` in `[0, 1]` is applied to the token term.
+Otherwise, a smooth quality gate `g` in `[0, 1]` is computed:
+
+```math
+g = 3r^2 - 2r^3
+```
+
+where:
+
+```math
+r = \max\left(0,\min\left(\frac{m+\delta}{2\delta},1\right)\right)
+```
+
+This gate is used asymmetrically:
+
+- for token savings, it unlocks reward as quality improves;
+- for token overspend, it softens the penalty as quality improves.
 
 The token term is:
 
@@ -302,11 +317,29 @@ The token term is:
 \tau = \max\left(-2,\min\left(2\log_2\left(\frac{T_B}{T_A}\right),2\right)\right)
 ```
 
+Let:
+
+```math
+\eta = 0.25
+```
+
 The final per-task explore score is:
 
 ```math
-s_E = g\tau
+s_E =
+\begin{cases}
+g\tau & \text{if } \tau \ge 0 \\
+\left(\eta + (1-\eta)(1-g)\right)\tau & \text{if } \tau < 0
+\end{cases}
 ```
+
+This means:
+
+- when the miner saves tokens, better quality is required to unlock the reward;
+- when the miner uses more tokens than baseline, better quality reduces the
+  size of the penalty, but does not remove it entirely;
+- once the miner quality margin drops to `m <= -delta`, the hard floor still
+  applies.
 
 ## Explore miner aggregation
 
@@ -316,7 +349,7 @@ Miner-level explore aggregation is performed by
 The aggregate:
 
 1. starts from the mean of the per-task explore scores,
-2. mixes that mean toward the score floor based on the total token-savings
-   ratio,
-3. saturates the token-savings influence at `+/-20%`,
+2. applies the hard floor only if the miner is worse than baseline on both
+   average quality margin and total weighted token usage,
+3. otherwise keeps the per-task mean unchanged,
 4. normalizes the resulting score to `[-1, 1]`.
