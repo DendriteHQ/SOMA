@@ -959,14 +959,27 @@ def _inject_benchmark_tasks_per_miner(
                         output_tokens=miner_output,
                     )
                     baseline_weighted_tokens = task.get("baseline_weighted_tokens")
-                    score_without_compression = task.get("baseline_score")
+                    # Baseline compared to itself via the exact same formula
+                    # used for the miner (same quality/tokens on both sides)
+                    # — always 0 when baseline has valid tokens, giving a
+                    # fixed zero reference point so the miner's platform_score
+                    # is directly readable as above/below baseline.
+                    score_without_compression = compute_explore_task_score(
+                        baseline_quality_task,
+                        baseline_quality_task,
+                        baseline_weighted_tokens_avg,
+                        baseline_weighted_tokens_avg,
+                    )
+                    pass_with_compression = (
+                        task_platform_score > 0 if task_platform_score is not None else None
+                    )
                     miner_dict["tasks"].append({
                         "task": {
                             "task_id": task["task_id"],
                             "task_name": task["task_name"],
                             "is_screener": is_screener,
                             "pass_without_compression": None,
-                            "pass_with_compression": None,
+                            "pass_with_compression": pass_with_compression,
                             "tokens_without_compression": task.get("baseline_tokens_sum"),
                             "tokens_with_compression": miner_tokens_sum,
                             "platform_score": task_platform_score,
