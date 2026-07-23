@@ -603,6 +603,36 @@ async def load_stage2_miner_total_scores(
     return scores
 
 
+async def load_stage1_miner_total_scores(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> dict[str, float]:
+    """Per-hotkey total SWE score computed from stage-1 tasks only.
+
+    Uses the exact same benchmark-weighted-average formula as
+    ``load_stage2_miner_total_scores`` (``_subset_weighted_score`` over the
+    full ``BENCHMARK_TYPES`` triple), restricted to ``screener_stage == 1``.
+    Display-only: stage 1's actual pass/fail gate is
+    ``evaluate_stage1_for_script``, which only gates on
+    ``swebench_verified``/``swe_explorer_edit`` and never on
+    ``swe_explorer_explore`` — this blended score does not feed that gate,
+    it only gives the frontend a benchmark-weighted number to show.
+    """
+    miner_benchmark_scores = await _load_benchmark_scores(
+        db,
+        competition_id=competition_id,
+        task_stage_filter=(SweBenchTask.screener_stage == 1),
+    )
+
+    scores: dict[str, float] = {}
+    for hotkey, benchmark_scores in miner_benchmark_scores.items():
+        total_score = _subset_weighted_score(benchmark_scores, BENCHMARK_TYPES)
+        if total_score is not None:
+            scores[hotkey] = total_score
+    return scores
+
+
 async def load_competition_incentive_inputs(
     db: AsyncSession,
     *,
