@@ -92,6 +92,7 @@ from app.api.routes.scoring import (
     compute_explore_miner_total_score,
     _task_inputs,
     _summarize_baseline_pass,
+    _scoring_token_weights,
 )
 from app.services.swe_difficulty_calculator import (
     build_baseline_task_data,
@@ -1100,7 +1101,7 @@ def _inject_benchmark_tasks_per_miner(
 
 
 _TOKEN_TOTAL_WEIGHTED_FIELDS = ("baseline_weighted_tokens", "miner_weighted_tokens")
-_TOKEN_TOTAL_INT_FIELDS = (
+_TOKEN_TOTAL_COMPONENT_FIELDS = (
     "baseline_input_tokens",
     "baseline_cached_input_tokens",
     "baseline_output_tokens",
@@ -1121,7 +1122,21 @@ def _recompute_miner_token_totals_across_benchmarks(payload: dict[str, Any]) -> 
     silently missed them. Summing over the fully-populated `tasks[]` here
     (each entry across all three benchmark types shares the same field
     names) makes the totals match what `tasks[]` actually contains.
+
+    The per-component totals (input/cached_input/output) are weighted by the
+    same per-type weights compute_weighted_tokens() uses (default 1.0 / 0.1 /
+    3.0), not raw counts — so each equals its share of the overall
+    `*_weighted_tokens_total` and the three components of a side sum to it.
     """
+    input_weight, cached_weight, output_weight = _scoring_token_weights()
+    component_weight_by_field = {
+        "baseline_input_tokens": input_weight,
+        "baseline_cached_input_tokens": cached_weight,
+        "baseline_output_tokens": output_weight,
+        "miner_input_tokens": input_weight,
+        "miner_cached_input_tokens": cached_weight,
+        "miner_output_tokens": output_weight,
+    }
     for miner_dict in payload.get("miners", []):
         tasks = miner_dict.get("tasks")
         if not isinstance(tasks, list):
@@ -1133,13 +1148,18 @@ def _recompute_miner_token_totals_across_benchmarks(payload: dict[str, Any]) -> 
                 if isinstance(task, dict) and task.get(field) is not None
             ]
             miner_dict[f"{field}_total"] = _round_optional_1dp(sum(values)) if values else None
-        for field in _TOKEN_TOTAL_INT_FIELDS:
+        for field in _TOKEN_TOTAL_COMPONENT_FIELDS:
             values = [
                 task[field]
                 for task in tasks
                 if isinstance(task, dict) and task.get(field) is not None
             ]
-            miner_dict[f"{field}_total"] = int(sum(values)) if values else None
+            raw_total = sum(values) if values else None
+            miner_dict[f"{field}_total"] = (
+                _round_optional_1dp(raw_total * component_weight_by_field[field])
+                if raw_total is not None
+                else None
+            )
 
 
 def _inject_screener_summary_per_miner(
