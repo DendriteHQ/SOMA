@@ -66,20 +66,27 @@ def compute_weighted_tokens(
 
 EXPLORE_QUALITY_DELTA = 0.20
 EXPLORE_SCORE_FLOOR = -2.0
+EXPLORE_NEGATIVE_TAU_QUALITY_FLOOR = 0.25
 
 
 def _normalize_explore_score(score: float | None) -> float | None:
     """Normalize an explore score to [-1, 1].
 
-    compute_explore_task_score returns gate * tau with gate in [0, 1] and tau
-    clamped to [-2, 2] (or the floor itself), so the raw aggregate produced
-    by compute_explore_miner_total_score always lives in the symmetric range
-    [-2, 2]. That makes normalization a simple halving; the clamp is just a
-    safety net against floating point drift.
+    compute_explore_task_score returns a raw score in [-2, 2], either by
+    quality-gating positive token savings or by scaling negative token
+    penalties down as quality improves. The aggregate produced by
+    compute_explore_miner_total_score therefore also lives in [-2, 2]. That
+    makes normalization a simple halving; the clamp is just a safety net
+    against floating point drift.
     """
     if score is None:
         return None
     return max(-1.0, min(1.0, score / 2.0))
+
+
+def _smoothstep_unit_interval(value: float) -> float:
+    clamped = max(0.0, min(1.0, value))
+    return (3 * clamped**2) - (2 * clamped**3)
 
 
 def _normalize_to_unit_interval(
@@ -113,7 +120,7 @@ def compute_explore_task_score(
     delta: float = EXPLORE_QUALITY_DELTA,
     floor: float = EXPLORE_SCORE_FLOOR,
 ) -> float | None:
-    """Per-task explore score: token savings gated by preserved exploration quality.
+    """Per-task explore score: quality gates rewards and softens penalties.
 
     miner_quality/baseline_quality are the task-level averages of
     (hit_file_rate - noise_file_rate) over the miner's own repeats and the
@@ -134,10 +141,15 @@ def compute_explore_task_score(
     ):
         return None
 
-    r = max(0.0, min(1.0, (margin + delta) / (2 * delta)))
-    gate = (3 * r**2) - (2 * r**3)
+    gate = _smoothstep_unit_interval((margin + delta) / (2 * delta))
     tau = max(-2.0, min(2.0, 2 * log2(baseline_weighted_tokens / miner_weighted_tokens)))
-    return gate * tau
+    if tau >= 0:
+        return gate * tau
+
+    penalty_scale = EXPLORE_NEGATIVE_TAU_QUALITY_FLOOR + (
+        (1.0 - EXPLORE_NEGATIVE_TAU_QUALITY_FLOOR) * (1.0 - gate)
+    )
+    return penalty_scale * tau
 
 
 def compute_explore_miner_total_score(
@@ -151,9 +163,8 @@ def compute_explore_miner_total_score(
     """Aggregate explore score across all of a miner's scored tasks.
 
     Applies a hard penalty (floor) when both the miner's average quality and
-    total token usage are worse than baseline; otherwise blends the average
-    per-task score toward the floor based on overall token savings, saturating
-    once total savings reach +/-20%.
+    total token usage are worse than baseline; otherwise uses the mean of the
+    per-task scores directly.
 
     The raw aggregate lives in [-2, 2]; the value returned here is
     normalized to [-1, 1] (a straight halving).
@@ -163,7 +174,11 @@ def compute_explore_miner_total_score(
 
     p_avg = sum(task_scores) / len(task_scores)
 
-    if total_miner_weighted_tokens is None or total_baseline_weighted_tokens is None or total_baseline_weighted_tokens <= 0:
+    if (
+        total_miner_weighted_tokens is None
+        or total_baseline_weighted_tokens is None
+        or total_baseline_weighted_tokens <= 0
+    ):
         raw_score = p_avg
     else:
         margin_agg = sum(task_margins) / len(task_margins) if task_margins else None
@@ -172,9 +187,7 @@ def compute_explore_miner_total_score(
         if margin_agg is not None and margin_agg < 0 and s_ratio < 0:
             raw_score = floor
         else:
-            r = max(0.0, min(1.0, (s_ratio + 0.20) / 0.40))
-            m = (3 * r**2) - (2 * r**3)
-            raw_score = (m * p_avg) + ((1 - m) * floor)
+            raw_score = p_avg
 
     return _normalize_explore_score(raw_score)
 
@@ -250,6 +263,7 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
                 "task_id": task_id,
                 "task_name": task_name,
                 "is_screener": bool(row.is_screener),
+                "screener_stage": _to_optional_int(getattr(row, "screener_stage", None)),
                 "hotkey": str(row.hotkey),
                 "baseline_runs": {},
                 "runs_by_id": {},
@@ -607,6 +621,7 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         task_id=int(group["task_id"]),
         task_name=str(group["task_name"]),
         is_screener=bool(group["is_screener"]),
+        screener_stage=_to_optional_int(group.get("screener_stage")),
         passed=task_passed if bool(group["is_screener"]) else None,
         pass_without_compression=group["baseline_pass_without_compression"],
         pass_with_compression=pass_with_compression_result,
