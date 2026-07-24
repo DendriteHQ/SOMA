@@ -736,9 +736,7 @@ async def update_openrouter_api_key(
     payload = _req.payload
     if payload.miner_hotkey != _req.sig.signer_ss58:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Miner hotkey does not match signature")
-    if not settings.debug:
-        snapshot = _get_metagraph_snapshot(request)
-        _ensure_miner_registered(snapshot=snapshot, signer_ss58=_req.sig.signer_ss58)
+        
     await _acquire_miner_openrouter_key_lock(db, miner_hotkey=payload.miner_hotkey)
 
     miner = await _ensure_miner_row(db, payload.miner_hotkey)
@@ -813,9 +811,7 @@ async def delete_openrouter_api_key(
     payload = _req.payload
     if payload.miner_hotkey != _req.sig.signer_ss58:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Miner hotkey does not match signature")
-    if not settings.debug:
-        snapshot = _get_metagraph_snapshot(request)
-        _ensure_miner_registered(snapshot=snapshot, signer_ss58=_req.sig.signer_ss58)
+
     await _acquire_miner_openrouter_key_lock(db, miner_hotkey=payload.miner_hotkey)
 
     miner = await _ensure_miner_row(db, payload.miner_hotkey)
