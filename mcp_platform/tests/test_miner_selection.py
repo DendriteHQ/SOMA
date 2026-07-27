@@ -17,6 +17,8 @@ MCP_PLATFORM_DIR = os.path.abspath(os.path.join(TESTS_DIR, ".."))
 if MCP_PLATFORM_DIR not in sys.path:
     sys.path.insert(0, MCP_PLATFORM_DIR)
 
+os.environ["DEBUG"] = "false"
+
 from soma_shared.db.models.base import Base
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.script import Script
@@ -582,7 +584,9 @@ async def test_eval_phase_selects_top_screener_script(
     await async_session.commit()
 
     original_top = settings.top_screener_scripts
+    original_min_advancers = settings.screener_stage2_min_advancers
     settings.top_screener_scripts = 0.5
+    settings.screener_stage2_min_advancers = 0
 
     try:
         # Miner 1: higher screener scores (should be selected)
@@ -699,6 +703,7 @@ async def test_eval_phase_selects_top_screener_script(
         assert selected_script.script_uuid == "70000000-0000-0000-0000-000000000011"
     finally:
         settings.top_screener_scripts = original_top
+        settings.screener_stage2_min_advancers = original_min_advancers
 
 
 @pytest.mark.asyncio
@@ -784,7 +789,9 @@ async def test_eval_top_fraction_ignores_banned_miners(
     timeframe.eval_ends_at = now + timedelta(hours=1)
 
     original_top = settings.top_screener_scripts
+    original_min_advancers = settings.screener_stage2_min_advancers
     settings.top_screener_scripts = 0.5
+    settings.screener_stage2_min_advancers = 0
 
     try:
         # Non-banned high score; later upload.
@@ -963,6 +970,7 @@ async def test_eval_top_fraction_ignores_banned_miners(
         )
     finally:
         settings.top_screener_scripts = original_top
+        settings.screener_stage2_min_advancers = original_min_advancers
 
 
 @pytest.mark.asyncio
@@ -981,7 +989,9 @@ async def test_eval_phase_selects_miner_with_unassigned_competition_backlog(
     await async_session.commit()
 
     original_top = settings.top_screener_scripts
+    original_min_advancers = settings.screener_stage2_min_advancers
     settings.top_screener_scripts = 1.0
+    settings.screener_stage2_min_advancers = 0
 
     try:
         miner = Miner(id=95, ss58="miner_unassigned_backlog")
@@ -1072,6 +1082,7 @@ async def test_eval_phase_selects_miner_with_unassigned_competition_backlog(
         )
     finally:
         settings.top_screener_scripts = original_top
+        settings.screener_stage2_min_advancers = original_min_advancers
 
 
 @pytest.mark.asyncio

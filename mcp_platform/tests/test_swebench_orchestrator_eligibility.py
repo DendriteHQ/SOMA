@@ -37,10 +37,12 @@ class _ExecuteResult:
         all_rows: list | None = None,
         first_row=None,
         mappings_rows: list[dict] | None = None,
+        rowcount: int = 0,
     ):
         self._all_rows = all_rows or []
         self._first_row = first_row
         self._mappings_rows = mappings_rows or []
+        self.rowcount = rowcount
 
     def all(self) -> list:
         return self._all_rows
@@ -159,6 +161,7 @@ def test_select_stage2_advancers_top_fraction_plus_delta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(orchestrator.settings, "top_screener_scripts", 0.2, raising=False)
+    monkeypatch.setattr(orchestrator.settings, "screener_stage2_min_advancers", 0, raising=False)
     monkeypatch.setattr(orchestrator.settings, "screener_extra_score_points", 0.03, raising=False)
     monkeypatch.setattr(orchestrator.settings, "screener_extra_miners_limit", 10, raising=False)
 
@@ -176,6 +179,7 @@ def test_select_stage2_advancers_delta_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(orchestrator.settings, "top_screener_scripts", 0.2, raising=False)
+    monkeypatch.setattr(orchestrator.settings, "screener_stage2_min_advancers", 0, raising=False)
     monkeypatch.setattr(orchestrator.settings, "screener_extra_score_points", 1.0, raising=False)
     monkeypatch.setattr(orchestrator.settings, "screener_extra_miners_limit", 1, raising=False)
 
@@ -185,6 +189,22 @@ def test_select_stage2_advancers_delta_cap(
     selected = orchestrator._select_stage2_advancers(scored)
     # top 20% of 10 = 2, plus at most 1 extra via the (wide) delta window.
     assert len(selected) == 3
+
+
+def test_select_stage2_advancers_honors_min_advancers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(orchestrator.settings, "top_screener_scripts", 0.2, raising=False)
+    monkeypatch.setattr(orchestrator.settings, "screener_stage2_min_advancers", 4, raising=False)
+    monkeypatch.setattr(orchestrator.settings, "screener_extra_score_points", 0.0, raising=False)
+    monkeypatch.setattr(orchestrator.settings, "screener_extra_miners_limit", 0, raising=False)
+
+    scored = [
+        (orchestrator._ScriptRef(script_id=i, miner_fk=i), ratio)
+        for i, ratio in enumerate([0.50, 0.49, 0.485, 0.48, 0.30, 0.10, 0.0])
+    ]
+    selected = orchestrator._select_stage2_advancers(scored)
+    assert sorted(s.script_id for s in selected) == [0, 1, 2, 3]
 
 
 @pytest.mark.asyncio
@@ -256,18 +276,23 @@ async def test_seed_waits_for_stage1_baseline_before_loading_scripts(
 
     load_scripts_mock = AsyncMock(return_value=[])
     monkeypatch.setattr(orchestrator, "_seed_baseline_runs", AsyncMock(return_value=0))
-    monkeypatch.setattr(
-        orchestrator, "_is_screener_baseline_complete", AsyncMock(return_value=False)
-    )
     monkeypatch.setattr(orchestrator, "_load_latest_scripts_for_competition", load_scripts_mock)
+    monkeypatch.setattr(orchestrator, "_load_screening_baseline_states", AsyncMock(return_value={}))
+    monkeypatch.setattr(orchestrator, "_load_screening_miner_run_states", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        orchestrator.screening_shared,
+        "evaluate_stage1_for_script",
+        AsyncMock(return_value=(False, False)),
+    )
 
     created = await orchestrator._seed_runs_for_competition(
         db, competition_id=75, eval_starts_at=eval_starts_at, now=now
     )
 
     assert created == 0
-    # Stage-1 baseline incomplete -> short-circuit before loading scripts.
-    assert load_scripts_mock.await_count == 0
+    # Current flow still loads scripts and seeds stage-1 runs before
+    # classification can conclude the cohort is incomplete.
+    assert load_scripts_mock.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -486,7 +511,7 @@ async def test_dispatch_keeps_ineligible_non_baseline_runs_pending(
     assert db.rollback.await_count == 1
     assert db.commit.await_count == 0
 
-    selection_sql = _extract_sql(db.execute)
+    selection_sql = _extract_sql(db.execute, call_index=1)
     assert "WHERE r.status = 'pending'" in selection_sql
     assert "r.baseline_run = TRUE" in selection_sql
     assert "FROM miner_uploads mu" in selection_sql
@@ -512,13 +537,10 @@ async def test_dispatch_query_orders_baseline_then_upload_time(
 
     await orchestrator._dispatch_due_runs(app, now)
 
-    selection_sql = _extract_sql(db.execute)
+    selection_sql = _extract_sql(db.execute, call_index=1)
     assert "AS miner_upload_created_at" in selection_sql
     assert "SELECT MIN(mu.created_at)" in selection_sql
-    screener_priority_clause = (
-        "CASE WHEN t.is_screener = TRUE AND r.benchmark_type IN ('swebench_verified') "
-        "THEN 0 ELSE 1 END ASC"
-    )
+    screener_priority_clause = "CASE t.screener_stage WHEN 1 THEN 0 WHEN 2 THEN 1 ELSE 2 END ASC"
     assert screener_priority_clause in selection_sql
     assert selection_sql.index(screener_priority_clause) < selection_sql.index(
         "CASE WHEN r.baseline_run = TRUE THEN 0 ELSE 1 END ASC"
@@ -554,7 +576,9 @@ async def test_dispatch_resumes_after_eligibility_restored(
     eligible_db = AsyncMock()
     eligible_db.execute = AsyncMock(
         side_effect=[
+            _ExecuteResult(),
             _ExecuteResult(mappings_rows=[due_row]),
+            _ExecuteResult(all_rows=[]),
             _ExecuteResult(),
         ]
     )
@@ -583,8 +607,8 @@ async def test_dispatch_resumes_after_eligibility_restored(
     assert manager.calls == 1
 
     # First pass left pending work untouched (selection only, no UPDATE status change).
-    assert ineligible_db.execute.await_count == 1
+    assert ineligible_db.execute.await_count == 2
 
-    dispatched_update_sql = _extract_sql(eligible_db.execute, call_index=1)
+    dispatched_update_sql = _extract_sql(eligible_db.execute, call_index=3)
     assert "SET status = 'dispatched'" in dispatched_update_sql
     assert eligible_db.commit.await_count == 1

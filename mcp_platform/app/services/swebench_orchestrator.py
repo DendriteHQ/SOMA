@@ -659,24 +659,28 @@ def _stage2_runs_complete(
 def _select_stage2_advancers(
     scored: list[tuple[_ScriptRef, float]],
 ) -> list[_ScriptRef]:
-    """Top-fraction of stage-2 passers by SWE total score, plus a delta window.
+    """Top-fraction-or-minimum of stage-2 passers, plus a delta window.
 
     ``scored`` pairs each gate-passer with its stage-2 total score (the same
     quality+saving formula as the final competition score). Selects
-    rank <= ceil(N * top_screener_scripts), then additionally any script whose
-    score is within screener_extra_score_points of the best score, capped at
+    rank <= min(total, max(stage2_min_advancers, ceil(total * top_screener_scripts))),
+    then additionally any script whose score is within
+    screener_extra_score_points of the best score, capped at
     screener_extra_miners_limit extra scripts. This wires the previously-unused
-    delta knobs into the SWE stage-2 selection.
+    delta knobs into the SWE stage-2 selection while guaranteeing a minimum
+    stage-2 cohort size.
     """
     if not scored:
         return []
     top_fraction = min(1.0, max(0.0, float(settings.top_screener_scripts)))
+    min_advancers = max(0, int(settings.screener_stage2_min_advancers))
     delta = max(0.0, float(settings.screener_extra_score_points))
     extra_cap = max(0, int(settings.screener_extra_miners_limit))
 
     ordered = sorted(scored, key=lambda item: item[1], reverse=True)
     total = len(ordered)
-    top_limit = int(math.ceil(total * top_fraction)) if top_fraction > 0 else 0
+    fraction_limit = int(math.ceil(total * top_fraction)) if top_fraction > 0 else 0
+    top_limit = min(total, max(min_advancers, fraction_limit))
     best_score = ordered[0][1]
 
     selected: list[_ScriptRef] = []

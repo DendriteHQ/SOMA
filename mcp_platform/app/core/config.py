@@ -88,6 +88,12 @@ class Settings(BaseSettings):
         default=10,
         alias="SCREENER_EXTRA_MINERS_LIMIT",
     )
+    # Minimum number of stage-2 screeners that should advance to full evaluation
+    # before applying any extra delta-window additions.
+    screener_stage2_min_advancers: int = Field(
+        default=40,
+        alias="SCREENER_STAGE2_MIN_ADVANCERS",
+    )
     # Score window in percentage points from best screener score (e.g. 0.03 = 3pp).
     screener_extra_score_points: float = Field(
         default=0.03,
@@ -472,6 +478,19 @@ class Settings(BaseSettings):
             numeric = int(value)
         except (TypeError, ValueError) as exc:
             raise ValueError("SCREENER_EXTRA_MINERS_LIMIT must be an integer") from exc
+        if numeric < 0:
+            numeric = 0
+        return numeric
+
+    @field_validator("screener_stage2_min_advancers", mode="before")
+    @classmethod
+    def _parse_screener_stage2_min_advancers(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 40
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SCREENER_STAGE2_MIN_ADVANCERS must be an integer") from exc
         if numeric < 0:
             numeric = 0
         return numeric

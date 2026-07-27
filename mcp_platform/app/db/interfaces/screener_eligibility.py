@@ -15,10 +15,16 @@ def compute_top_screener_limit(
     *,
     total_eligible: int,
     top_screener_scripts: float,
+    min_advancers: int,
 ) -> int:
-    if total_eligible <= 0 or top_screener_scripts <= 0:
+    if total_eligible <= 0:
         return 0
-    return int(math.ceil(total_eligible * top_screener_scripts))
+    fraction_limit = (
+        int(math.ceil(total_eligible * top_screener_scripts))
+        if top_screener_scripts > 0
+        else 0
+    )
+    return min(total_eligible, max(max(0, int(min_advancers)), fraction_limit))
 
 
 @db_query_interface(sample_kwargs={"competition_id": 40})
@@ -49,12 +55,19 @@ async def get_screener_total_eligible_limit1_for_competition(
     )
 
 
-@db_query_interface(sample_kwargs={"competition_id": 40, "top_screener_scripts": 0.2})
+@db_query_interface(
+    sample_kwargs={
+        "competition_id": 40,
+        "top_screener_scripts": 0.2,
+        "min_advancers": 40,
+    }
+)
 async def fetch_top_screener_miner_ids_for_competition(
     db: AsyncSession,
     *,
     competition_id: int,
     top_screener_scripts: float,
+    min_advancers: int,
 ) -> tuple[list[int], int, int]:
     row = (
         await db.execute(
@@ -69,10 +82,19 @@ async def fetch_top_screener_miner_ids_for_competition(
                     SELECT
                         COUNT(*)::int AS total_eligible,
                         CASE
-                            WHEN CAST(:top_screener_scripts AS double precision) <= 0 THEN 0
-                            ELSE CEIL(
-                                COUNT(*) * CAST(:top_screener_scripts AS double precision)
-                            )::int
+                            WHEN COUNT(*) <= 0 THEN 0
+                            ELSE LEAST(
+                                COUNT(*)::int,
+                                GREATEST(
+                                    GREATEST(CAST(:min_advancers AS int), 0),
+                                    CASE
+                                        WHEN CAST(:top_screener_scripts AS double precision) <= 0 THEN 0
+                                        ELSE CEIL(
+                                            COUNT(*) * CAST(:top_screener_scripts AS double precision)
+                                        )::int
+                                    END
+                                )
+                            )
                         END AS top_limit
                     FROM base
                 )
@@ -95,6 +117,7 @@ async def fetch_top_screener_miner_ids_for_competition(
             {
                 "competition_id": competition_id,
                 "top_screener_scripts": float(top_screener_scripts),
+                "min_advancers": int(min_advancers),
             },
         )
     ).mappings().first()
@@ -198,12 +221,19 @@ async def fetch_swebench_eligible_ss58_for_competition(
     return [str(ss58) for ss58 in (row["eligible_ss58"] or []) if ss58]
 
 
-@db_query_interface(sample_kwargs={"competition_id": 40, "top_screener_scripts": 0.2})
+@db_query_interface(
+    sample_kwargs={
+        "competition_id": 40,
+        "top_screener_scripts": 0.2,
+        "min_advancers": 40,
+    }
+)
 async def fetch_top_screener_ss58_for_competition(
     db: AsyncSession,
     *,
     competition_id: int,
     top_screener_scripts: float,
+    min_advancers: int,
 ) -> tuple[list[str], int, int]:
     row = (
         await db.execute(
@@ -218,10 +248,19 @@ async def fetch_top_screener_ss58_for_competition(
                     SELECT
                         COUNT(*)::int AS total_eligible,
                         CASE
-                            WHEN CAST(:top_screener_scripts AS double precision) <= 0 THEN 0
-                            ELSE CEIL(
-                                COUNT(*) * CAST(:top_screener_scripts AS double precision)
-                            )::int
+                            WHEN COUNT(*) <= 0 THEN 0
+                            ELSE LEAST(
+                                COUNT(*)::int,
+                                GREATEST(
+                                    GREATEST(CAST(:min_advancers AS int), 0),
+                                    CASE
+                                        WHEN CAST(:top_screener_scripts AS double precision) <= 0 THEN 0
+                                        ELSE CEIL(
+                                            COUNT(*) * CAST(:top_screener_scripts AS double precision)
+                                        )::int
+                                    END
+                                )
+                            )
                         END AS top_limit
                     FROM base
                 )
@@ -247,6 +286,7 @@ async def fetch_top_screener_ss58_for_competition(
             {
                 "competition_id": competition_id,
                 "top_screener_scripts": float(top_screener_scripts),
+                "min_advancers": int(min_advancers),
             },
         )
     ).mappings().first()
