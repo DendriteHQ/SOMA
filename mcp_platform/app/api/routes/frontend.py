@@ -1053,6 +1053,12 @@ def _inject_benchmark_tasks_per_miner(
                         if v is not None
                     ]
                     baseline_weighted_tokens = sum(baseline_weighted_values) if baseline_weighted_values else None
+                    baseline_runs_passed = sum(
+                        1 for b in baseline_runs.values() if b.get("resolved") is True
+                    )
+                    compression_runs_passed = sum(
+                        1 for r in runs if r.get("pass_with_compression") is True
+                    )
                     miner_dict["tasks"].append({
                         "task": {
                             "task_id": task["task_id"],
@@ -1068,6 +1074,10 @@ def _inject_benchmark_tasks_per_miner(
                         "runs": runs,
                         "total_runs": len(runs),
                         "benchmark_type": benchmark_type,
+                        "baseline_runs_passed": baseline_runs_passed,
+                        "baseline_runs_total": len(baseline_runs),
+                        "compression_runs_passed": compression_runs_passed,
+                        "compression_runs_total": len(runs),
                         "baseline_weighted_tokens": baseline_weighted_tokens,
                         "miner_weighted_tokens": miner_weighted_tokens,
                         "baseline_input_tokens": task.get("baseline_input_tokens"),
@@ -1278,6 +1288,30 @@ def _inject_task_screener_stage(
             task_dict["screener_stage"] = screener_stage_by_task_id.get(int(task_id))
 
 
+def _inject_verified_task_pass_counts(
+    payload: dict[str, Any],
+    verified_pass_counts: dict[str, dict[int, dict[str, int]]],
+) -> None:
+    """Attach baseline/compression pass-vs-total run counts to each
+    swebench_verified task entry. Computed from build_swe_task_groups()'s
+    baseline_runs/runs in _get_competition_aggregate_impl, since that raw
+    per-run data is gone once the response model is dumped to a plain dict."""
+    for miner_dict in payload.get("miners", []):
+        hotkey = miner_dict.get("miner", {}).get("hotkey", "")
+        counts_by_task_id = verified_pass_counts.get(hotkey, {})
+        for task_entry in miner_dict.get("tasks", []):
+            if task_entry.get("benchmark_type") != "swebench_verified":
+                continue
+            task_dict = task_entry.get("task")
+            task_id = task_dict.get("task_id") if isinstance(task_dict, dict) else None
+            if task_id is None:
+                continue
+            counts = counts_by_task_id.get(int(task_id))
+            if counts is None:
+                continue
+            task_entry.update(counts)
+
+
 async def _get_competition_aggregate_payload(
     request: Request,
     db: AsyncSession,
@@ -1288,7 +1322,7 @@ async def _get_competition_aggregate_payload(
         latest_competition_id is not None and int(competition_id) == latest_competition_id
     )
     if is_latest_competition:
-        response_model, miners_snapshot = await _get_competition_aggregate_impl(
+        response_model, miners_snapshot, verified_pass_counts = await _get_competition_aggregate_impl(
             request=request,
             db=db,
             competition_id=competition_id,
@@ -1296,6 +1330,7 @@ async def _get_competition_aggregate_payload(
         payload = response_model.model_dump(mode="json")
         stage_cohort = await _classify_swe_stage_cohort(db, comp_id=competition_id)
         _inject_screener_summary_per_miner(payload, miners_snapshot, stage_cohort)
+        _inject_verified_task_pass_counts(payload, verified_pass_counts)
         benchmark_data = await _fetch_benchmark_non_screener_data(db, comp_id=competition_id)
         _inject_benchmark_tasks_per_miner(payload, benchmark_data)
         screener_benchmark_data = await _fetch_benchmark_non_screener_data(
@@ -1324,7 +1359,7 @@ async def _get_competition_aggregate_payload(
             await _save_aggregate_snapshot_to_local(competition_id, s3_snapshot_payload)
             return s3_snapshot_payload
 
-        response_model, miners_snapshot = await _get_competition_aggregate_impl(
+        response_model, miners_snapshot, verified_pass_counts = await _get_competition_aggregate_impl(
             request=request,
             db=db,
             competition_id=competition_id,
@@ -1332,6 +1367,7 @@ async def _get_competition_aggregate_payload(
         payload = response_model.model_dump(mode="json")
         stage_cohort = await _classify_swe_stage_cohort(db, comp_id=competition_id)
         _inject_screener_summary_per_miner(payload, miners_snapshot, stage_cohort)
+        _inject_verified_task_pass_counts(payload, verified_pass_counts)
         benchmark_data = await _fetch_benchmark_non_screener_data(db, comp_id=competition_id)
         _inject_benchmark_tasks_per_miner(payload, benchmark_data)
         screener_benchmark_data = await _fetch_benchmark_non_screener_data(
@@ -3270,7 +3306,7 @@ async def _get_competition_aggregate_impl(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     competition_id: int = Path(..., ge=1),
-) -> tuple[SweCompetitionAggregateResponse, SweMinersSnapshot]:
+) -> tuple[SweCompetitionAggregateResponse, SweMinersSnapshot, dict[str, dict[int, dict[str, int]]]]:
     competition_name = await db.scalar(
         select(Competition.competition_name).where(Competition.id == competition_id)
     )
@@ -3362,6 +3398,7 @@ async def _get_competition_aggregate_impl(
     rank_by_hotkey = _build_scored_rank_map(items=scored_rank_candidates)
 
     miners: list[SweCompetitionMinerAggregateItem] = []
+    verified_pass_counts: dict[str, dict[int, dict[str, int]]] = {}
     for hotkey in miners_snapshot.ordered_hotkeys:
         miner_snapshot = miners_snapshot.miners_by_hotkey.get(hotkey)
         if miner_snapshot is None:
@@ -3402,6 +3439,23 @@ async def _get_competition_aggregate_impl(
                 group["runs"],
                 key=lambda run: (run["attempt_no"], run["run_id"] or 0),
             )
+            baseline_runs_for_group = (
+                group["baseline_runs"]
+                if isinstance(group.get("baseline_runs"), dict)
+                else {}
+            )
+            verified_pass_counts.setdefault(hotkey, {})[int(group["task_id"])] = {
+                "baseline_runs_passed": sum(
+                    1
+                    for baseline in baseline_runs_for_group.values()
+                    if baseline.get("resolved") is True
+                ),
+                "baseline_runs_total": len(baseline_runs_for_group),
+                "compression_runs_passed": sum(
+                    1 for run in runs if run.get("pass_with_compression") is True
+                ),
+                "compression_runs_total": len(runs),
+            }
             baseline_task_tokens_values = [
                 _to_optional_int(baseline.get("tokens_used"))
                 for baseline in (
@@ -3601,7 +3655,7 @@ async def _get_competition_aggregate_impl(
         len(miners),
     )
 
-    return response, miners_snapshot
+    return response, miners_snapshot, verified_pass_counts
 
 
 @frontend_router.get("/summary", response_model=FrontendSummaryResponse)
