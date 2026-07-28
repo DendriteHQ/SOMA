@@ -24,6 +24,7 @@ from soma_shared.contracts.api.v1.frontend import (
     ChallengeItem,
     ContestSummary,
     CurrentCompetitionTimeframeResponse,
+    FrontendEconomicsResponse,
     FrontendSummaryResponse,
     MinerChallengesResponse,
     MinerCompetitionItem,
@@ -124,6 +125,9 @@ _rate_limit_cache = Cache(Cache.MEMORY, namespace="frontend_api_key_rate_limit")
 _dash_rows_cache = DashRowsFrozenCache()
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after uploads finish"
 API_KEY_HEADER = "x-api-key"
+# Daily alpha emission to the subnet, over a 14-day competition.
+DAILY_ALPHA_EMISSION = 2952.0
+COMPETITION_DAYS = 14
 
 SWE_BENCH_TASKS = sa.table(
     "swe_bench_tasks",
@@ -3656,6 +3660,58 @@ async def _get_competition_aggregate_impl(
     )
 
     return response, miners_snapshot, verified_pass_counts
+
+
+@frontend_router.get("/economics", response_model=FrontendEconomicsResponse)
+async def frontend_economics(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> FrontendEconomicsResponse:
+    _cached = await _cache.get("economics")
+    if _cached is not None:
+        return _cached
+
+    metagraph_service = getattr(request.app.state, "metagraph_service", None)
+    if metagraph_service is None or not metagraph_service.is_connected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chain connection unavailable",
+        )
+
+    try:
+        registration_cost_tao = await asyncio.to_thread(
+            metagraph_service.get_registration_cost_tao
+        )
+        alpha_price_tao = await asyncio.to_thread(metagraph_service.get_alpha_price_tao)
+    except Exception as exc:
+        logger.warning("frontend_economics_chain_read_failed", extra={"error": str(exc)})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Chain read failed",
+        ) from exc
+
+    burn_active, burn_ratio = await _get_current_burn_state(db)
+    # burn_ratio is the burned share, so miners' share of emission is its complement.
+    effective_burn_ratio = burn_ratio if burn_active else 0.0
+
+    response = FrontendEconomicsResponse(
+        server_ts=datetime.now(timezone.utc),
+        registration_cost_tao=registration_cost_tao,
+        alpha_price_tao=alpha_price_tao,
+        prize_pool_tao=DAILY_ALPHA_EMISSION
+        * alpha_price_tao
+        * (1.0 - effective_burn_ratio)
+        * COMPETITION_DAYS,
+        burn_ratio=burn_ratio,
+    )
+
+    await _cache.set("economics", response, ttl=60)
+    logger.info(
+        f"[Frontend] Economics: registration_cost_tao={response.registration_cost_tao}, "
+        f"alpha_price_tao={response.alpha_price_tao}, prize_pool_tao={response.prize_pool_tao}"
+    )
+
+    return response
 
 
 @frontend_router.get("/summary", response_model=FrontendSummaryResponse)
