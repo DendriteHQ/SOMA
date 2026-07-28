@@ -125,9 +125,8 @@ _rate_limit_cache = Cache(Cache.MEMORY, namespace="frontend_api_key_rate_limit")
 _dash_rows_cache = DashRowsFrozenCache()
 TEXT_HIDDEN_PLACEHOLDER = "Will be available after uploads finish"
 API_KEY_HEADER = "x-api-key"
-# Daily alpha emission to the subnet, over a 14-day competition.
+# Daily alpha emission to the subnet.
 DAILY_ALPHA_EMISSION = 2952.0
-COMPETITION_DAYS = 14
 
 SWE_BENCH_TASKS = sa.table(
     "swe_bench_tasks",
@@ -3608,6 +3607,38 @@ async def _get_competition_aggregate_impl(
     return response, miners_snapshot
 
 
+async def _get_current_competition_days(db: AsyncSession) -> float:
+    """Length of the active competition in days, from upload start to eval end."""
+    row = (
+        await db.execute(
+            select(
+                CompetitionTimeframe.upload_starts_at,
+                CompetitionTimeframe.eval_ends_at,
+            )
+            .select_from(Competition)
+            .join(
+                CompetitionConfig,
+                CompetitionConfig.competition_fk == Competition.id,
+            )
+            .join(
+                CompetitionTimeframe,
+                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+            )
+            .where(CompetitionConfig.is_active.is_(True))
+            .order_by(Competition.id.desc(), CompetitionTimeframe.created_at.desc())
+            .limit(1)
+        )
+    ).first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active competition timeframe found",
+        )
+
+    return (row.eval_ends_at - row.upload_starts_at).total_seconds() / 86400.0
+
+
 @frontend_router.get("/economics", response_model=FrontendEconomicsResponse)
 async def frontend_economics(
     request: Request,
@@ -3639,6 +3670,7 @@ async def frontend_economics(
     burn_active, burn_ratio = await _get_current_burn_state(db)
     # burn_ratio is the burned share, so miners' share of emission is its complement.
     effective_burn_ratio = burn_ratio if burn_active else 0.0
+    competition_days = await _get_current_competition_days(db)
 
     response = FrontendEconomicsResponse(
         server_ts=datetime.now(timezone.utc),
@@ -3647,7 +3679,7 @@ async def frontend_economics(
         prize_pool_tao=DAILY_ALPHA_EMISSION
         * alpha_price_tao
         * (1.0 - effective_burn_ratio)
-        * COMPETITION_DAYS,
+        * competition_days,
         burn_ratio=burn_ratio,
     )
 
