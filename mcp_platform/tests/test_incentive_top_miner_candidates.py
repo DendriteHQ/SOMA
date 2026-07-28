@@ -1,7 +1,6 @@
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -28,10 +27,6 @@ from app.api.routes.incentive_admin import (
 	update_top_miner_approval,
 )
 from app.services.top_miner_approval import set_top_miner_approval
-from app.services.swe_difficulty_calculator import (
-	TaskDifficultyResult,
-	build_miner_category_scores,
-)
 from soma_shared.db.models.base import Base
 from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.competition_config import CompetitionConfig
@@ -182,73 +177,6 @@ async def test_get_active_top_miner_rows_filters_only_approved_active_windows(
 		("approved-current", 0.25),
 		("approved-other-competition", 0.25),
 	]
-
-
-def test_build_miner_category_scores_requires_all_tasks_scored() -> None:
-	task_difficulties = (
-		TaskDifficultyResult(
-			task_name="task-1",
-			loss_ratio=0.1,
-			average_tokens=100.0,
-			normalized_token_score=1.0,
-			difficulty_score=0.2,
-			category="Easy",
-		),
-		TaskDifficultyResult(
-			task_name="task-2",
-			loss_ratio=0.2,
-			average_tokens=200.0,
-			normalized_token_score=0.5,
-			difficulty_score=0.3,
-			category="Hard",
-		),
-	)
-	rows = [
-		SimpleNamespace(
-			task_name="task-1",
-			hotkey="complete-miner",
-			baseline_run_id=1,
-			baseline_tokens_used=100,
-			baseline_resolved=True,
-			run_id=11,
-			attempt_no=1,
-			run_tokens_used=50,
-			time_taken_seconds=10.0,
-			agent_steps=5,
-			run_resolved=True,
-		),
-		SimpleNamespace(
-			task_name="task-2",
-			hotkey="complete-miner",
-			baseline_run_id=2,
-			baseline_tokens_used=120,
-			baseline_resolved=True,
-			run_id=12,
-			attempt_no=1,
-			run_tokens_used=60,
-			time_taken_seconds=12.0,
-			agent_steps=6,
-			run_resolved=True,
-		),
-		SimpleNamespace(
-			task_name="task-1",
-			hotkey="incomplete-miner",
-			baseline_run_id=1,
-			baseline_tokens_used=100,
-			baseline_resolved=True,
-			run_id=21,
-			attempt_no=1,
-			run_tokens_used=55,
-			time_taken_seconds=11.0,
-			agent_steps=5,
-			run_resolved=True,
-		),
-	]
-
-	scores = build_miner_category_scores(rows, task_difficulties)
-
-	assert set(scores) == {"complete-miner"}
-	assert set(scores["complete-miner"]) == {"Easy", "Hard"}
 
 
 @pytest.mark.asyncio

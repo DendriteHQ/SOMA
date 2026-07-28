@@ -146,15 +146,6 @@ class Settings(BaseSettings):
         alias="BEST_MINERS_CACHE_PATH",
     )
 
-    # Batch cleanup
-    batch_cleanup_interval_secs: int = Field(
-        default=120,
-        alias="BATCH_CLEANUP_INTERVAL_SECS",
-    )
-    batch_assignment_timeout_hours: float = Field(
-        default=0.2,
-        alias="BATCH_ASSIGNMENT_TIMEOUT_HOURS",
-    )
     validator_openrouter_error_cooldown_seconds: float = Field(
         default=600.0,
         alias="VALIDATOR_OPENROUTER_ERROR_COOLDOWN_SECONDS",
@@ -162,18 +153,6 @@ class Settings(BaseSettings):
     openrouter_ssm_prefix: str = Field(
         default="/s114/dev",
         alias="OPENROUTER_SSM_PREFIX",
-    )
-
-    # Materialized view refresh
-    # Fast views: mv_miner_status, mv_miner_screener_stats, mv_miner_competition_stats
-    mv_refresh_fast_interval_secs: int = Field(
-        default=10,
-        alias="MV_REFRESH_FAST_INTERVAL_SECS",
-    )
-    # Slow views: mv_competition_challenges
-    mv_refresh_interval_secs: int = Field(
-        default=60,
-        alias="MV_REFRESH_INTERVAL_SECS",
     )
 
     # Sandbox timeout configuration

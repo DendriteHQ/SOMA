@@ -44,8 +44,6 @@ from app.api.routes.utils import (
     _get_request_row,
     _get_validator,
     _log_error_response,
-    # Re-exported for backward compatibility with existing tests.
-    _select_miner_ss58,
 )
 from app.core.config import settings
 from app.core.logging import get_logger
