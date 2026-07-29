@@ -71,6 +71,10 @@ class MetagraphService:
     def latest_snapshot(self) -> dict[str, Any] | None:
         return self._latest_snapshot
 
+    @property
+    def is_connected(self) -> bool:
+        return self._subtensor is not None
+
     def _build_subtensor(self) -> bt.subtensor:
         logging.getLogger("bittensor").setLevel(logging.INFO)
         # Bittensor reconfigures logging; restore app logging settings.
@@ -109,6 +113,23 @@ class MetagraphService:
             except TypeError:
                 pass
         return subtensor_cls()
+
+    def get_registration_cost_tao(self) -> float:
+        """Current registration burn cost in TAO, read straight from chain storage."""
+        value = self._subtensor.substrate.query(
+            module="SubtensorModule",
+            storage_function="Burn",
+            params=[settings.bt_netuid],
+        )
+        if hasattr(value, "tao"):
+            return float(value.tao)
+        if hasattr(value, "rao"):
+            return float(value.rao) / 1e9
+        return float(getattr(value, "value", value)) / 1e9
+
+    def get_alpha_price_tao(self) -> float:
+        """Current subnet alpha token price in TAO (1 ALPHA = X TAO)."""
+        return float(self._subtensor.subnet(settings.bt_netuid).price.tao)
 
     def _get_current_block(self) -> int | None:
         if self._subtensor is None:
