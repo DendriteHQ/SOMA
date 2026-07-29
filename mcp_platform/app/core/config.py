@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     wallet_path: str | None = Field(default=None, alias="WALLET_PATH")
     wallet_hotkey: str | None = Field(default=None, alias="WALLET_HOTKEY")
     bt_netuid: int = Field(default=114, alias="BT_NETUID")
-    bt_network: str | None = Field(default=None, alias="BT_NETWORK")
+    bt_network: str = Field(default="finney", alias="BT_NETWORK")
     bt_chain_endpoint: str | None = Field(default=None, alias="BT_CHAIN_ENDPOINT")
     bt_metagraph_epoch_length: int = Field(
         default=100, alias="BT_METAGRAPH_EPOCH_LENGTH"

@@ -2968,7 +2968,7 @@ async def frontend_economics(
         burn_ratio=burn_ratio,
     )
 
-    await _cache.set("economics", response, ttl=60)
+    await _cache.set("economics", response, ttl=30)
     logger.info(
         f"[Frontend] Economics: registration_cost_tao={response.registration_cost_tao}, "
         f"alpha_price_tao={response.alpha_price_tao}, prize_pool_tao={response.prize_pool_tao}"
