@@ -114,22 +114,25 @@ class MetagraphService:
                 pass
         return subtensor_cls()
 
-    def get_registration_cost_tao(self) -> float:
-        """Current registration burn cost in TAO, read straight from chain storage."""
+    def _query_netuid_scalar(self, storage_function: str) -> int:
+        """Read a single-value storage item for the configured netuid, in rao."""
         value = self._subtensor.substrate.query(
             module="SubtensorModule",
-            storage_function="Burn",
+            storage_function=storage_function,
             params=[settings.bt_netuid],
         )
-        if hasattr(value, "tao"):
-            return float(value.tao)
-        if hasattr(value, "rao"):
-            return float(value.rao) / 1e9
-        return float(getattr(value, "value", value)) / 1e9
+        raw = getattr(value, "value", value)
+        # Some items decode to a single-element vector on finney, e.g. [50000000].
+        return int(raw[0] if isinstance(raw, (list, tuple)) else raw)
+
+    def get_registration_cost_tao(self) -> float:
+        """Current registration burn cost in TAO, read straight from chain storage."""
+        return self._query_netuid_scalar("Burn") / 1e9
 
     def get_alpha_price_tao(self) -> float:
-        """Current subnet alpha token price in TAO (1 ALPHA = X TAO)."""
-        return float(self._subtensor.subnet(settings.bt_netuid).price.tao)
+        """Current alpha price in TAO (1 ALPHA = X TAO), from the subnet pool reserves."""
+        alpha_in = self._query_netuid_scalar("SubnetAlphaIn")
+        return (self._query_netuid_scalar("SubnetTAO") / alpha_in) if alpha_in else 0.0
 
     def _get_current_block(self) -> int | None:
         if self._subtensor is None:
@@ -183,15 +186,25 @@ class MetagraphService:
                     asyncio.to_thread(self._build_subtensor),
                     timeout=settings.bt_metagraph_init_timeout_secs,
                 )
+                resolved_network = getattr(self._subtensor, "network", None)
+                resolved_endpoint = getattr(self._subtensor, "chain_endpoint", None)
                 logger.info(
                     "metagraph_service_subtensor_built",
                     extra={
-                        "network": getattr(self._subtensor, "network", None),
-                        "chain_endpoint": getattr(
-                            self._subtensor, "chain_endpoint", None
-                        ),
+                        "network": resolved_network,
+                        "chain_endpoint": resolved_endpoint,
                     },
                 )
+                if resolved_network != "finney":
+                    # Off-mainnet chains report unrelated economics for the same netuid.
+                    logger.warning(
+                        "metagraph_non_mainnet_network",
+                        extra={
+                            "network": resolved_network,
+                            "chain_endpoint": resolved_endpoint,
+                            "netuid": settings.bt_netuid,
+                        },
+                    )
             self._metagraph = await asyncio.wait_for(
                 asyncio.to_thread(self._subtensor.metagraph, settings.bt_netuid),
                 timeout=settings.bt_metagraph_init_timeout_secs,
