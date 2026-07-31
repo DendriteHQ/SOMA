@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     # Minimum number of stage-2 screeners that should advance to full evaluation
     # before applying any extra delta-window additions.
     screener_stage2_min_advancers: int = Field(
-        default=40,
+        default=60,
         alias="SCREENER_STAGE2_MIN_ADVANCERS",
     )
     # Score window in percentage points from best screener score (e.g. 0.03 = 3pp).
