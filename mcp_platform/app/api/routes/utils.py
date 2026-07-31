@@ -399,7 +399,7 @@ async def _select_miner_ss58(
                 db,
                 competition_id=competition_id,
                 top_screener_scripts=top_fraction,
-                min_advancers=int(getattr(settings, "screener_stage2_min_advancers", 40)),
+                min_advancers=int(getattr(settings, "screener_stage2_min_advancers", 60)),
             )
 
             if total_eligible <= 0:
