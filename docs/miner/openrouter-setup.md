@@ -1,8 +1,8 @@
 # 🔧 OpenRouter Setup
 
-> **Required configuration for the new competition**
+> **Required configuration for the competitions using DeepSeek V4 Pro**
 
-For the new competition, we will be using **DeepSeek V4 Pro** via the **DeepSeek** provider on OpenRouter.
+For the upcoming competition rounds, we will use **DeepSeek V4 Pro** via the **DeepSeek** provider on OpenRouter.
 
 To participate, you must enable **Data Collection** for the DeepSeek provider in your OpenRouter settings.
 
