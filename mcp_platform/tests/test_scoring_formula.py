@@ -231,34 +231,6 @@ def test_build_swe_miner_scores_leaves_total_raw_when_tokens_are_missing():
     assert abs(screener_score - 2.0) < 1e-9
 
 
-def test_build_swe_category_scores_uses_platform_scores_without_run_baseline_fields():
-    scoring = _load_scoring_module()
-
-    task_groups = {
-        "task-a": {
-            "task_name": "task-a",
-            "baseline_runs": {1: {"tokens_used": 100}},
-            "baseline_weighted_tokens": 100.0,
-            "runs": [{"platform_score": 2.0, "tokens_with_compression": 80, "weighted_tokens_with_compression": 80.0}],
-        },
-        "task-b": {
-            "task_name": "task-b",
-            "baseline_runs": {2: {"tokens_used": 100}},
-            "baseline_weighted_tokens": 100.0,
-            "runs": [{"platform_score": 0.0, "tokens_with_compression": 100, "weighted_tokens_with_compression": 100.0}],
-        },
-    }
-
-    category_scores = scoring.build_swe_category_scores(
-        task_groups,
-        {"task-a": "Easy", "task-b": "Hard"},
-    )
-
-    assert abs(category_scores["Easy"] - 2.0) < 1e-9
-    assert category_scores["Medium"] is None
-    assert abs(category_scores["Hard"] + 2.0) < 1e-9
-
-
 def test_build_swe_miner_category_scores_with_penalty_returns_scores_for_complete_miners():
     scoring = _load_scoring_module()
 

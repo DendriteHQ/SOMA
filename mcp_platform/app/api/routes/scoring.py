@@ -640,25 +640,3 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         platform_score=task_score,
         run_count=len(runs),
     )
-
-
-def build_swe_category_scores(
-    task_groups: dict[int, dict[str, object]],
-    task_categories: dict[str, str],
-) -> dict[str, float | None]:
-    """Runs the same main+hard-boost aggregation as build_swe_miner_scores, scoped to the
-    subset of task groups belonging to each difficulty category.
-    """
-    category_scores: dict[str, float | None] = {}
-    for category in ("Easy", "Medium", "Hard"):
-        category_groups = {
-            task_id: group
-            for task_id, group in task_groups.items()
-            if task_categories.get(str(group["task_name"])) == category
-        }
-        if not category_groups:
-            category_scores[category] = None
-            continue
-        total_score, _ = build_swe_miner_total_score(category_groups)
-        category_scores[category] = total_score
-    return category_scores

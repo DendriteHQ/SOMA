@@ -6,17 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.interfaces.query_registry import db_query_interface
-from app.db.views import V_ACTIVE_COMPETITION
 from soma_shared.db.models.competition_config import CompetitionConfig
 from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
-
-
-@db_query_interface(sample_kwargs={})
-async def get_active_competition_id_from_view(
-    db: AsyncSession,
-) -> int | None:
-    competition_id = await db.scalar(select(V_ACTIVE_COMPETITION.c.competition_id).limit(1))
-    return int(competition_id) if competition_id is not None else None
 
 
 @db_query_interface(sample_kwargs_factory=lambda: {"now": datetime.now(timezone.utc)})
@@ -25,8 +16,7 @@ async def get_active_competition_id_direct(
     *,
     now: datetime,
 ) -> int | None:
-    """Read active competition directly from competition_configs + competition_timeframes,
-    bypassing v_active_competition which requires compression_competition_config."""
+    """Read active competition directly from competition_configs + competition_timeframes."""
     # Prefer competition where now is within [upload_starts_at, eval_ends_at].
     row = (
         await db.execute(
@@ -69,36 +59,12 @@ async def get_active_competition_id_direct(
     return int(competition_id) if competition_id is not None else None
 
 
-@db_query_interface(sample_kwargs={})
-async def get_active_competition_phase_row(
-    db: AsyncSession,
-):
-    return (
-        await db.execute(
-            select(
-                V_ACTIVE_COMPETITION.c.competition_id,
-                V_ACTIVE_COMPETITION.c.eval_starts_at,
-            ).limit(1)
-        )
-    ).first()
-
-
 @db_query_interface(sample_kwargs={"competition_id": 40})
 async def get_active_competition_upload_starts_at(
     db: AsyncSession,
     *,
     competition_id: int,
 ):
-    row = (
-        await db.execute(
-            select(V_ACTIVE_COMPETITION.c.upload_starts_at)
-            .where(V_ACTIVE_COMPETITION.c.competition_id == competition_id)
-            .limit(1)
-        )
-    ).first()
-    if row is not None:
-        return row.upload_starts_at
-    # Fallback: read directly from competition_configs + competition_timeframes.
     row = (
         await db.execute(
             select(CompetitionTimeframe.upload_starts_at)
