@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import uuid
@@ -69,6 +72,108 @@ logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
 
 _EXPLORER_METRIC_KEYS = ("precision", "recall", "f1_score", "hit_file_rate", "noise_file_rate", "weighted_core_coverage")
+_VALIDATION_PREFETCH_BATCH_SIZE = 50
+_VALIDATION_PREFETCH_REFILL_THRESHOLD = 10
+_VALIDATION_PREFETCH_CACHE_TTL_SECONDS = 5.0
+_VALIDATION_FETCH_MAX_ATTEMPTS = 50
+
+
+@dataclass(slots=True)
+class _ValidationPrefetchCandidate:
+    validation_id: int
+
+
+class _ValidationPrefetchCache:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._queue: deque[_ValidationPrefetchCandidate] = deque()
+        self._queued_ids: set[int] = set()
+        self._fetched_at: datetime | None = None
+
+    def _clear_unlocked(self) -> None:
+        self._queue.clear()
+        self._queued_ids.clear()
+        self._fetched_at = None
+
+    def _is_stale_unlocked(self, *, now: datetime) -> bool:
+        if self._fetched_at is None:
+            return False
+        return (now - self._fetched_at).total_seconds() >= _VALIDATION_PREFETCH_CACHE_TTL_SECONDS
+
+    async def _refill_unlocked(
+        self,
+        db: AsyncSession,
+        *,
+        now: datetime,
+        claim_ttl_seconds: int,
+        completed_condition,
+        request_id: str | None,
+    ) -> None:
+        query = _build_validation_candidate_query(
+            now=now,
+            claim_ttl_seconds=claim_ttl_seconds,
+            completed_condition=completed_condition,
+            select_columns=(SweBenchRunValidation.id,),
+            limit=_VALIDATION_PREFETCH_BATCH_SIZE,
+            lock_rows=False,
+        )
+        rows = (await db.execute(query)).all()
+        added = 0
+        for row in rows:
+            validation_id = int(row[0])
+            if validation_id in self._queued_ids:
+                continue
+            self._queue.append(_ValidationPrefetchCandidate(validation_id=validation_id))
+            self._queued_ids.add(validation_id)
+            added += 1
+        self._fetched_at = now
+        if added or rows:
+            logger.info(
+                "get_swebench_validation_prefetch_refill",
+                extra={
+                    "request_id": request_id,
+                    "fetched_rows": len(rows),
+                    "added_rows": added,
+                    "queue_size": len(self._queue),
+                },
+            )
+
+    async def pop(
+        self,
+        db: AsyncSession,
+        *,
+        now: datetime,
+        claim_ttl_seconds: int,
+        completed_condition,
+        request_id: str | None,
+    ) -> _ValidationPrefetchCandidate | None:
+        async with self._lock:
+            if self._is_stale_unlocked(now=now):
+                self._clear_unlocked()
+            if not self._queue:
+                await self._refill_unlocked(
+                    db,
+                    now=now,
+                    claim_ttl_seconds=claim_ttl_seconds,
+                    completed_condition=completed_condition,
+                    request_id=request_id,
+                )
+            if not self._queue:
+                return None
+            candidate = self._queue.popleft()
+            self._queued_ids.discard(candidate.validation_id)
+            if len(self._queue) < _VALIDATION_PREFETCH_REFILL_THRESHOLD:
+                await self._refill_unlocked(
+                    db,
+                    now=now,
+                    claim_ttl_seconds=claim_ttl_seconds,
+                    completed_condition=completed_condition,
+                    request_id=request_id,
+                )
+            return candidate
+
+
+_validation_prefetch_cache = _ValidationPrefetchCache()
 
 
 async def _insert_benchmark_sub_row(
@@ -148,6 +253,110 @@ def _completed_run_condition():
     if not predicates:
         return None
     return or_(*predicates)
+
+
+def _active_validation_timeframe_exists(*, now: datetime):
+    return exists(
+        select(1)
+        .select_from(CompetitionConfig)
+        .join(
+            CompetitionTimeframe,
+            CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+        )
+        .where(CompetitionConfig.competition_fk == SweBenchTask.competition_fk)
+        .where(CompetitionConfig.is_active.is_(True))
+        .where(CompetitionTimeframe.eval_ends_at >= now)
+    )
+
+
+def _validation_reclaim_condition(
+    *,
+    now: datetime,
+    claim_ttl_seconds: int,
+):
+    claim_expires_col = _model_attr(SweBenchRunValidation, "claim_expires_at")
+    claimed_at_col = _model_attr(SweBenchRunValidation, "claimed_at")
+    validator_fk_col = _model_attr(SweBenchRunValidation, "validator_fk")
+    if validator_fk_col is None:
+        return None
+
+    reclaim_conditions = [validator_fk_col.is_(None)]
+    if claim_expires_col is not None:
+        reclaim_conditions.append(
+            and_(
+                claim_expires_col.is_not(None),
+                claim_expires_col < now,
+            )
+        )
+        if claimed_at_col is not None:
+            reclaim_conditions.append(
+                and_(
+                    claim_expires_col.is_(None),
+                    or_(
+                        claimed_at_col.is_(None),
+                        claimed_at_col < (now - timedelta(seconds=claim_ttl_seconds)),
+                    ),
+                )
+            )
+    return or_(*reclaim_conditions)
+
+
+def _build_validation_candidate_query(
+    *,
+    now: datetime,
+    claim_ttl_seconds: int,
+    completed_condition,
+    select_columns,
+    limit: int,
+    validation_id: int | None = None,
+    lock_rows: bool,
+):
+    query = (
+        select(*select_columns)
+        .select_from(SweBenchRunValidation)
+        .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
+        .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
+        .where(SweBenchRunValidation.scored_at.is_(None))
+        .where(_active_validation_timeframe_exists(now=now))
+    )
+    if completed_condition is not None:
+        query = query.where(completed_condition)
+    reclaim_condition = _validation_reclaim_condition(
+        now=now,
+        claim_ttl_seconds=claim_ttl_seconds,
+    )
+    if reclaim_condition is not None:
+        query = query.where(reclaim_condition)
+    if validation_id is not None:
+        query = query.where(SweBenchRunValidation.id == validation_id)
+    query = query.order_by(SweBenchRunValidation.id.asc()).limit(limit)
+    if lock_rows:
+        query = query.with_for_update(skip_locked=True)
+    return query
+
+
+async def _claim_validation_candidate(
+    db: AsyncSession,
+    *,
+    validation_id: int,
+    now: datetime,
+    claim_ttl_seconds: int,
+    completed_condition,
+):
+    query = _build_validation_candidate_query(
+        now=now,
+        claim_ttl_seconds=claim_ttl_seconds,
+        completed_condition=completed_condition,
+        select_columns=(SweBenchRunValidation, SweBenchRun, SweBenchTask),
+        validation_id=validation_id,
+        limit=1,
+        lock_rows=True,
+    )
+    candidate_row = (await db.execute(query)).first()
+    if candidate_row is None:
+        await db.rollback()
+        return None
+    return candidate_row
 
 
 def _miners_log(miners_list: list[MinerWeight]) -> list[dict[str, float | int]]:
@@ -826,6 +1035,7 @@ async def get_swebench_validation(
 ) -> SignedEnvelope[GetSweBenchValidationResponse]:
     request_id = getattr(request.state, "request_id", None)
     validator = await _get_validator(db, ss58=_req.sig.signer_ss58)
+    validator_id = int(validator.id)
     validator_status = (validator.current_status or "").lower()
     if validator_status != "working":
         raise HTTPException(
@@ -834,80 +1044,41 @@ async def get_swebench_validation(
         )
 
     claim_ttl_seconds = max(60, int(settings.swebench_validation_claim_ttl_seconds))
-    claim_expires_col = _model_attr(SweBenchRunValidation, "claim_expires_at")
     claimed_at_col = _model_attr(SweBenchRunValidation, "claimed_at")
     validator_fk_col = _model_attr(SweBenchRunValidation, "validator_fk")
+    claim_expires_col = _model_attr(SweBenchRunValidation, "claim_expires_at")
     logs_col = _model_attr(SweBenchRunValidation, "logs")
     completed_condition = _completed_run_condition()
 
     task_payload: SweBenchValidationTask | None = None
     output_storage = _get_output_storage(request)
-    for _ in range(50):
+    for _ in range(_VALIDATION_FETCH_MAX_ATTEMPTS):
         now = datetime.now(timezone.utc)
         claim_expires_at = now + timedelta(seconds=claim_ttl_seconds)
-
-        active_timeframe_exists = exists(
-            select(1)
-            .select_from(CompetitionConfig)
-            .join(
-                CompetitionTimeframe,
-                CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
-            )
-            .where(CompetitionConfig.competition_fk == SweBenchTask.competition_fk)
-            .where(CompetitionConfig.is_active.is_(True))
-            .where(CompetitionTimeframe.eval_ends_at >= now)
+        prefetched = await _validation_prefetch_cache.pop(
+            db,
+            now=now,
+            claim_ttl_seconds=claim_ttl_seconds,
+            completed_condition=completed_condition,
+            request_id=request_id,
         )
-        query_unclaimed = (
-            select(SweBenchRunValidation, SweBenchRun, SweBenchTask)
-            .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
-            .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
-            .where(SweBenchRunValidation.scored_at.is_(None))
-            # Don't hand out (or churn through auto-scoring) validations whose
-            # competition has already ended its eval window; those results no
-            # longer feed dispatch/scoring for anything live.
-            .where(active_timeframe_exists)
-        )
-        if completed_condition is not None:
-            query_unclaimed = query_unclaimed.where(completed_condition)
-        if validator_fk_col is not None:
-            reclaim_conditions = [validator_fk_col.is_(None)]
-            if claim_expires_col is not None:
-                reclaim_conditions.append(
-                    and_(
-                        claim_expires_col.is_not(None),
-                        claim_expires_col < now,
-                    )
-                )
-                # Backward compatibility: older rows may have validator_fk set
-                # without claim_expires_at (and sometimes without claimed_at),
-                # which makes them permanently unclaimable.
-                if claimed_at_col is not None:
-                    reclaim_conditions.append(
-                        and_(
-                            claim_expires_col.is_(None),
-                            or_(
-                                claimed_at_col.is_(None),
-                                claimed_at_col < (now - timedelta(seconds=claim_ttl_seconds)),
-                            ),
-                        )
-                    )
-            query_unclaimed = query_unclaimed.where(or_(*reclaim_conditions))
-        query_unclaimed = (
-            query_unclaimed.order_by(SweBenchRunValidation.id.asc())
-            .with_for_update(skip_locked=True)
-            .limit(1)
-        )
-        candidate_row = (await db.execute(query_unclaimed)).first()
-
-        if candidate_row is None:
-            await db.rollback()
+        if prefetched is None:
             break
+        candidate_row = await _claim_validation_candidate(
+            db,
+            validation_id=prefetched.validation_id,
+            now=now,
+            claim_ttl_seconds=claim_ttl_seconds,
+            completed_condition=completed_condition,
+        )
+        if candidate_row is None:
+            continue
 
         validation_row, run_row, task_row = candidate_row
         current_validator_fk = getattr(validation_row, "validator_fk", None)
-        is_new_claim = int(current_validator_fk or 0) != int(validator.id)
+        is_new_claim = int(current_validator_fk or 0) != validator_id
         if validator_fk_col is not None:
-            validation_row.validator_fk = validator.id
+            validation_row.validator_fk = validator_id
         if claimed_at_col is not None and (is_new_claim or getattr(validation_row, "claimed_at", None) is None):
             validation_row.claimed_at = now
         if claim_expires_col is not None:

@@ -247,7 +247,7 @@ class Settings(BaseSettings):
         alias="SWEBENCH_DISPATCH_WINDOW_SECONDS",
     )
     swebench_dispatch_max_runs_per_window: int = Field(
-        default=10,
+        default=20,
         alias="SWEBENCH_DISPATCH_MAX_RUNS_PER_WINDOW",
     )
     swebench_max_concurrent_dispatched_per_miner: int = Field(

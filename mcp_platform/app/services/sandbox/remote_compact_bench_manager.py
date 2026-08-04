@@ -205,20 +205,71 @@ class RemoteCompactBenchManager:
     ) -> CompactBenchRunTaskResponse:
         last_exc: Exception | None = None
         candidate_urls = self._pick_sandbox_urls()
+        run_id = int(payload.run_id)
+        metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
+        logger.info(
+            "compact_bench_dispatch_candidates",
+            extra={
+                "run_id": run_id,
+                "instance_id": payload.instance_id,
+                "benchmark_type": payload.benchmark_type,
+                "candidate_sandbox_urls": candidate_urls,
+                "candidate_count": len(candidate_urls),
+                "miner_fk": metadata.get("miner_fk"),
+                "script_fk": metadata.get("script_fk"),
+                "attempt_no": metadata.get("attempt_no"),
+            },
+        )
 
         for index, sandbox_url in enumerate(candidate_urls):
             try:
+                logger.info(
+                    "compact_bench_dispatch_attempt",
+                    extra={
+                        "run_id": run_id,
+                        "instance_id": payload.instance_id,
+                        "benchmark_type": payload.benchmark_type,
+                        "sandbox_url": sandbox_url,
+                        "attempt_index": index + 1,
+                        "candidate_count": len(candidate_urls),
+                    },
+                )
                 response = await client.post(
                     f"{sandbox_url}/run_compact_bench_task",
                     json=payload.model_dump(mode="json"),
                     timeout=timeout,
                 )
                 response.raise_for_status()
+                logger.info(
+                    "compact_bench_dispatch_accepted",
+                    extra={
+                        "run_id": run_id,
+                        "instance_id": payload.instance_id,
+                        "benchmark_type": payload.benchmark_type,
+                        "sandbox_url": sandbox_url,
+                        "attempt_index": index + 1,
+                        "candidate_count": len(candidate_urls),
+                    },
+                )
                 return CompactBenchRunTaskResponse.model_validate(response.json())
             except Exception as exc:
                 last_exc = exc
-                _, retryable = self._format_dispatch_error(exc)
+                error, retryable = self._format_dispatch_error(exc)
                 has_fallback = index < len(candidate_urls) - 1
+                logger.warning(
+                    "compact_bench_dispatch_attempt_failed",
+                    extra={
+                        "run_id": run_id,
+                        "instance_id": payload.instance_id,
+                        "benchmark_type": payload.benchmark_type,
+                        "sandbox_url": sandbox_url,
+                        "attempt_index": index + 1,
+                        "candidate_count": len(candidate_urls),
+                        "retryable": retryable,
+                        "has_fallback": has_fallback,
+                        "error": error,
+                    },
+                )
                 if retryable and has_fallback:
                     continue
                 raise
