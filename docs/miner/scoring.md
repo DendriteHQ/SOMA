@@ -349,7 +349,49 @@ Miner-level explore aggregation is performed by
 The aggregate:
 
 1. starts from the mean of the per-task explore scores,
-2. applies the hard floor only if the miner is worse than baseline on both
-   average quality margin and total weighted token usage,
-3. otherwise keeps the per-task mean unchanged,
+2. pulls that mean toward the explore floor in proportion to how far the miner
+   is worse than baseline on both average quality margin and total weighted
+   token usage,
+3. keeps the per-task mean unchanged whenever either axis is at or better than
+   baseline,
 4. normalizes the resulting score to `[-1, 1]`.
+
+### Aggregate dual-worse penalty
+
+Let `m_agg` be the mean per-task quality margin and
+
+```math
+r = 1 - \frac{T_M}{T_B}
+```
+
+the aggregate token ratio, where `T_M` and `T_B` are the miner's and the
+baseline's total weighted token counts. Each axis gets a severity that is `0`
+at the baseline boundary and `1` at the far end of its span:
+
+```math
+\sigma_q = S\!\left(\frac{-m_{agg}}{\delta}\right)
+\qquad
+\sigma_t = S\!\left(\frac{-r}{\rho}\right)
+```
+
+where `S` is the smoothstep used elsewhere in explore scoring, `delta` is
+`EXPLORE_QUALITY_DELTA` (`0.20`) and `rho` is `EXPLORE_AGG_TOKEN_SPAN` (`0.50`,
+i.e. full severity at 1.5x baseline token usage).
+
+The aggregate severity is the product `sigma = sigma_q * sigma_t`, and the raw
+aggregate is interpolated toward the floor:
+
+```math
+s_{agg} = \bar{p} + \sigma\left(\text{floor} - \bar{p}\right)
+```
+
+Because `sigma_q` is `0` for `m_agg >= 0` and `sigma_t` is `0` for `r >= 0`, the
+penalty vanishes entirely unless the miner is worse than baseline on *both*
+axes, and it grows continuously from there — there is no threshold at which the
+category score jumps.
+
+| Symbol | Meaning | Value |
+| --- | --- | --- |
+| `delta` | aggregate quality span | `0.20` |
+| `rho` | aggregate token span | `0.50` |
+| `floor` | explore score floor | `-2.0` |

@@ -68,6 +68,16 @@ EXPLORE_QUALITY_DELTA = 0.20
 EXPLORE_SCORE_FLOOR = -2.0
 EXPLORE_NEGATIVE_TAU_QUALITY_FLOOR = 0.25
 
+# Aggregate dual-worse penalty spans. Severity ramps from 0 at the baseline
+# boundary to 1 at the far end of each span, so the penalty is continuous in
+# both inputs instead of switching on at a threshold.
+#
+# Quality reuses EXPLORE_QUALITY_DELTA: the aggregate reaches full quality
+# severity exactly where a single task would hit its own hard floor.
+EXPLORE_AGG_QUALITY_SPAN = EXPLORE_QUALITY_DELTA
+# Tokens reach full severity at 1.5x baseline usage (s_ratio == -0.5).
+EXPLORE_AGG_TOKEN_SPAN = 0.50
+
 
 def _normalize_explore_score(score: float | None) -> float | None:
     """Normalize an explore score to [-1, 1].
@@ -162,13 +172,22 @@ def compute_explore_miner_total_score(
 ) -> float | None:
     """Aggregate explore score across all of a miner's scored tasks.
 
-    Uses the mean of the scored explore tasks directly.
+    Starts from the mean of the per-task explore scores and pulls it toward the
+    explore floor in proportion to how far the miner is worse than baseline on
+    *both* aggregate quality margin and aggregate weighted-token usage.
 
-    Earlier versions forced the whole category to the explore floor whenever a
-    miner's aggregate quality and aggregate weighted-token usage were both worse
-    than baseline. That introduced a large discontinuity where small changes in
-    aggregate totals could flip the final explore category straight to ``-1``
-    after normalization, which made leaderboard movement noisier than intended.
+    The original rule applied that floor as a hard switch: any miner with
+    ``margin_agg < 0`` and ``s_ratio < 0`` was forced straight to the floor.
+    That was a genuine discontinuity -- a 0.002 swing in aggregate margin could
+    flip a miner from a mid-table score to ``-1`` after normalization.
+
+    Removing the rule outright fixed the discontinuity but also removed the only
+    aggregate-level check that a miner is at least as good as baseline overall,
+    which let a miner who is worse on both axes still finish with a positive
+    category score. This keeps the check and makes it continuous instead:
+    severity ramps smoothly from 0 at each baseline boundary, and the penalty is
+    the product of the two severities, so it vanishes whenever either axis is at
+    or better than baseline.
 
     The raw aggregate lives in [-2, 2]; the value returned here is normalized
     to [-1, 1] (a straight halving).
@@ -177,7 +196,27 @@ def compute_explore_miner_total_score(
         return None
 
     p_avg = sum(task_scores) / len(task_scores)
-    return _normalize_explore_score(p_avg)
+
+    if (
+        total_miner_weighted_tokens is None
+        or total_baseline_weighted_tokens is None
+        or total_baseline_weighted_tokens <= 0
+        or not task_margins
+    ):
+        return _normalize_explore_score(p_avg)
+
+    margin_agg = sum(task_margins) / len(task_margins)
+    s_ratio = 1.0 - (total_miner_weighted_tokens / total_baseline_weighted_tokens)
+
+    # Both severities are 0 at the baseline boundary and 1 at the far end of
+    # their span, so the product -- and therefore the penalty -- is continuous
+    # across margin_agg == 0 and s_ratio == 0.
+    quality_severity = _smoothstep_unit_interval(-margin_agg / EXPLORE_AGG_QUALITY_SPAN)
+    token_severity = _smoothstep_unit_interval(-s_ratio / EXPLORE_AGG_TOKEN_SPAN)
+    severity = quality_severity * token_severity
+
+    raw_score = p_avg + (severity * (floor - p_avg))
+    return _normalize_explore_score(raw_score)
 
 
 def _summarize_baseline_pass(baseline_runs: dict[int, dict[str, object]]) -> bool | None:

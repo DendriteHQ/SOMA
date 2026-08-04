@@ -348,7 +348,7 @@ def test_compute_explore_task_score_keeps_hard_quality_floor():
     assert abs(scoring.compute_explore_task_score(0.0, 0.2, 50.0, 100.0) + 2.0) < 1e-9
 
 
-def test_compute_explore_miner_total_score_uses_mean_unless_dual_worse_than_baseline():
+def test_compute_explore_miner_total_score_uses_mean_when_not_dual_worse():
     scoring = _load_scoring_module()
 
     # No extra token penalty when per-task scores are already computed and
@@ -366,17 +366,98 @@ def test_compute_explore_miner_total_score_uses_mean_unless_dual_worse_than_base
         < 1e-9
     )
 
-    # The aggregate still floors the miner if both quality and total tokens
-    # are worse than baseline.
+    # Worse on quality but not on tokens: token severity is 0, so the product
+    # is 0 and the mean passes through untouched.
     assert (
         abs(
             scoring.compute_explore_miner_total_score(
                 [0.5, -0.5],
                 [-0.3, -0.1],
-                total_miner_weighted_tokens=250.0,
+                total_miner_weighted_tokens=150.0,
                 total_baseline_weighted_tokens=200.0,
             )
-            + 1.0
+            - 0.0
+        )
+        < 1e-9
+    )
+
+
+def test_compute_explore_miner_total_score_dual_worse_penalty_is_continuous():
+    scoring = _load_scoring_module()
+
+    # The bug PR #215 was fixing: a hair's-breadth crossing of the baseline
+    # boundary must not move the category score appreciably.
+    just_above = scoring.compute_explore_miner_total_score(
+        [0.3, 0.4, 0.2],
+        [0.001, 0.001, 0.001],
+        total_miner_weighted_tokens=101.0,
+        total_baseline_weighted_tokens=100.0,
+    )
+    just_below = scoring.compute_explore_miner_total_score(
+        [0.3, 0.4, 0.2],
+        [-0.001, -0.001, -0.001],
+        total_miner_weighted_tokens=101.0,
+        total_baseline_weighted_tokens=100.0,
+    )
+
+    assert just_above is not None
+    assert just_below is not None
+    assert abs(just_above - just_below) < 1e-3
+
+    # Severity is monotone: sinking further into the dual-worse quadrant may
+    # only lower the score.
+    scores = [0.3, 0.4, 0.2]
+    previous = scoring.compute_explore_miner_total_score(
+        scores,
+        [0.0, 0.0, 0.0],
+        total_miner_weighted_tokens=100.0,
+        total_baseline_weighted_tokens=100.0,
+    )
+    for margin, tokens in ((-0.05, 110.0), (-0.10, 130.0), (-0.20, 150.0), (-0.40, 300.0)):
+        current = scoring.compute_explore_miner_total_score(
+            scores,
+            [margin, margin, margin],
+            total_miner_weighted_tokens=tokens,
+            total_baseline_weighted_tokens=100.0,
+        )
+        assert current is not None and previous is not None
+        assert current <= previous + 1e-12
+        previous = current
+
+    # Deep in the quadrant the miner still reaches the explore floor.
+    assert previous is not None
+    assert abs(previous + 1.0) < 1e-9
+
+
+def test_compute_explore_miner_total_score_rejects_dual_worse_positive_scores():
+    scoring = _load_scoring_module()
+
+    # A miner worse than baseline on both aggregate quality and aggregate
+    # tokens must not finish the category with a positive score, even when a
+    # few cheap tasks carry the per-task mean above zero.
+    result = scoring.compute_explore_miner_total_score(
+        [0.633, 0.633, 0.633, -1.766],
+        [-0.05, -0.05, -0.05, -0.10],
+        total_miner_weighted_tokens=1020.0,
+        total_baseline_weighted_tokens=400.0,
+    )
+
+    assert result is not None
+    assert result < 0.0
+
+
+def test_compute_explore_miner_total_score_falls_back_without_token_totals():
+    scoring = _load_scoring_module()
+
+    assert (
+        abs(
+            scoring.compute_explore_miner_total_score(
+                [0.5, -0.5],
+                [-0.3, -0.1],
+                total_miner_weighted_tokens=None,
+                total_baseline_weighted_tokens=None,
+            )
+            - 0.0
         )
         < 1e-9
     )
