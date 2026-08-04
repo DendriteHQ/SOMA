@@ -162,34 +162,22 @@ def compute_explore_miner_total_score(
 ) -> float | None:
     """Aggregate explore score across all of a miner's scored tasks.
 
-    Applies a hard penalty (floor) when both the miner's average quality and
-    total token usage are worse than baseline; otherwise uses the mean of the
-    per-task scores directly.
+    Uses the mean of the scored explore tasks directly.
 
-    The raw aggregate lives in [-2, 2]; the value returned here is
-    normalized to [-1, 1] (a straight halving).
+    Earlier versions forced the whole category to the explore floor whenever a
+    miner's aggregate quality and aggregate weighted-token usage were both worse
+    than baseline. That introduced a large discontinuity where small changes in
+    aggregate totals could flip the final explore category straight to ``-1``
+    after normalization, which made leaderboard movement noisier than intended.
+
+    The raw aggregate lives in [-2, 2]; the value returned here is normalized
+    to [-1, 1] (a straight halving).
     """
     if not task_scores:
         return None
 
     p_avg = sum(task_scores) / len(task_scores)
-
-    if (
-        total_miner_weighted_tokens is None
-        or total_baseline_weighted_tokens is None
-        or total_baseline_weighted_tokens <= 0
-    ):
-        raw_score = p_avg
-    else:
-        margin_agg = sum(task_margins) / len(task_margins) if task_margins else None
-        s_ratio = 1.0 - (total_miner_weighted_tokens / total_baseline_weighted_tokens)
-
-        if margin_agg is not None and margin_agg < 0 and s_ratio < 0:
-            raw_score = floor
-        else:
-            raw_score = p_avg
-
-    return _normalize_explore_score(raw_score)
+    return _normalize_explore_score(p_avg)
 
 
 def _summarize_baseline_pass(baseline_runs: dict[int, dict[str, object]]) -> bool | None:
