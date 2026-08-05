@@ -310,11 +310,11 @@ class Settings(BaseSettings):
     # thresholds differ, so verified and edit are never pooled together). A
     # script fails when (baseline_total - miner_total) / baseline_total < ratio.
     swebench_screening_stage1_token_saving_ratio_verified: float = Field(
-        default=0.10,
+        default=0.0,
         alias="SWEBENCH_SCREENING_STAGE1_TOKEN_SAVING_RATIO_VERIFIED",
     )
     swebench_screening_stage1_token_saving_ratio_edit: float = Field(
-        default=0.05,
+        default=0.0,
         alias="SWEBENCH_SCREENING_STAGE1_TOKEN_SAVING_RATIO_EDIT",
     )
 
