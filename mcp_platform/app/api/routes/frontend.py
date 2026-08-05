@@ -903,8 +903,16 @@ def _inject_benchmark_tasks_per_miner(
                         # matches build_swe_task_groups()'s own convention.
                         r["platform_score"] = None
 
-                    x, y, tok_b, tok_a = _task_inputs({"baseline_runs": baseline_runs, "runs": runs})
-                    task_platform_score = compute_swe_task_score(x, y, tok_b, tok_a)["score"]
+                    x, y, tok_b, tok_a, task_run_count = _task_inputs(
+                        {"baseline_runs": baseline_runs, "runs": runs}
+                    )
+                    task_platform_score = compute_swe_task_score(
+                        x,
+                        y,
+                        tok_b,
+                        tok_a,
+                        task_run_count=task_run_count,
+                    )["score"]
                     pass_without_compression = _summarize_baseline_pass(baseline_runs)
                     passed_with_compression_values = [
                         r["pass_with_compression"] for r in runs if r.get("pass_with_compression") is not None
