@@ -67,11 +67,11 @@ For each task:
 
 ### Compression ratio
 
-The compression-ratio term is the natural logarithm of the baseline-to-miner
+The compression-ratio term is the base-2 logarithm of the baseline-to-miner
 weighted-token ratio, clamped to `[-2, 2]`:
 
 ```math
-r = \max\left(-2,\min\left(\ln\left(\frac{T_B}{T_A}\right),2\right)\right)
+r = \max\left(-2,\min\left(\log_2\left(\frac{T_B}{T_A}\right),2\right)\right)
 ```
 
 If the token inputs are invalid:

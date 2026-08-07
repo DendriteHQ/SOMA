@@ -168,6 +168,20 @@ def test_compute_weighted_tokens_treats_cached_null_as_zero_only():
     )
 
 
+def test_trim_token_ratio_uses_base_2_logarithm():
+    scoring = _load_scoring_module()
+
+    assert abs(scoring.trim_token_ratio(100, 50) - 1.0) < 1e-9
+    assert abs(scoring.trim_token_ratio(100, 25) - 2.0) < 1e-9
+
+
+def test_swe_compression_ratio_uses_base_2_logarithm():
+    scoring = _load_scoring_module()
+
+    assert abs(scoring._compression_ratio(100.0, 50.0) - 1.0) < 1e-9
+    assert abs(scoring._compression_ratio(100.0, 25.0) - 2.0) < 1e-9
+
+
 def test_build_swe_miner_scores_applies_global_token_multiplier():
     scoring = _load_scoring_module()
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import floor, log, log2
+from math import floor, log2
 from typing import Any
 
 from soma_shared.contracts.api.v1.frontend import SweMinerTaskResultItem
@@ -198,7 +198,7 @@ def trim_token_ratio(tokens_without_compression: int | float | None, tokens_with
         return 0.0
 
     ratio = float(tokens_without_compression) / float(tokens_with_compression)
-    return max(-2.0, min(2.0, log(ratio)))
+    return max(-2.0, min(2.0, log2(ratio)))
 
 
 def base_swe_score(
@@ -338,7 +338,7 @@ def _compression_ratio(
     tokens_without_compression: float | None,
     tokens_with_compression: float | None,
 ) -> float:
-    """clamp(ln(tok_b / tok_a), -2, 2). Returns 0 if tokens are invalid/missing."""
+    """clamp(log2(tok_b / tok_a), -2, 2). Returns 0 if tokens are invalid/missing."""
     if (
         tokens_without_compression is None
         or tokens_with_compression is None
@@ -347,7 +347,7 @@ def _compression_ratio(
     ):
         return 0.0
     ratio = float(tokens_without_compression) / float(tokens_with_compression)
-    return max(SCORING_R_MIN, min(SCORING_R_MAX, log(ratio)))
+    return max(SCORING_R_MIN, min(SCORING_R_MAX, log2(ratio)))
 
 
 def _penalty_threshold(x: int) -> int:
