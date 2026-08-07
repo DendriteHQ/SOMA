@@ -2298,9 +2298,10 @@ async def _build_swe_status_overrides(
     *,
     comp_id: int,
     hotkeys: set[str],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, datetime]]:
+    """Returns (status_by_hotkey, last_submit_by_hotkey)."""
     if comp_id < 75 or not hotkeys:
-        return {}
+        return {}, {}
 
     page_miners_sq = (
         select(
@@ -2315,6 +2316,7 @@ async def _build_swe_status_overrides(
         select(
             Script.miner_fk.label("miner_fk"),
             Script.id.label("script_fk"),
+            MinerUpload.created_at.label("last_submit"),
             func.row_number()
             .over(
                 partition_by=Script.miner_fk,
@@ -2342,6 +2344,7 @@ async def _build_swe_status_overrides(
                 page_miners_sq.c.miner_fk,
                 page_miners_sq.c.is_banned,
                 latest_scripts_sq.c.script_fk,
+                latest_scripts_sq.c.last_submit,
                 active_key_exists.label("has_active_key"),
             )
             .select_from(page_miners_sq)
@@ -2356,6 +2359,7 @@ async def _build_swe_status_overrides(
     ).all()
 
     status_by_hotkey: dict[str, str] = {}
+    last_submit_by_hotkey: dict[str, datetime] = {}
     script_refs: dict[str, tuple[int, int]] = {}
     for row in miner_script_rows:
         ss58 = str(row.ss58)
@@ -2363,6 +2367,9 @@ async def _build_swe_status_overrides(
         miner_fk = int(row.miner_fk)
         has_active_key = bool(row.has_active_key)
         script_fk = int(row.script_fk) if row.script_fk is not None else None
+
+        if row.last_submit is not None:
+            last_submit_by_hotkey[ss58] = row.last_submit
         if is_banned:
             status_by_hotkey[ss58] = "failed review"
             continue
@@ -2373,7 +2380,7 @@ async def _build_swe_status_overrides(
             script_refs[ss58] = (miner_fk, script_fk)
 
     if not script_refs:
-        return status_by_hotkey
+        return status_by_hotkey, last_submit_by_hotkey
 
     task_rows = (
         await db.execute(
@@ -2387,7 +2394,7 @@ async def _build_swe_status_overrides(
         )
     ).all()
     if not task_rows:
-        return status_by_hotkey
+        return status_by_hotkey, last_submit_by_hotkey
 
     task_repeats: dict[int, int] = {}
     stage1_ids: list[int] = []
@@ -2537,7 +2544,7 @@ async def _build_swe_status_overrides(
             else:
                 status_by_hotkey[ss58] = "not qualified"
 
-    return status_by_hotkey
+    return status_by_hotkey, last_submit_by_hotkey
 
 
 async def _get_competition_aggregate_impl(
@@ -2607,7 +2614,7 @@ async def _get_competition_aggregate_impl(
         rows_snapshot=rows_snapshot,
     )
     hotkeys = set(miners_snapshot.ordered_hotkeys)
-    status_overrides = await _build_swe_status_overrides(
+    status_overrides, last_submit_by_hotkey = await _build_swe_status_overrides(
         db,
         comp_id=competition_id,
         hotkeys=hotkeys,
@@ -2832,6 +2839,7 @@ async def _get_competition_aggregate_impl(
                     screener_task_count=miner_snapshot.screener_task_count,
                 ),
                 status=miner_status,
+                last_submit=last_submit_by_hotkey.get(hotkey),
                 rank=rank_by_hotkey.get(hotkey),
                 penalties=SweMinerPenaltySummary(
                     categories=penalties_categories,
