@@ -122,8 +122,11 @@ s = r
 All other non-excluded hard tasks use:
 
 ```math
-s = \max\left(-2,\min\left(r+\frac{y-x}{5-x},3\right)\right)
+s = \max\left(-2,\min\left(r+\frac{y-x}{n-x},3\right)\right)
 ```
+
+Where `n` is the total run count for the task (typically the task's planned
+repeat count).
 
 Hard tasks are assigned to `pool=hard_boost`.
 
@@ -160,8 +163,11 @@ s = r
 If `y > x`:
 
 ```math
-s = \max\left(-2,\min\left(r+\frac{y-x}{5-x},3\right)\right)
+s = \max\left(-2,\min\left(r+\frac{y-x}{n-x},3\right)\right)
 ```
+
+Where `n` is the total run count for the task (typically the task's planned
+repeat count).
 
 Standard tasks are assigned to `pool=main`.
 

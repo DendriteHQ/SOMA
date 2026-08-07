@@ -360,19 +360,24 @@ def compute_swe_task_score(
     y: int,
     tokens_without_compression: float | None,
     tokens_with_compression: float | None,
+    *,
+    task_run_count: int,
 ) -> dict[str, object]:
     """Per-task score.
 
     Parameters
     ----------
     x : number of resolved baseline runs for this task (out of the baseline
-        repeat count, typically 5).
+        repeat count).
     y : number of resolved miner runs for this task (aggregate count, on the
         same scale as x).
     tokens_without_compression : average weighted baseline tokens across the
         RESOLVED baseline runs only (``None`` when x == 0).
     tokens_with_compression : average weighted miner tokens across runs with
         a valid token count.
+    task_run_count : total run count for this task, typically the planned
+        repeat count for the task. The bonus zone uses the remaining run
+        budget (``task_run_count - x``) instead of a fixed constant.
 
     Returns a dict with:
       score       — numeric per-task score, or ``None`` for no-contribution
@@ -386,6 +391,7 @@ def compute_swe_task_score(
     """
     r = _compression_ratio(tokens_without_compression, tokens_with_compression)
     threshold = _penalty_threshold(x)
+    task_run_count = max(int(task_run_count), x, y, 1)
 
     # ── Impossible / near-impossible baseline tasks (x <= 1) ─────────────
     if x <= 1:
@@ -403,7 +409,7 @@ def compute_swe_task_score(
             raw = r
             zone = "maintain"
         else:
-            denom = 5 - x
+            denom = task_run_count - x
             bonus = (y - x) / denom if denom > 0 else 0.0
             raw = max(SCORING_R_MIN, min(SCORING_BONUS_CAP, r + bonus))
             zone = "bonus"
@@ -429,7 +435,7 @@ def compute_swe_task_score(
         raw = r
         zone = "maintain"
     else:
-        denom = 5 - x
+        denom = task_run_count - x
         bonus = (y - x) / denom if denom > 0 else 0.0
         raw = max(SCORING_R_MIN, min(SCORING_BONUS_CAP, r + bonus))
         zone = "bonus"
@@ -446,7 +452,7 @@ def compute_swe_task_score(
 
 def _task_inputs(
     group: dict[str, object],
-) -> tuple[int, int, float | None, float | None]:
+) -> tuple[int, int, float | None, float | None, int]:
     """Derive the (x, y, tok_b, tok_a) inputs for compute_swe_task_score
     from a task group produced by build_swe_task_groups.
     """
@@ -483,7 +489,9 @@ def _task_inputs(
     ]
     tok_a = sum(miner_tokens) / len(miner_tokens) if miner_tokens else None
 
-    return x, y, tok_b, tok_a
+    task_run_count = max(len(baselines), len(runs), x, y, 1)
+
+    return x, y, tok_b, tok_a, task_run_count
 
 
 def build_swe_task_scores(
@@ -492,10 +500,17 @@ def build_swe_task_scores(
     """Compute per-task score for every task group of a miner."""
     task_scores: dict[int, dict[str, object]] = {}
     for task_id, group in task_groups.items():
-        x, y, tok_b, tok_a = _task_inputs(group)
-        result = compute_swe_task_score(x, y, tok_b, tok_a)
+        x, y, tok_b, tok_a, task_run_count = _task_inputs(group)
+        result = compute_swe_task_score(
+            x,
+            y,
+            tok_b,
+            tok_a,
+            task_run_count=task_run_count,
+        )
         result["x"] = x
         result["y"] = y
+        result["task_run_count"] = task_run_count
         result["tokens_without_compression"] = tok_b
         result["tokens_with_compression"] = tok_a
         task_scores[task_id] = result
@@ -602,8 +617,14 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
     if passed_with_compression_values else None
     )
 
-    x, y, tok_b, tok_a = _task_inputs(group)
-    task_score = compute_swe_task_score(x, y, tok_b, tok_a)["score"]
+    x, y, tok_b, tok_a, task_run_count = _task_inputs(group)
+    task_score = compute_swe_task_score(
+        x,
+        y,
+        tok_b,
+        tok_a,
+        task_run_count=task_run_count,
+    )["score"]
 
     return SweMinerTaskResultItem(
         task_id=int(group["task_id"]),

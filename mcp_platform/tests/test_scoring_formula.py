@@ -291,6 +291,65 @@ def test_build_swe_miner_category_scores_with_penalty_returns_scores_for_complet
     assert scores["miner-a"]["Medium"] is None
 
 
+def test_compute_swe_task_score_uses_dynamic_task_run_count_for_bonus_zone():
+    scoring = _load_scoring_module()
+
+    result = scoring.compute_swe_task_score(
+        10,
+        12,
+        100.0,
+        80.0,
+        task_run_count=20,
+    )
+
+    expected_ratio = scoring._compression_ratio(100.0, 80.0)
+    expected_bonus = (12 - 10) / (20 - 10)
+
+    assert result["zone"] == "bonus"
+    assert abs(result["score"] - (expected_ratio + expected_bonus)) < 1e-9
+
+
+def test_task_input_summary_exposes_dynamic_task_run_count():
+    scoring = _load_scoring_module()
+
+    group = {
+        "baseline_runs": {
+            1: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            2: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            3: {"resolved": False, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            4: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            5: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            6: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            7: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            8: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            9: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+            10: {"resolved": True, "input_tokens": 60, "cached_input_tokens": 30, "output_tokens": 10},
+        },
+        "runs": [
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+            {"pass_with_compression": True, "weighted_tokens_with_compression": 80.0},
+        ],
+    }
+
+    x, y, tok_b, tok_a, task_run_count = scoring._task_inputs(group)
+
+    assert x == 9
+    assert y == 12
+    assert task_run_count == 12
+    assert tok_b is not None
+    assert tok_a == 80.0
+
+
 def test_compute_explore_task_score_uses_quality_gate_for_rewards():
     scoring = _load_scoring_module()
 
