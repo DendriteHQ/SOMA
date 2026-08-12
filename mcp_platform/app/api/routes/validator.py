@@ -70,9 +70,9 @@ logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
 
 _EXPLORER_METRIC_KEYS = ("precision", "recall", "f1_score", "hit_file_rate", "noise_file_rate", "weighted_core_coverage")
-_VALIDATION_PREFETCH_BATCH_SIZE = 50
-_VALIDATION_PREFETCH_REFILL_THRESHOLD = 10
-_VALIDATION_PREFETCH_CACHE_TTL_SECONDS = 5.0
+_VALIDATION_PREFETCH_BATCH_SIZE = 400
+_VALIDATION_PREFETCH_REFILL_THRESHOLD = 100
+_VALIDATION_PREFETCH_CACHE_TTL_SECONDS = 30.0
 _VALIDATION_FETCH_MAX_ATTEMPTS = 50
 
 
@@ -299,6 +299,60 @@ def _validation_reclaim_condition(
     return or_(*reclaim_conditions)
 
 
+def _run_row_is_completed(run_row: SweBenchRun) -> bool:
+    status = getattr(run_row, "status", None)
+    if status is not None:
+        return str(status).lower() in {"completed", "failed"}
+
+    report_markers = (
+        getattr(run_row, "tokens_used", None),
+        getattr(run_row, "time_taken_seconds", None),
+        getattr(run_row, "agent_steps", None),
+        getattr(run_row, "last_error", None),
+    )
+    return any(marker is not None for marker in report_markers)
+
+
+def _validation_row_is_claimable(
+    validation_row: SweBenchRunValidation,
+    *,
+    now: datetime,
+    claim_ttl_seconds: int,
+) -> bool:
+    validator_fk = getattr(validation_row, "validator_fk", None)
+    if validator_fk is None:
+        return True
+
+    claim_expires_at = getattr(validation_row, "claim_expires_at", None)
+    if claim_expires_at is not None:
+        return claim_expires_at < now
+
+    claimed_at = getattr(validation_row, "claimed_at", None)
+    if claimed_at is None:
+        return True
+    return claimed_at < (now - timedelta(seconds=claim_ttl_seconds))
+
+
+async def _competition_validation_timeframe_is_active(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+    now: datetime,
+) -> bool:
+    stmt = (
+        select(CompetitionConfig.id)
+        .join(
+            CompetitionTimeframe,
+            CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
+        )
+        .where(CompetitionConfig.competition_fk == competition_id)
+        .where(CompetitionConfig.is_active.is_(True))
+        .where(CompetitionTimeframe.eval_ends_at >= now)
+        .limit(1)
+    )
+    return (await db.execute(stmt)).first() is not None
+
+
 def _build_validation_candidate_query(
     *,
     now: datetime,
@@ -341,20 +395,51 @@ async def _claim_validation_candidate(
     claim_ttl_seconds: int,
     completed_condition,
 ):
-    query = _build_validation_candidate_query(
-        now=now,
-        claim_ttl_seconds=claim_ttl_seconds,
-        completed_condition=completed_condition,
-        select_columns=(SweBenchRunValidation, SweBenchRun, SweBenchTask),
-        validation_id=validation_id,
-        limit=1,
-        lock_rows=True,
+    validation_query = (
+        select(SweBenchRunValidation)
+        .where(SweBenchRunValidation.id == validation_id)
+        .limit(1)
+        .with_for_update(skip_locked=True)
     )
-    candidate_row = (await db.execute(query)).first()
-    if candidate_row is None:
+    validation_row = (await db.execute(validation_query)).scalar_one_or_none()
+    if validation_row is None:
         await db.rollback()
         return None
-    return candidate_row
+
+    if validation_row.scored_at is not None or not _validation_row_is_claimable(
+        validation_row,
+        now=now,
+        claim_ttl_seconds=claim_ttl_seconds,
+    ):
+        await db.rollback()
+        return None
+
+    run_task_query = (
+        select(SweBenchRun, SweBenchTask)
+        .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
+        .where(SweBenchRun.id == validation_row.run_fk)
+        .limit(1)
+    )
+    run_task_row = (await db.execute(run_task_query)).first()
+    if run_task_row is None:
+        await db.rollback()
+        return None
+
+    run_row, task_row = run_task_row
+    if completed_condition is not None and not _run_row_is_completed(run_row):
+        await db.rollback()
+        return None
+
+    competition_active = await _competition_validation_timeframe_is_active(
+        db,
+        competition_id=int(task_row.competition_fk),
+        now=now,
+    )
+    if not competition_active:
+        await db.rollback()
+        return None
+
+    return validation_row, run_row, task_row
 
 
 def _miners_log(miners_list: list[MinerWeight]) -> list[dict[str, float | int]]:
