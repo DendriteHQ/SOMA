@@ -121,19 +121,10 @@ async def _persist_compact_bench_report(
         # after data resets / test cleanups on platform side.
         return True
 
-    logger.info(
+    logger.debug(
         "compact_bench_report_received",
         extra={
             "run_id": payload.run_id,
-            "client_host": _request_client_host(request),
-            "request_path": str(request.url.path),
-            "ok_status": payload.ok_status,
-            "patch_capture_status": payload.patch_capture_status,
-            "trajectory_upload_status": payload.trajectory_upload_status,
-            "compression_logs_upload_status": payload.compression_logs_upload_status,
-            "prior_trajectory_uuid": getattr(run, "trajectory_uuid", None),
-            "prior_compression_logs_uuid": getattr(run, "compression_logs_uuid", None),
-            "payload_metadata": payload.metadata if isinstance(payload.metadata, dict) else None,
         },
     )
 
@@ -281,24 +272,11 @@ async def _persist_compact_bench_report(
         )
 
     await db.commit()
-    logger.info(
+    logger.debug(
         "compact_bench_report_persisted",
         extra={
             "run_id": payload.run_id,
-            "client_host": _request_client_host(request),
-            "request_path": str(request.url.path),
-            "ok_status": payload.ok_status,
-            "patch_capture_status": payload.patch_capture_status,
-            "patch_saved": patch_saved,
-            "trajectory_uploaded": trajectory_uploaded,
-            "compression_logs_uploaded": compression_logs_uploaded,
-            "status": desired_status,
-            "tokens_used": resolved_total_tokens,
-            "input_tokens": input_tokens,
-            "cached_input_tokens": cached_input_tokens,
-            "output_tokens": output_tokens,
-            "has_error": bool(resolved_last_error),
-            "error_excerpt": (resolved_last_error or "")[:240],
+            "completed_successfully": desired_status == "completed",
         },
     )
     return True

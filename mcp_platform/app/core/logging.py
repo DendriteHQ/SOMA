@@ -139,6 +139,13 @@ _FILE_LOGGER_ROUTES = {
     "app.security": Path("security"),
 }
 
+_DEFAULT_MODULE_LOG_LEVELS = {
+    # httpx/httpcore emit one INFO line per request, which is far too noisy
+    # for the platform's steady-state sandbox dispatch traffic.
+    "httpx": "WARNING",
+    "httpcore": "WARNING",
+}
+
 
 class _DomainLoggerAdapter(logging.LoggerAdapter):
     def process(self, msg, kwargs):
@@ -624,13 +631,18 @@ def _remove_filter_type(filter_type: type[logging.Filter]) -> None:
 
 
 def _apply_module_log_levels(module_levels: Mapping[str, str] | None) -> None:
-    if not module_levels:
-        return
     normalized: dict[str, str] = {}
-    for key, value in module_levels.items():
-        if not key:
-            continue
+    for key, value in _DEFAULT_MODULE_LOG_LEVELS.items():
         normalized[str(key).strip()] = str(value).strip().upper()
+
+    if module_levels:
+        for key, value in module_levels.items():
+            if not key:
+                continue
+            normalized[str(key).strip()] = str(value).strip().upper()
+
+    if not normalized:
+        return
 
     for name, level in normalized.items():
         logging.getLogger(name).setLevel(level)

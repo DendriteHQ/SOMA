@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy import and_, func, literal, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,8 +52,14 @@ _LAST_WINDOW_LIMIT_LOG_AT: float | None = None
 _WINDOW_LIMIT_LOG_INTERVAL_SECONDS = 30.0
 _LAST_IDLE_DISPATCH_LOG_AT: float | None = None
 _DISPATCH_IDLE_LOG_INTERVAL_SECONDS = 30.0
-_DISPATCH_FETCH_LOOKAHEAD_MULTIPLIER = 2000
-_DISPATCH_FETCH_LIMIT_CAP = 20000
+_DISPATCH_FETCH_LOOKAHEAD_MULTIPLIER = 10000
+_DISPATCH_FETCH_LIMIT_CAP = 100000
+_DISPATCH_FETCH_GROUP_LIMIT = 40
+_DISPATCH_FETCH_ROWS_PER_GROUP_LIMIT = 40
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_COMP112_STAGE2_OVERRIDE_PATH = (
+    _REPO_ROOT / "tmp" / "competition_112_stage2_override" / "qualified_hotkeys.txt"
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,36 @@ class _ScriptRef:
     script_id: int
     miner_fk: int
     ss58: str | None = None
+
+
+def _load_stage2_advancer_override_hotkeys(competition_id: int) -> set[str] | None:
+    if competition_id != 112:
+        return None
+    try:
+        hotkeys = {
+            line.strip()
+            for line in _COMP112_STAGE2_OVERRIDE_PATH.read_text().splitlines()
+            if line.strip()
+        }
+    except FileNotFoundError:
+        logger.warning(
+            "swebench_stage2_override_missing",
+            extra={
+                "competition_id": competition_id,
+                "path": str(_COMP112_STAGE2_OVERRIDE_PATH),
+            },
+        )
+        return None
+    except Exception:
+        logger.exception(
+            "swebench_stage2_override_load_failed",
+            extra={
+                "competition_id": competition_id,
+                "path": str(_COMP112_STAGE2_OVERRIDE_PATH),
+            },
+        )
+        return None
+    return hotkeys or None
 
 
 def _non_baseline_eligibility_sql(
@@ -162,6 +199,9 @@ def start_swebench_orchestrator_task(app) -> None:
             "dispatch_strict_fifo": bool(settings.swebench_dispatch_strict_fifo),
             "dispatch_window_seconds": float(settings.swebench_dispatch_window_seconds),
             "dispatch_max_runs_per_window": int(settings.swebench_dispatch_max_runs_per_window),
+            "max_concurrent_dispatched_baseline_runs": int(
+                settings.swebench_max_concurrent_dispatched_baseline_runs
+            ),
             "max_concurrent_dispatched_per_miner": int(
                 settings.swebench_max_concurrent_dispatched_per_miner
             ),
@@ -233,7 +273,7 @@ async def _run_orchestration_tick(app) -> None:
                 now=now,
             )
             if recovered_runs > 0:
-                logger.info(
+                logger.debug(
                     "swebench_orchestrator_recovered_stale_dispatched_runs",
                     extra={
                         "recovered_runs": recovered_runs,
@@ -265,8 +305,11 @@ async def _run_orchestration_tick(app) -> None:
                 break
         if dispatched or failed:
             logger.info(
-                "swebench_orchestrator_dispatch_pass",
+                "swebench_orchestration_tick_summary",
                 extra={
+                    "active_competitions": len(active_competitions),
+                    "seeded_runs": seeded_runs,
+                    "recovered_runs": recovered_runs,
                     "dispatched": dispatched,
                     "deferred": deferred,
                     "failed": failed,
@@ -279,7 +322,7 @@ async def _run_orchestration_tick(app) -> None:
                 _LAST_IDLE_DISPATCH_LOG_AT is None
                 or (now_monotonic - _LAST_IDLE_DISPATCH_LOG_AT) >= _DISPATCH_IDLE_LOG_INTERVAL_SECONDS
             ):
-                logger.info(
+                logger.debug(
                     "swebench_orchestrator_dispatch_pass_idle",
                     extra={
                         "dispatched": dispatched,
@@ -307,7 +350,7 @@ def _maybe_log_seed_pass(*, active_competitions: int, seeded_runs: int, now: dat
     # Log immediately only when new runs were seeded.
     # Otherwise throttle to keep orchestrator logs readable.
     if seeded_runs > 0:
-        logger.info(
+        logger.debug(
             "swebench_orchestrator_seed_pass",
             extra={
                 "active_competitions": active_competitions,
@@ -324,7 +367,7 @@ def _maybe_log_seed_pass(*, active_competitions: int, seeded_runs: int, now: dat
         should_log_idle = elapsed_seconds >= _SEED_IDLE_LOG_INTERVAL_SECONDS
 
     if should_log_idle:
-        logger.info(
+        logger.debug(
             (
                 "swebench_orchestrator_seed_pass_idle"
                 if active_competitions == 0
@@ -784,6 +827,13 @@ async def _classify_stage2_scripts(
     )
     if stage1_passers and not cohort_complete:
         return False, []
+
+    override_hotkeys = _load_stage2_advancer_override_hotkeys(competition_id)
+    if override_hotkeys is not None:
+        advancers = [
+            script for script in stage1_passers if script.ss58 in override_hotkeys
+        ]
+        return True, advancers
 
     # Rank by the canonical SWE total score (quality + saving) computed from
     # stage-2 tasks only — the same formula as the final competition score,
@@ -1481,6 +1531,9 @@ async def _dispatch_due_runs(
     app.state.swebench_dispatch_window_started_at = dispatch_window_started_at
 
     max_dispatched_per_miner = max(0, int(settings.swebench_max_concurrent_dispatched_per_miner))
+    max_dispatched_baseline_runs = max(
+        0, int(settings.swebench_max_concurrent_dispatched_baseline_runs)
+    )
     eligibility_sql = _non_baseline_eligibility_sql(
         script_fk_expr="r.script_fk",
         miner_fk_expr="r.miner_fk",
@@ -1507,7 +1560,7 @@ async def _dispatch_due_runs(
         )
         banned_pending_count = int(banned_pending_result.rowcount or 0)
         if banned_pending_count > 0:
-            logger.info(
+            logger.debug(
                 "swebench_orchestrator_failed_banned_pending_runs",
                 extra={"failed_runs": banned_pending_count},
             )
@@ -1527,60 +1580,138 @@ async def _dispatch_due_runs(
             await db.execute(
                 text(
                     """
+                    WITH due_candidates AS MATERIALIZED (
+                        SELECT
+                            r.id AS run_id,
+                            r.diff_storage_uuid,
+                            r.trajectory_uuid,
+                            r.compression_logs_uuid,
+                            r.attempt_no,
+                            r.benchmark_type,
+                            r.miner_fk,
+                            r.script_fk,
+                            r.baseline_run,
+                            CASE
+                                WHEN r.baseline_run = TRUE THEN NULL
+                                ELSE (
+                                    SELECT MIN(mu.created_at)
+                                    FROM miner_uploads mu
+                                    WHERE mu.script_fk = r.script_fk
+                                      AND mu.competition_fk = t.competition_fk
+                                )
+                            END AS miner_upload_created_at,
+                            t.id AS task_id,
+                            t.competition_fk,
+                            t.instance_id,
+                            t.planned_repeats,
+                            t.is_screener,
+                            t.screener_stage,
+                            r.created_at,
+                            CASE t.screener_stage WHEN 1 THEN 0 WHEN 2 THEN 1 ELSE 2 END AS phase_priority,
+                            CASE WHEN r.baseline_run = TRUE THEN 0 ELSE 1 END AS baseline_priority,
+                            COALESCE(r.miner_fk, 0) AS dispatch_group_id
+                        FROM swe_bench_runs r
+                        JOIN swe_bench_tasks t ON t.id = r.task_fk
+                        WHERE r.status = 'pending'
+                          AND ({active_timeframe_sql})
+                          AND ({baseline_scored_sql})
+                          AND (
+                              r.baseline_run = TRUE
+                              OR ({eligibility_sql})
+                          )
+                        ORDER BY
+                            CASE t.screener_stage WHEN 1 THEN 0 WHEN 2 THEN 1 ELSE 2 END ASC,
+                            CASE WHEN r.baseline_run = TRUE THEN 0 ELSE 1 END ASC,
+                            miner_upload_created_at ASC NULLS LAST,
+                            r.created_at ASC,
+                            r.id ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT :limit
+                    ),
+                    ranked_candidates AS (
+                        SELECT
+                            dc.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY dc.dispatch_group_id
+                                ORDER BY
+                                    dc.phase_priority ASC,
+                                    dc.baseline_priority ASC,
+                                    dc.miner_upload_created_at ASC NULLS LAST,
+                                    dc.created_at ASC,
+                                    dc.run_id ASC
+                            ) AS group_row_num
+                        FROM due_candidates dc
+                    ),
+                    group_heads AS (
+                        SELECT DISTINCT ON (rc.dispatch_group_id)
+                            rc.dispatch_group_id,
+                            rc.phase_priority,
+                            rc.baseline_priority,
+                            rc.miner_upload_created_at,
+                            rc.created_at,
+                            rc.run_id
+                        FROM ranked_candidates rc
+                        ORDER BY
+                            rc.dispatch_group_id,
+                            rc.phase_priority ASC,
+                            rc.baseline_priority ASC,
+                            rc.miner_upload_created_at ASC NULLS LAST,
+                            rc.created_at ASC,
+                            rc.run_id ASC
+                    ),
+                    selected_groups AS (
+                        SELECT
+                            gh.dispatch_group_id,
+                            ROW_NUMBER() OVER (
+                                ORDER BY
+                                    gh.phase_priority ASC,
+                                    gh.baseline_priority ASC,
+                                    gh.miner_upload_created_at ASC NULLS LAST,
+                                    gh.created_at ASC,
+                                    gh.run_id ASC
+                            ) AS group_rank
+                        FROM group_heads gh
+                    )
                     SELECT
-                        r.id AS run_id,
-                        r.diff_storage_uuid,
-                        r.trajectory_uuid,
-                        r.compression_logs_uuid,
-                        r.attempt_no,
-                        r.benchmark_type,
-                        r.miner_fk,
-                        r.script_fk,
-                        r.baseline_run,
-                        CASE
-                            WHEN r.baseline_run = TRUE THEN NULL
-                            ELSE (
-                                SELECT MIN(mu.created_at)
-                                FROM miner_uploads mu
-                                WHERE mu.script_fk = r.script_fk
-                                  AND mu.competition_fk = t.competition_fk
-                            )
-                        END AS miner_upload_created_at,
-                        t.id AS task_id,
-                        t.competition_fk,
-                        t.instance_id,
-                        t.planned_repeats,
-                        t.is_screener,
-                        t.screener_stage
-                    FROM swe_bench_runs r
-                    JOIN swe_bench_tasks t ON t.id = r.task_fk
-                    WHERE r.status = 'pending'
-                      AND ({active_timeframe_sql})
-                      AND ({baseline_scored_sql})
-                      AND (
-                          r.baseline_run = TRUE
-                          OR ({eligibility_sql})
-                      )
+                        rc.run_id,
+                        rc.diff_storage_uuid,
+                        rc.trajectory_uuid,
+                        rc.compression_logs_uuid,
+                        rc.attempt_no,
+                        rc.benchmark_type,
+                        rc.miner_fk,
+                        rc.script_fk,
+                        rc.baseline_run,
+                        rc.miner_upload_created_at,
+                        rc.task_id,
+                        rc.competition_fk,
+                        rc.instance_id,
+                        rc.planned_repeats,
+                        rc.is_screener,
+                        rc.screener_stage
+                    FROM ranked_candidates rc
+                    JOIN selected_groups sg
+                      ON sg.dispatch_group_id = rc.dispatch_group_id
+                    WHERE rc.group_row_num <= :group_row_limit
+                      AND sg.group_rank <= :group_limit
                     ORDER BY
-                        -- Two-stage phase priority: stage-1 drains before stage-2,
-                        -- stage-2 before full evaluation. Late uploads keep stage-1
-                        -- priority even after the upload window closes.
-                        CASE t.screener_stage WHEN 1 THEN 0 WHEN 2 THEN 1 ELSE 2 END ASC,
-                        -- Within a phase, baseline runs go first (their scoring
-                        -- gates the phase's miner-run evaluation).
-                        CASE WHEN r.baseline_run = TRUE THEN 0 ELSE 1 END ASC,
-                        miner_upload_created_at ASC NULLS LAST,
-                        r.created_at ASC,
-                        r.id ASC
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT :limit
+                        rc.phase_priority ASC,
+                        rc.baseline_priority ASC,
+                        rc.miner_upload_created_at ASC NULLS LAST,
+                        rc.created_at ASC,
+                        rc.run_id ASC
                     """.format(
                         eligibility_sql=eligibility_sql,
                         active_timeframe_sql=active_timeframe_sql,
                         baseline_scored_sql=baseline_scored_sql,
                     )
                 ),
-                {"limit": fetch_limit, "now": now},
+                {
+                    "limit": fetch_limit,
+                    "now": now,
+                    "group_row_limit": _DISPATCH_FETCH_ROWS_PER_GROUP_LIMIT,
+                    "group_limit": _DISPATCH_FETCH_GROUP_LIMIT,
+                },
             )
         ).mappings().all()
 
@@ -1597,7 +1728,7 @@ async def _dispatch_due_runs(
                 or (now_monotonic - _LAST_CAPACITY_LOG_AT) >= _CAPACITY_LOG_INTERVAL_SECONDS
             ):
                 _LAST_CAPACITY_LOG_AT = now_monotonic
-                logger.info(
+                logger.debug(
                     "swebench_orchestrator_capacity_cooldown_active",
                     extra={
                         "cooldown_seconds_left": round(global_not_before - now_monotonic, 2),
@@ -1623,7 +1754,7 @@ async def _dispatch_due_runs(
                     0.0,
                     dispatch_window_seconds - (now_monotonic - dispatch_window_started_at),
                 )
-                logger.info(
+                logger.debug(
                     "swebench_orchestrator_dispatch_window_limit_active",
                     extra={
                         "seconds_left": round(seconds_left, 2),
@@ -1655,8 +1786,27 @@ async def _dispatch_due_runs(
                 for miner_fk, dispatched_count in miner_rows
             }
 
+        active_dispatched_baseline_runs = 0
+        if max_dispatched_baseline_runs > 0:
+            active_dispatched_baseline_runs = int(
+                (
+                    await db.execute(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM swe_bench_runs
+                            WHERE status = 'dispatched'
+                              AND baseline_run = TRUE
+                            """
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
+
         dispatch_rows: list[dict] = []
         deferred_by_cooldown = 0
+        deferred_by_baseline_limit = 0
         deferred_by_miner_limit = 0
         for row in due_rows:
             run_id = int(row["run_id"])
@@ -1668,6 +1818,12 @@ async def _dispatch_due_runs(
                     break
                 continue
 
+            if bool(row["baseline_run"]) and max_dispatched_baseline_runs > 0:
+                if active_dispatched_baseline_runs >= max_dispatched_baseline_runs:
+                    deferred_by_baseline_limit += 1
+                    # Let miner runs continue to flow once the global baseline cap is full.
+                    continue
+
             miner_fk = row.get("miner_fk")
             if max_dispatched_per_miner > 0 and miner_fk is not None:
                 active_for_miner = int(active_dispatched_by_miner.get(int(miner_fk), 0))
@@ -1677,6 +1833,8 @@ async def _dispatch_due_runs(
                     continue
 
             dispatch_rows.append(row)
+            if bool(row["baseline_run"]) and max_dispatched_baseline_runs > 0:
+                active_dispatched_baseline_runs += 1
             if max_dispatched_per_miner > 0 and miner_fk is not None:
                 active_dispatched_by_miner[int(miner_fk)] = active_for_miner + 1
             if (
@@ -1690,7 +1848,11 @@ async def _dispatch_due_runs(
                 break
 
         if not dispatch_rows:
-            deferred += deferred_by_cooldown + deferred_by_miner_limit
+            deferred += (
+                deferred_by_cooldown
+                + deferred_by_baseline_limit
+                + deferred_by_miner_limit
+            )
             await db.rollback()
             break
 

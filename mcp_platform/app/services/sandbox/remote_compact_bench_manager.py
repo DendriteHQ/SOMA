@@ -207,7 +207,7 @@ class RemoteCompactBenchManager:
         candidate_urls = self._pick_sandbox_urls()
         run_id = int(payload.run_id)
         metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
-        logger.info(
+        logger.debug(
             "compact_bench_dispatch_candidates",
             extra={
                 "run_id": run_id,
@@ -223,7 +223,7 @@ class RemoteCompactBenchManager:
 
         for index, sandbox_url in enumerate(candidate_urls):
             try:
-                logger.info(
+                logger.debug(
                     "compact_bench_dispatch_attempt",
                     extra={
                         "run_id": run_id,
@@ -240,7 +240,7 @@ class RemoteCompactBenchManager:
                     timeout=timeout,
                 )
                 response.raise_for_status()
-                logger.info(
+                logger.debug(
                     "compact_bench_dispatch_accepted",
                     extra={
                         "run_id": run_id,
@@ -256,7 +256,8 @@ class RemoteCompactBenchManager:
                 last_exc = exc
                 error, retryable = self._format_dispatch_error(exc)
                 has_fallback = index < len(candidate_urls) - 1
-                logger.warning(
+                log_fn = logger.debug if retryable else logger.warning
+                log_fn(
                     "compact_bench_dispatch_attempt_failed",
                     extra={
                         "run_id": run_id,
