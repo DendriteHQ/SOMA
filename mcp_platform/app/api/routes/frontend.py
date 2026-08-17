@@ -66,6 +66,7 @@ from app.services.swebench_orchestrator import (
     _load_latest_scripts_for_competition,
 )
 from app.services.incentive_calculator import (
+    final_score_includes_screener_stage,
     load_stage1_miner_total_scores,
     load_stage2_miner_total_scores,
 )
@@ -1724,25 +1725,24 @@ async def _compute_explore_scores_by_hotkey(
     averaged) baseline, and the miner/baseline weighted-token totals only
     cover tasks the miner has runs on.
 
-    Covers eval + stage-2 explore tasks (screener + non-screener fetches
-    merged, then stage-1 dropped) — the same scope as verified/edit's
-    category score (their task groups with stage-1 groups excluded via
-    _exclude_stage1_groups) and as the backend's own competition score
-    (incentive_calculator.load_competition_incentive_inputs, which filters
-    screener_stage.is_distinct_from(1)). A task is either is_screener True
-    or False, never both, so the two fetches below never collide on
-    task_id.
+    Covers exactly the stages that contribute to the final competition score.
+    Most competitions include eval + stage-2 and exclude stage 1; competition
+    112 is a one-off eval-only hotfix. A task is either is_screener True or
+    False, never both, so the two fetches below never collide on task_id.
     """
-    stage1_task_ids = {
+    excluded_task_ids = {
         int(row.id)
         for row in (
             await db.execute(
-                select(SweBenchTask.id)
-                .where(SweBenchTask.competition_fk == comp_id)
-                .where(SweBenchTask.is_screener.is_(True))
-                .where(SweBenchTask.screener_stage == 1)
+                select(SweBenchTask.id, SweBenchTask.screener_stage).where(
+                    SweBenchTask.competition_fk == comp_id
+                )
             )
         ).all()
+        if not final_score_includes_screener_stage(
+            comp_id,
+            _to_optional_int(row.screener_stage),
+        )
     }
 
     baseline_by_task: dict[int, dict] = {}
@@ -1760,9 +1760,9 @@ async def _compute_explore_scores_by_hotkey(
     baseline_by_task = {
         task_id: data
         for task_id, data in baseline_by_task.items()
-        if task_id not in stage1_task_ids
+        if task_id not in excluded_task_ids
     }
-    rows = [row for row in rows if int(row.task_id) not in stage1_task_ids]
+    rows = [row for row in rows if int(row.task_id) not in excluded_task_ids]
 
     quality_by_hotkey: dict[str, dict[int, list[float]]] = {}
     weighted_by_hotkey: dict[str, dict[int, list[float]]] = {}
@@ -1922,21 +1922,19 @@ async def _fetch_stage_explore_weighted_token_totals(
     return (baseline_total if has_baseline else None), miner_total_by_hotkey
 
 
-def _exclude_stage1_groups(
+def _filter_groups_for_final_score(
     task_groups: dict[int, dict[str, object]],
+    *,
+    competition_id: int,
 ) -> dict[int, dict[str, object]]:
-    """Drop stage-1 (liveness) task groups, keeping eval (screener_stage is
-    None) and stage-2 (qualification) ones — mirrors the backend's own
-    scope for the competition score (see
-    ``incentive_calculator.load_competition_incentive_inputs``, which
-    filters ``screener_stage.is_distinct_from(1)``), so the frontend's
-    displayed overall score is computed over the same tasks the backend
-    actually rewards on, not stage-1's liveness check.
-    """
+    """Keep only task groups that contribute to the competition final score."""
     return {
         task_id: group
         for task_id, group in task_groups.items()
-        if group.get("screener_stage") != 1
+        if final_score_includes_screener_stage(
+            competition_id,
+            _to_optional_int(group.get("screener_stage")),
+        )
     }
 
 
@@ -2087,9 +2085,13 @@ async def _build_swe_miners_snapshot(
     miners_by_hotkey: dict[str, SweMinerSnapshotItem] = {}
     for hotkey in all_hotkeys:
         task_groups = verified_task_groups_by_hotkey.get(hotkey, {})
-        verified_score, _ = build_swe_miner_total_score(_exclude_stage1_groups(task_groups))
+        verified_score, _ = build_swe_miner_total_score(
+            _filter_groups_for_final_score(task_groups, competition_id=comp_id)
+        )
         edit_groups = edit_task_groups_by_hotkey.get(hotkey, {})
-        edit_score, _ = build_swe_miner_total_score(_exclude_stage1_groups(edit_groups))
+        edit_score, _ = build_swe_miner_total_score(
+            _filter_groups_for_final_score(edit_groups, competition_id=comp_id)
+        )
         explore_score = explore_scores_by_hotkey.get(hotkey)
 
         category_scores = _clean_swe_category_scores(

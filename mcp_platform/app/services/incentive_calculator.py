@@ -41,6 +41,8 @@ BENCHMARK_WEIGHTS: dict[BenchmarkType, float] = {
     "swe_explorer_edit": 0.25,
 }
 
+_COMPETITION_FINAL_SCORE_EVAL_ONLY_IDS: frozenset[int] = frozenset({112})
+
 # Static layer weights over benchmark-type subsets:
 # L0 (triple) -> 0.25, L1 (pairs) -> 0.45, L2 (singles) -> 0.30.
 LAYER_WEIGHTS_BY_SUBSET_SIZE: dict[int, float] = {3: 0.25, 2: 0.45, 1: 0.30}
@@ -145,6 +147,28 @@ def _subset_weighted_score(
     if weight_total <= 0.0:
         return None
     return weighted_sum / weight_total
+
+
+def final_score_includes_screener_stage(
+    competition_id: int,
+    screener_stage: int | None,
+) -> bool:
+    """Return whether a task stage contributes to the competition final score.
+
+    Most competitions include stage 2 and eval tasks in the final score while
+    excluding stage 1. Competition 112 is a one-off hotfix that uses eval
+    tasks only.
+    """
+    if competition_id in _COMPETITION_FINAL_SCORE_EVAL_ONLY_IDS:
+        return screener_stage is None
+    return screener_stage != 1
+
+
+def competition_final_score_task_stage_filter(competition_id: int):
+    """SQLAlchemy task-stage filter matching final_score_includes_screener_stage."""
+    if competition_id in _COMPETITION_FINAL_SCORE_EVAL_ONLY_IDS:
+        return SweBenchTask.screener_stage.is_(None)
+    return SweBenchTask.screener_stage.is_distinct_from(1)
 
 
 def calculate_incentive_weights(
@@ -638,13 +662,12 @@ async def load_competition_incentive_inputs(
     *,
     competition_id: int,
 ) -> tuple[tuple[BenchmarkType, ...], dict[str, dict[BenchmarkType, float]]]:
-    # Full score = eval tasks (screener_stage IS NULL) + stage-2 qualification
-    # tasks (screener_stage = 2). IS DISTINCT FROM keeps NULL and 2, drops
-    # stage-1 (liveness) tasks.
+    # Most competitions score eval (NULL) + stage-2 tasks, excluding stage 1.
+    # Competition 112 is a hotfix exception: final scoring is eval-only.
     miner_benchmark_scores = await _load_benchmark_scores(
         db,
         competition_id=competition_id,
-        task_stage_filter=SweBenchTask.screener_stage.is_distinct_from(1),
+        task_stage_filter=competition_final_score_task_stage_filter(competition_id),
     )
 
     return BENCHMARK_TYPES, miner_benchmark_scores
