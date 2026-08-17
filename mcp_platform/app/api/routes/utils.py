@@ -206,6 +206,4 @@ async def _get_validator(
             ),
         )
 
-    # Update last_seen_at
-    validator.last_seen_at = datetime.now(timezone.utc)
     return validator

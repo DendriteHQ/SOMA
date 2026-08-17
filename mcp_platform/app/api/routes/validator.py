@@ -50,6 +50,7 @@ from app.api.routes.utils import (
 )
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.db.session import get_db_read_session
 from app.db.interfaces.burn_weight_queries import get_active_top_miner_rows
 from app.db.interfaces.competition_queries import (
     get_active_competition_upload_starts_at,
@@ -1024,7 +1025,6 @@ async def register(
             ip=payload.serving_ip,
             port=payload.serving_port,
             created_at=now,
-            last_seen_at=now,
             current_status="working",
             is_archive=False,
         )
@@ -1033,7 +1033,6 @@ async def register(
     else:
         validator.ip = payload.serving_ip
         validator.port = payload.serving_port
-        validator.last_seen_at = now
         validator.current_status = "working"
         await db.flush()
 
@@ -1302,7 +1301,7 @@ async def submit_swebench_validation_score(
             .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
             .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
             .where(SweBenchRunValidation.id == payload.validation_id)
-            .with_for_update()
+            .with_for_update(of=SweBenchRunValidation)
             .limit(1)
         )
     ).first()
@@ -1443,26 +1442,28 @@ async def get_best_miners(
         else:
             hotkey_to_uid = {str(hk): int(uid) for hk, uid in zip(hotkeys, uids)}
             try:
-                current_competition_id = await _get_active_competition_id(db)
-                if current_competition_id is None:
-                    response_payload = _fallback_best_miners_payload(
-                        request_id,
-                        "no_active_competition_timeframe",
-                    )
-                else:
-                    response_payload = await _build_best_miners_payload(
-                        db,
-                        request_id=request_id,
-                        now=now,
-                        active_competition_id=int(current_competition_id),
-                        hotkey_to_uid=hotkey_to_uid,
-                    )
-                    if not _is_burn_only_payload(response_payload):
-                        _write_best_miners_cache(
-                            response_payload,
+                async for read_db in get_db_read_session():
+                    current_competition_id = await _get_active_competition_id(read_db)
+                    if current_competition_id is None:
+                        response_payload = _fallback_best_miners_payload(
+                            request_id,
+                            "no_active_competition_timeframe",
+                        )
+                    else:
+                        response_payload = await _build_best_miners_payload(
+                            read_db,
                             request_id=request_id,
                             now=now,
+                            active_competition_id=int(current_competition_id),
+                            hotkey_to_uid=hotkey_to_uid,
                         )
+                    break
+                if not _is_burn_only_payload(response_payload):
+                    _write_best_miners_cache(
+                        response_payload,
+                        request_id=request_id,
+                        now=now,
+                    )
             except Exception as exc:
                 try:
                     await db.rollback()
