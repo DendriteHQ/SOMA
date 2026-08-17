@@ -233,6 +233,10 @@ class Settings(BaseSettings):
         default=30,
         alias="SWEBENCH_MAX_CONCURRENT_DISPATCHED_PER_MINER",
     )
+    swebench_max_concurrent_dispatched_baseline_runs: int = Field(
+        default=30,
+        alias="SWEBENCH_MAX_CONCURRENT_DISPATCHED_BASELINE_RUNS",
+    )
     swebench_dispatched_ttl_seconds: int = Field(
         default=2400,
         alias="SWEBENCH_DISPATCHED_TTL_SECONDS",
@@ -317,6 +321,17 @@ class Settings(BaseSettings):
         default=0.0,
         alias="SWEBENCH_SCREENING_STAGE1_TOKEN_SAVING_RATIO_EDIT",
     )
+
+    @field_validator("debug", "debug_clear_db", mode="before")
+    @classmethod
+    def _parse_debug_like_bool(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw in {"release", "prod", "production"}:
+                return False
+            if raw in {"debug", "dev", "development"}:
+                return True
+        return value
 
     @field_validator("log_levels", mode="before")
     @classmethod
@@ -540,6 +555,17 @@ class Settings(BaseSettings):
             raise ValueError("SWEBENCH_MAX_CONCURRENT_DISPATCHED_PER_MINER must be an integer") from exc
         return max(0, numeric)
 
+    @field_validator("swebench_max_concurrent_dispatched_baseline_runs", mode="before")
+    @classmethod
+    def _parse_swebench_max_concurrent_dispatched_baseline_runs(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 30
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_MAX_CONCURRENT_DISPATCHED_BASELINE_RUNS must be an integer") from exc
+        return max(0, numeric)
+
     @field_validator("swebench_screening_pass_ratio", mode="before")
     @classmethod
     def _parse_swebench_screening_pass_ratio(cls, value: Any) -> float:
@@ -706,15 +732,7 @@ class Settings(BaseSettings):
             return self.rds_writer_host
         return secret.get("host") or secret.get("hostname")
 
-    def get_postgres_dsn(self) -> str | None:
-        if self.postgres_dsn:
-            return self.postgres_dsn
-        if not self.rds_secret_id:
-            return None
-        secret = self._read_rds_secret()
-        host = self._resolve_rds_host(secret)
-        if not host:
-            raise RuntimeError("RDS secret is missing host information")
+    def _build_postgres_dsn_for_host(self, secret: dict[str, Any], host: str) -> str:
         user = secret.get("username")
         password = secret.get("password")
         if not user or not password:
@@ -735,6 +753,39 @@ class Settings(BaseSettings):
             f"{scheme}://{quote(str(user))}:{quote(str(password))}"
             f"@{host}:{port}/{quote(str(db_name))}"
         )
+
+    def get_postgres_dsn(self) -> str | None:
+        if self.postgres_dsn:
+            return self.postgres_dsn
+        if not self.rds_secret_id:
+            return None
+        secret = self._read_rds_secret()
+        host = self._resolve_rds_host(secret)
+        if not host:
+            raise RuntimeError("RDS secret is missing host information")
+        return self._build_postgres_dsn_for_host(secret, host)
+
+    def get_postgres_writer_dsn(self) -> str | None:
+        if self.postgres_dsn:
+            return self.postgres_dsn
+        if not self.rds_secret_id:
+            return None
+        secret = self._read_rds_secret()
+        host = self.rds_writer_host or secret.get("host") or secret.get("hostname")
+        if not host:
+            raise RuntimeError("RDS writer host is missing")
+        return self._build_postgres_dsn_for_host(secret, str(host))
+
+    def get_postgres_reader_dsn(self) -> str | None:
+        if self.postgres_dsn:
+            return self.postgres_dsn
+        if not self.rds_secret_id:
+            return None
+        secret = self._read_rds_secret()
+        host = self.rds_reader_host
+        if not host:
+            return None
+        return self._build_postgres_dsn_for_host(secret, host)
 
 
 settings = Settings()

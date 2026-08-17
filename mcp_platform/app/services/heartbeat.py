@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from pydantic import ValidationError
 
 from app.core.config import settings
+from app.db.session import get_db_read_session
 from app.db.interfaces.competition_queries import get_active_competition_id_direct
 from soma_shared.contracts.common.signatures import SignedEnvelope
 from soma_shared.contracts.validator.v1.messages import (
@@ -21,9 +22,9 @@ from soma_shared.contracts.validator.v1.messages import (
     HeartbeatResponse,
 )
 from soma_shared.db.session import (
-    get_db_session,
     begin_db_request_metrics_scope,
     end_db_request_metrics_scope,
+    get_db_session,
 )
 from app.db.validator_heartbeat_log import log_validator_heartbeat
 from soma_shared.utils.signer import (
@@ -36,8 +37,9 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_HEARTBEAT_INTERVAL_SECS = 60
+DEFAULT_HEARTBEAT_INTERVAL_SECS = 600
 DEFAULT_HEARTBEAT_TIMEOUT_SECS = 20
+DEFAULT_HEARTBEAT_LOG_TIMEOUT_SECS = 60
 
 
 def start_heartbeat_thread(
@@ -147,7 +149,7 @@ def _send_heartbeat_and_log(
         loop,
     )
     try:
-        future.result(timeout=20)
+        future.result(timeout=DEFAULT_HEARTBEAT_LOG_TIMEOUT_SECS)
     except Exception:
         logger.exception(
             "heartbeat_log_failed",
@@ -262,7 +264,7 @@ def _get_active_competition_id(loop: asyncio.AbstractEventLoop) -> int | None:
     async def _fetch() -> int | None:
         metrics_token = begin_db_request_metrics_scope()
         try:
-            async for session in get_db_session():
+            async for session in get_db_read_session():
                 return await get_active_competition_id_direct(
                     session,
                     now=datetime.now(timezone.utc),

@@ -6,10 +6,11 @@ import json
 import sqlalchemy as sa
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from aiocache import Cache
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Path as FastAPIPath, Query, Request, Response, status
 from sqlalchemy import func, select, and_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,9 +44,9 @@ from soma_shared.db.models.swe_bench_verified_validation import SweBenchVerified
 from soma_shared.db.models.swe_explorer_edit_validation import SweExplorerEditValidation
 from soma_shared.db.models.swe_explorer_validation import SweExplorerValidation
 from soma_shared.db.models.validator import Validator
-from soma_shared.db.session import get_db_session
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.db.session import get_db_read_session
 from app.api.routes.scoring import (
     build_swe_miner_total_score,
     build_swe_task_groups,
@@ -159,6 +160,7 @@ class SweRowsSnapshot:
     comp_id: int
     rows: list[sa.Row]
     rows_by_hotkey: dict[str, list[sa.Row]]
+    task_groups_by_hotkey: dict[str, dict[int, dict[str, object]]]
 
 
 @dataclass(slots=True)
@@ -170,7 +172,7 @@ class SweCompetitionMinerMeta:
     rank: int | None
 
 
-SWE_ROWS_SNAPSHOT_CACHE_VERSION = "v1"
+SWE_ROWS_SNAPSHOT_CACHE_VERSION = "v3"
 SWE_MINERS_SNAPSHOT_CACHE_VERSION = "v2"
 SWE_ROWS_SNAPSHOT_TTL_SECONDS = 300
 SWE_MINERS_SNAPSHOT_TTL_SECONDS = 300
@@ -179,6 +181,33 @@ AGGREGATE_SNAPSHOT_VERSION = settings.frontend_aggregate_snapshot_version
 AGGREGATE_SNAPSHOT_LOCAL_DIR = settings.frontend_aggregate_snapshot_dir
 AGGREGATE_SNAPSHOT_S3_PREFIX = settings.frontend_aggregate_snapshot_s3_prefix
 _aggregate_snapshot_build_lock = asyncio.Lock()
+LATEST_COMPETITION_AGGREGATE_REFRESH_SECONDS = 600.0
+
+
+@dataclass(slots=True)
+class LatestCompetitionAggregateCache:
+    competition_id: int | None = None
+    payload: Any | None = None
+    payload_bytes: bytes | None = None
+    gzip_payload_bytes: bytes | None = None
+    refreshed_at: datetime | None = None
+    refresh_started_at: datetime | None = None
+    is_refreshing: bool = False
+    last_error: str | None = None
+
+
+class _FrontendRequestProxy:
+    def __init__(self, app) -> None:
+        self.app = app
+        self.state = app.state
+
+
+def _get_latest_competition_aggregate_cache(app) -> LatestCompetitionAggregateCache:
+    cache = getattr(app.state, "latest_competition_aggregate_cache", None)
+    if cache is None:
+        cache = LatestCompetitionAggregateCache()
+        app.state.latest_competition_aggregate_cache = cache
+    return cache
 
 
 def _json_payload_bytes(payload: Any) -> bytes:
@@ -1017,8 +1046,8 @@ def _recompute_miner_token_totals_across_benchmarks(payload: dict[str, Any]) -> 
     _inject_benchmark_tasks_per_miner() has appended the explore/edit tasks.
 
     `_get_competition_aggregate_impl` sets the `*_total` fields from
-    `task_groups`, which only ever holds `swebench_verified` rows (see
-    `_fetch_swe_rows_live`'s benchmark_type filter) — explore/edit tasks are
+    `task_groups`, which only ever holds `swebench_verified` rows from the
+    verified-only snapshot builder — explore/edit tasks are
     appended to `tasks[]` afterward, by this module-level call, so the totals
     silently missed them. Summing over the fully-populated `tasks[]` here
     (each entry across all three benchmark types shares the same field
@@ -1273,6 +1302,114 @@ async def _get_competition_aggregate_payload(
         return payload
 
 
+async def _build_latest_competition_aggregate_payload(
+    app,
+    db: AsyncSession,
+    competition_id: int,
+) -> Any:
+    request_proxy = _FrontendRequestProxy(app)
+    response_model, miners_snapshot, verified_pass_counts = await _get_competition_aggregate_impl(
+        request=request_proxy,
+        db=db,
+        competition_id=competition_id,
+    )
+    payload = response_model.model_dump(mode="json")
+    stage_cohort = await _classify_swe_stage_cohort(db, comp_id=competition_id)
+    _inject_screener_summary_per_miner(payload, miners_snapshot, stage_cohort)
+    _inject_verified_task_pass_counts(payload, verified_pass_counts)
+    benchmark_data = await _fetch_benchmark_non_screener_data(db, comp_id=competition_id)
+    _inject_benchmark_tasks_per_miner(payload, benchmark_data)
+    screener_benchmark_data = await _fetch_benchmark_non_screener_data(
+        db, comp_id=competition_id, is_screener=True
+    )
+    _inject_benchmark_tasks_per_miner(payload, screener_benchmark_data, is_screener=True)
+    _recompute_miner_token_totals_across_benchmarks(payload)
+    screener_stage_by_task_id = await _fetch_swe_task_screener_stage(db, comp_id=competition_id)
+    _inject_task_screener_stage(payload, screener_stage_by_task_id)
+    return payload
+
+
+async def _refresh_latest_competition_aggregate_once(app) -> None:
+    cache = _get_latest_competition_aggregate_cache(app)
+    cache.is_refreshing = True
+    cache.refresh_started_at = datetime.now(timezone.utc)
+    try:
+        async for db in get_db_read_session():
+            latest_competition_id = await _get_latest_competition_id(db)
+            cache.competition_id = latest_competition_id
+            if latest_competition_id is None:
+                cache.last_error = "No competitions exist yet"
+                return
+
+            payload = await _build_latest_competition_aggregate_payload(
+                app,
+                db,
+                latest_competition_id,
+            )
+            payload_bytes = _json_payload_bytes(payload)
+            gzip_payload_bytes = gzip.compress(payload_bytes)
+
+            cache.competition_id = int(latest_competition_id)
+            cache.payload = payload
+            cache.payload_bytes = payload_bytes
+            cache.gzip_payload_bytes = gzip_payload_bytes
+            cache.refreshed_at = datetime.now(timezone.utc)
+            cache.last_error = None
+            logger.info(
+                "latest_competition_aggregate_refresh_complete",
+                extra={
+                    "competition_id": int(latest_competition_id),
+                    "payload_bytes": len(payload_bytes),
+                    "gzip_payload_bytes": len(gzip_payload_bytes),
+                },
+            )
+            return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        cache.last_error = f"{type(exc).__name__}: {exc}"
+        logger.exception(
+            "latest_competition_aggregate_refresh_failed",
+            extra={
+                "competition_id": cache.competition_id,
+            },
+        )
+    finally:
+        cache.is_refreshing = False
+
+
+async def _latest_competition_aggregate_refresh_loop(app) -> None:
+    while True:
+        await _refresh_latest_competition_aggregate_once(app)
+        await asyncio.sleep(LATEST_COMPETITION_AGGREGATE_REFRESH_SECONDS)
+
+
+def start_latest_competition_aggregate_refresh_task(app) -> None:
+    _get_latest_competition_aggregate_cache(app)
+    existing_task = getattr(app.state, "latest_competition_aggregate_refresh_task", None)
+    if existing_task is not None and not existing_task.done():
+        return
+    app.state.latest_competition_aggregate_refresh_task = asyncio.create_task(
+        _latest_competition_aggregate_refresh_loop(app),
+        name="latest_competition_aggregate_refresh",
+    )
+    logger.info(
+        "latest_competition_aggregate_refresh_started",
+        extra={"refresh_seconds": LATEST_COMPETITION_AGGREGATE_REFRESH_SECONDS},
+    )
+
+
+async def stop_latest_competition_aggregate_refresh_task(app) -> None:
+    task = getattr(app.state, "latest_competition_aggregate_refresh_task", None)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 def _swe_rows_snapshot_cache_key(comp_id: int) -> str:
     return f"swe_rows_snapshot_{SWE_ROWS_SNAPSHOT_CACHE_VERSION}_{comp_id}"
 
@@ -1282,15 +1419,18 @@ async def _build_swe_rows_snapshot(
     *,
     comp_id: int,
 ) -> SweRowsSnapshot:
-    rows = await _fetch_swe_rows_live(db, comp_id=comp_id)
-    rows_by_hotkey: dict[str, list[sa.Row]] = {}
-    for row in rows:
-        rows_by_hotkey.setdefault(str(row.hotkey), []).append(row)
+    task_groups_by_hotkey = await _fetch_swe_task_groups_by_hotkey_live(
+        db,
+        comp_id=comp_id,
+        benchmark_type="swebench_verified",
+        resolved_validation_table="swe_bench_verified_validations",
+    )
 
     return SweRowsSnapshot(
         comp_id=comp_id,
-        rows=rows,
-        rows_by_hotkey=rows_by_hotkey,
+        rows=[],
+        rows_by_hotkey={},
+        task_groups_by_hotkey=task_groups_by_hotkey,
     )
 
 
@@ -1314,98 +1454,248 @@ async def _get_swe_rows_snapshot(
         return snapshot
 
 
-async def _fetch_swe_rows_live(
+def _normalize_json_records(value: object) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _finalize_swe_task_groups(
+    tasks: dict[int, dict[str, object]],
+) -> dict[int, dict[str, object]]:
+    for group in tasks.values():
+        finalized_runs: list[dict[str, object]] = []
+        for run in group["runs_by_id"].values():
+            run["platform_score"] = None
+            run["weighted_tokens_with_compression"] = compute_weighted_tokens(
+                input_tokens=run["input_tokens_with_compression"],
+                cached_input_tokens=run["cached_input_tokens_with_compression"],
+                output_tokens=run["output_tokens_with_compression"],
+            )
+            finalized_runs.append(run)
+        group["runs"] = finalized_runs
+        group["baseline_pass_without_compression"] = _summarize_baseline_pass(
+            group["baseline_runs"]
+        )
+        group["baseline_tokens_without_compression"] = _average_optional_int(
+            [baseline["tokens_used"] for baseline in group["baseline_runs"].values()]
+        )
+        group.pop("runs_by_id", None)
+    return tasks
+
+
+def _build_swe_task_groups_by_hotkey_from_facts(
+    *,
+    baseline_rows: list[dict[str, object]],
+    miner_rows: list[dict[str, object]],
+) -> dict[str, dict[int, dict[str, object]]]:
+    baseline_by_task: dict[int, dict[str, object]] = {}
+    for row in baseline_rows:
+        task_id = int(row["task_id"])
+        baseline_runs: dict[int, dict[str, object]] = {}
+        for baseline in _normalize_json_records(row.get("baseline_runs")):
+            baseline_run_id = _to_optional_int(baseline.get("baseline_run_id"))
+            if baseline_run_id is None:
+                continue
+            baseline_runs[baseline_run_id] = {
+                "resolved": baseline.get("baseline_resolved"),
+                "tokens_used": _to_optional_int(baseline.get("baseline_tokens_used")),
+                "input_tokens": _to_optional_int(baseline.get("baseline_input_tokens")),
+                "cached_input_tokens": _to_optional_int(
+                    baseline.get("baseline_cached_input_tokens")
+                ),
+                "output_tokens": _to_optional_int(
+                    baseline.get("baseline_output_tokens")
+                ),
+            }
+        baseline_by_task[task_id] = {
+            "task_name": str(row["task_name"]),
+            "is_screener": bool(row["is_screener"]),
+            "screener_stage": _to_optional_int(row.get("screener_stage")),
+            "baseline_runs": baseline_runs,
+        }
+
+    groups_by_hotkey: dict[str, dict[int, dict[str, object]]] = {}
+    for row in miner_rows:
+        task_id = int(row["task_id"])
+        baseline_task = baseline_by_task.get(task_id)
+        if baseline_task is None:
+            continue
+
+        hotkey = str(row["hotkey"])
+        task_groups = groups_by_hotkey.setdefault(hotkey, {})
+        group = task_groups.setdefault(
+            task_id,
+            {
+                "task_id": task_id,
+                "task_name": baseline_task["task_name"],
+                "is_screener": baseline_task["is_screener"],
+                "screener_stage": baseline_task["screener_stage"],
+                "hotkey": hotkey,
+                "baseline_runs": {
+                    run_id: dict(run_data)
+                    for run_id, run_data in baseline_task["baseline_runs"].items()
+                },
+                "runs_by_id": {},
+            },
+        )
+
+        run_id = _to_optional_int(row.get("run_id"))
+        if run_id is None:
+            continue
+
+        group["runs_by_id"].setdefault(
+            run_id,
+            {
+                "run_id": run_id,
+                "attempt_no": _to_optional_int(row.get("attempt_no")) or 0,
+                "pass_with_compression": row.get("run_resolved"),
+                "tokens_with_compression": _to_optional_int(row.get("run_tokens_used")),
+                "input_tokens_with_compression": _to_optional_int(
+                    row.get("run_input_tokens")
+                ),
+                "cached_input_tokens_with_compression": _to_optional_int(
+                    row.get("run_cached_input_tokens")
+                ),
+                "output_tokens_with_compression": _to_optional_int(
+                    row.get("run_output_tokens")
+                ),
+                "time_taken_seconds": _to_optional_float(row.get("time_taken_seconds")),
+                "agent_steps": _to_optional_int(row.get("agent_steps")),
+            },
+        )
+
+    return {
+        hotkey: _finalize_swe_task_groups(task_groups)
+        for hotkey, task_groups in groups_by_hotkey.items()
+    }
+
+
+async def _fetch_swe_task_groups_by_hotkey_live(
     db: AsyncSession,
     *,
     comp_id: int,
+    benchmark_type: str,
+    resolved_validation_table: str,
     hotkey: str | None = None,
     task_id: int | None = None,
-) -> list[sa.Row]:
-    baseline_runs = aliased(SweBenchRun, name="baseline_runs")
-    baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
-    baseline_verified = aliased(SweBenchVerifiedValidation, name="baseline_verified")
-    miner_runs = aliased(SweBenchRun, name="miner_runs")
-    miner_validations = aliased(SweBenchRunValidation, name="miner_validations")
-    miner_verified = aliased(SweBenchVerifiedValidation, name="miner_verified")
+) -> dict[str, dict[int, dict[str, object]]]:
+    task_filter_sql = " AND t.id = :task_id" if task_id is not None else ""
+    hotkey_filter_sql = " AND m.ss58 = :hotkey" if hotkey is not None else ""
+    params: dict[str, object] = {
+        "comp_id": comp_id,
+        "benchmark_type": benchmark_type,
+    }
+    if task_id is not None:
+        params["task_id"] = task_id
+    if hotkey is not None:
+        params["hotkey"] = hotkey
 
-    query = (
-        select(
-            SweBenchTask.id.label("task_id"),
-            SweBenchTask.instance_id.label("task_name"),
-            SweBenchTask.is_screener.label("is_screener"),
-            SweBenchTask.screener_stage.label("screener_stage"),
-            Miner.ss58.label("hotkey"),
-            baseline_runs.id.label("baseline_run_id"),
-            baseline_runs.tokens_used.label("baseline_tokens_used"),
-            baseline_runs.input_tokens.label("baseline_input_tokens"),
-            baseline_runs.cached_input_tokens.label("baseline_cached_input_tokens"),
-            baseline_runs.output_tokens.label("baseline_output_tokens"),
-            baseline_verified.resolved.label("baseline_resolved"),
-            miner_runs.id.label("run_id"),
-            miner_runs.attempt_no.label("attempt_no"),
-            miner_runs.tokens_used.label("run_tokens_used"),
-            miner_runs.input_tokens.label("run_input_tokens"),
-            miner_runs.cached_input_tokens.label("run_cached_input_tokens"),
-            miner_runs.output_tokens.label("run_output_tokens"),
-            miner_runs.time_taken_seconds.label("time_taken_seconds"),
-            miner_runs.agent_steps.label("agent_steps"),
-            miner_verified.resolved.label("run_resolved"),
+    baseline_sql = sa.text(
+        f"""
+        WITH baseline_validation_choice AS (
+            SELECT DISTINCT ON (rv.run_fk)
+                rv.run_fk,
+                resolved.resolved
+            FROM swe_bench_run_validations rv
+            LEFT JOIN {resolved_validation_table} resolved
+              ON resolved.validation_fk = rv.id
+            ORDER BY rv.run_fk, rv.id ASC
         )
-        .select_from(SweBenchTask)
-        .join(
-            baseline_runs,
-            and_(
-                baseline_runs.task_fk == SweBenchTask.id,
-                baseline_runs.baseline_run.is_(True),
-                baseline_runs.benchmark_type == "swebench_verified",
-            ),
+        SELECT
+            t.id AS task_id,
+            t.instance_id AS task_name,
+            t.is_screener AS is_screener,
+            t.screener_stage AS screener_stage,
+            COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'baseline_run_id', br.id,
+                        'baseline_resolved', bvc.resolved,
+                        'baseline_tokens_used', br.tokens_used,
+                        'baseline_input_tokens', br.input_tokens,
+                        'baseline_cached_input_tokens', br.cached_input_tokens,
+                        'baseline_output_tokens', br.output_tokens
+                    )
+                    ORDER BY br.id
+                ),
+                '[]'::jsonb
+            ) AS baseline_runs
+        FROM swe_bench_tasks t
+        JOIN swe_bench_runs br
+          ON br.task_fk = t.id
+         AND br.baseline_run = TRUE
+         AND br.benchmark_type = :benchmark_type
+        LEFT JOIN baseline_validation_choice bvc
+          ON bvc.run_fk = br.id
+        WHERE t.competition_fk = :comp_id
+        {task_filter_sql}
+        GROUP BY t.id, t.instance_id, t.is_screener, t.screener_stage
+        ORDER BY t.instance_id ASC, t.id ASC
+        """
+    )
+    miner_sql = sa.text(
+        f"""
+        WITH miner_validation_choice AS (
+            SELECT DISTINCT ON (rv.run_fk)
+                rv.run_fk,
+                resolved.resolved
+            FROM swe_bench_run_validations rv
+            LEFT JOIN {resolved_validation_table} resolved
+              ON resolved.validation_fk = rv.id
+            ORDER BY rv.run_fk, rv.id ASC
         )
-        .outerjoin(
-            baseline_validations,
-            baseline_validations.run_fk == baseline_runs.id,
-        )
-        .outerjoin(
-            baseline_verified,
-            baseline_verified.validation_fk == baseline_validations.id,
-        )
-        .join(
-            miner_runs,
-            and_(
-                miner_runs.task_fk == SweBenchTask.id,
-                miner_runs.baseline_run.is_(False),
-                miner_runs.benchmark_type == "swebench_verified",
-            ),
-        )
-        .join(Miner, Miner.id == miner_runs.miner_fk)
-        .outerjoin(
-            miner_validations,
-            miner_validations.run_fk == miner_runs.id,
-        )
-        .outerjoin(
-            miner_verified,
-            miner_verified.validation_fk == miner_validations.id,
-        )
-        .where(SweBenchTask.competition_fk == comp_id)
-        .order_by(
-            SweBenchTask.instance_id.asc(),
-            Miner.ss58.asc(),
-            miner_runs.attempt_no.asc(),
-            miner_runs.id.asc(),
-        )
+        SELECT
+            t.id AS task_id,
+            t.instance_id AS task_name,
+            t.is_screener AS is_screener,
+            t.screener_stage AS screener_stage,
+            m.ss58 AS hotkey,
+            mr.id AS run_id,
+            mr.attempt_no AS attempt_no,
+            mr.tokens_used AS run_tokens_used,
+            mr.input_tokens AS run_input_tokens,
+            mr.cached_input_tokens AS run_cached_input_tokens,
+            mr.output_tokens AS run_output_tokens,
+            mr.time_taken_seconds AS time_taken_seconds,
+            mr.agent_steps AS agent_steps,
+            mvc.resolved AS run_resolved
+        FROM swe_bench_tasks t
+        JOIN swe_bench_runs mr
+          ON mr.task_fk = t.id
+         AND mr.baseline_run = FALSE
+         AND mr.benchmark_type = :benchmark_type
+        JOIN miners m
+          ON m.id = mr.miner_fk
+        LEFT JOIN miner_validation_choice mvc
+          ON mvc.run_fk = mr.id
+        WHERE t.competition_fk = :comp_id
+        {task_filter_sql}
+        {hotkey_filter_sql}
+        ORDER BY t.instance_id ASC, m.ss58 ASC, mr.attempt_no ASC, mr.id ASC
+        """
     )
 
-    if hotkey is not None:
-        query = query.where(Miner.ss58 == hotkey)
-    if task_id is not None:
-        query = query.where(SweBenchTask.id == task_id)
-
     try:
-        result = await db.execute(query)
+        baseline_rows = (
+            await db.execute(baseline_sql, params)
+        ).mappings().all()
+        miner_rows = (
+            await db.execute(miner_sql, params)
+        ).mappings().all()
     except SQLAlchemyError as exc:
         logger.warning(
             "swe_frontend_query_failed",
             extra={
                 "competition_id": comp_id,
+                "benchmark_type": benchmark_type,
                 "hotkey": hotkey,
                 "task_id": task_id,
             },
@@ -1416,103 +1706,10 @@ async def _fetch_swe_rows_live(
             detail="SWE frontend data is unavailable",
         ) from exc
 
-    return list(result)
-
-
-async def _fetch_swe_edit_rows_live(
-    db: AsyncSession,
-    *,
-    comp_id: int,
-) -> list[sa.Row]:
-    """Mirror of _fetch_swe_rows_live for swe_explorer_edit: same row shape for
-    build_swe_task_groups, with `resolved` read from swe_explorer_edit_validations."""
-    baseline_runs = aliased(SweBenchRun, name="baseline_runs")
-    baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
-    baseline_edit = aliased(SweExplorerEditValidation, name="baseline_edit")
-    miner_runs = aliased(SweBenchRun, name="miner_runs")
-    miner_validations = aliased(SweBenchRunValidation, name="miner_validations")
-    miner_edit = aliased(SweExplorerEditValidation, name="miner_edit")
-
-    query = (
-        select(
-            SweBenchTask.id.label("task_id"),
-            SweBenchTask.instance_id.label("task_name"),
-            SweBenchTask.is_screener.label("is_screener"),
-            SweBenchTask.screener_stage.label("screener_stage"),
-            Miner.ss58.label("hotkey"),
-            baseline_runs.id.label("baseline_run_id"),
-            baseline_runs.tokens_used.label("baseline_tokens_used"),
-            baseline_runs.input_tokens.label("baseline_input_tokens"),
-            baseline_runs.cached_input_tokens.label("baseline_cached_input_tokens"),
-            baseline_runs.output_tokens.label("baseline_output_tokens"),
-            baseline_edit.resolved.label("baseline_resolved"),
-            miner_runs.id.label("run_id"),
-            miner_runs.attempt_no.label("attempt_no"),
-            miner_runs.tokens_used.label("run_tokens_used"),
-            miner_runs.input_tokens.label("run_input_tokens"),
-            miner_runs.cached_input_tokens.label("run_cached_input_tokens"),
-            miner_runs.output_tokens.label("run_output_tokens"),
-            miner_runs.time_taken_seconds.label("time_taken_seconds"),
-            miner_runs.agent_steps.label("agent_steps"),
-            miner_edit.resolved.label("run_resolved"),
-        )
-        .select_from(SweBenchTask)
-        .join(
-            baseline_runs,
-            and_(
-                baseline_runs.task_fk == SweBenchTask.id,
-                baseline_runs.baseline_run.is_(True),
-                baseline_runs.benchmark_type == "swe_explorer_edit",
-            ),
-        )
-        .outerjoin(
-            baseline_validations,
-            baseline_validations.run_fk == baseline_runs.id,
-        )
-        .outerjoin(
-            baseline_edit,
-            baseline_edit.validation_fk == baseline_validations.id,
-        )
-        .join(
-            miner_runs,
-            and_(
-                miner_runs.task_fk == SweBenchTask.id,
-                miner_runs.baseline_run.is_(False),
-                miner_runs.benchmark_type == "swe_explorer_edit",
-            ),
-        )
-        .join(Miner, Miner.id == miner_runs.miner_fk)
-        .outerjoin(
-            miner_validations,
-            miner_validations.run_fk == miner_runs.id,
-        )
-        .outerjoin(
-            miner_edit,
-            miner_edit.validation_fk == miner_validations.id,
-        )
-        .where(SweBenchTask.competition_fk == comp_id)
-        .order_by(
-            SweBenchTask.instance_id.asc(),
-            Miner.ss58.asc(),
-            miner_runs.attempt_no.asc(),
-            miner_runs.id.asc(),
-        )
+    return _build_swe_task_groups_by_hotkey_from_facts(
+        baseline_rows=[dict(row) for row in baseline_rows],
+        miner_rows=[dict(row) for row in miner_rows],
     )
-
-    try:
-        result = await db.execute(query)
-    except SQLAlchemyError as exc:
-        logger.warning(
-            "swe_frontend_edit_query_failed",
-            extra={"competition_id": comp_id},
-            exc_info=exc,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="SWE frontend data is unavailable",
-        ) from exc
-
-    return list(result)
 
 
 async def _compute_explore_scores_by_hotkey(
@@ -1529,7 +1726,7 @@ async def _compute_explore_scores_by_hotkey(
 
     Covers eval + stage-2 explore tasks (screener + non-screener fetches
     merged, then stage-1 dropped) — the same scope as verified/edit's
-    category score (build_swe_task_groups(rows), stage-1 groups excluded via
+    category score (their task groups with stage-1 groups excluded via
     _exclude_stage1_groups) and as the backend's own competition score
     (incentive_calculator.load_competition_incentive_inputs, which filters
     screener_stage.is_distinct_from(1)). A task is either is_screener True
@@ -1857,9 +2054,7 @@ async def _build_swe_miners_snapshot(
 ) -> SweMinersSnapshot:
     if rows_snapshot is None:
         rows_snapshot = await _get_swe_rows_snapshot(db, comp_id=comp_id)
-    miner_rows: dict[str, list[sa.Row]] = {}
-    for row in rows_snapshot.rows:
-        miner_rows.setdefault(str(row.hotkey), []).append(row)
+    verified_task_groups_by_hotkey = rows_snapshot.task_groups_by_hotkey
 
     min_resolved = settings.screener_min_resolved
     eligible_hotkeys = set(
@@ -1868,10 +2063,12 @@ async def _build_swe_miners_snapshot(
         )
     )
 
-    edit_rows = await _fetch_swe_edit_rows_live(db, comp_id=comp_id)
-    edit_rows_by_hotkey: dict[str, list[sa.Row]] = {}
-    for row in edit_rows:
-        edit_rows_by_hotkey.setdefault(str(row.hotkey), []).append(row)
+    edit_task_groups_by_hotkey = await _fetch_swe_task_groups_by_hotkey_live(
+        db,
+        comp_id=comp_id,
+        benchmark_type="swe_explorer_edit",
+        resolved_validation_table="swe_explorer_edit_validations",
+    )
     explore_scores_by_hotkey = await _compute_explore_scores_by_hotkey(db, comp_id=comp_id)
     (
         stage1_explore_baseline_weighted,
@@ -1882,12 +2079,16 @@ async def _build_swe_miners_snapshot(
         stage2_explore_miner_weighted_by_hotkey,
     ) = await _fetch_stage_explore_weighted_token_totals(db, comp_id=comp_id, stage=2)
 
-    all_hotkeys = set(miner_rows) | set(edit_rows_by_hotkey) | set(explore_scores_by_hotkey)
+    all_hotkeys = (
+        set(verified_task_groups_by_hotkey)
+        | set(edit_task_groups_by_hotkey)
+        | set(explore_scores_by_hotkey)
+    )
     miners_by_hotkey: dict[str, SweMinerSnapshotItem] = {}
     for hotkey in all_hotkeys:
-        task_groups = build_swe_task_groups(miner_rows.get(hotkey, []))
+        task_groups = verified_task_groups_by_hotkey.get(hotkey, {})
         verified_score, _ = build_swe_miner_total_score(_exclude_stage1_groups(task_groups))
-        edit_groups = build_swe_task_groups(edit_rows_by_hotkey.get(hotkey, []))
+        edit_groups = edit_task_groups_by_hotkey.get(hotkey, {})
         edit_score, _ = build_swe_miner_total_score(_exclude_stage1_groups(edit_groups))
         explore_score = explore_scores_by_hotkey.get(hotkey)
 
@@ -2036,6 +2237,22 @@ def _to_optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _average_optional_int(values: list[int | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    return sum(present) / len(present)
 
 
 def _weighted_tokens_for_screening(
@@ -2557,8 +2774,8 @@ async def _build_swe_status_overrides(
 
 async def _get_competition_aggregate_impl(
     request: Request,
-    db: AsyncSession = Depends(get_db_session),
-    competition_id: int = Path(..., ge=1),
+    db: AsyncSession = Depends(get_db_read_session),
+    competition_id: int = FastAPIPath(..., ge=1),
 ) -> tuple[SweCompetitionAggregateResponse, SweMinersSnapshot, dict[str, dict[int, dict[str, int]]]]:
     competition_name = await db.scalar(
         select(Competition.competition_name).where(Competition.id == competition_id)
@@ -2569,16 +2786,16 @@ async def _get_competition_aggregate_impl(
             detail="Competition not found",
         )
 
-    has_swe_tasks = await db.scalar(
-        select(SweBenchTask.id)
-        .where(SweBenchTask.competition_fk == competition_id)
-        .limit(1)
-    )
-    if has_swe_tasks is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only SWE competitions are supported by this endpoint",
-        )
+    # has_swe_tasks = await db.scalar(
+    #     select(SweBenchTask.id)
+    #     .where(SweBenchTask.competition_fk == competition_id)
+    #     .limit(1)
+    # )
+    # if has_swe_tasks is None:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_400_BAD_REQUEST,
+    #         detail="Only SWE competitions are supported by this endpoint",
+    #     )
 
     timeframe_row = (
         await db.execute(
@@ -2652,8 +2869,7 @@ async def _get_competition_aggregate_impl(
             continue
         miner_status = resolved_status_by_hotkey.get(hotkey, "in queue")
 
-        miner_rows = rows_snapshot.rows_by_hotkey.get(hotkey, [])
-        task_groups = build_swe_task_groups(miner_rows)
+        task_groups = rows_snapshot.task_groups_by_hotkey.get(hotkey, {})
         # Penalty zones are already folded into each task's score by the new
         # scoring, so there is no separate penalty to report.
         penalties_categories: dict[str, float | None] = {}
@@ -2702,29 +2918,30 @@ async def _get_competition_aggregate_impl(
                 ),
                 "compression_runs_total": len(runs),
             }
-            baseline_task_tokens_values = [
-                _to_optional_int(baseline.get("tokens_used"))
-                for baseline in (
-                    group.get("baseline_runs", {}).values()
-                    if isinstance(group.get("baseline_runs"), dict)
-                    else []
-                )
-                if _to_optional_int(baseline.get("tokens_used")) is not None
-            ]
+            baseline_task_tokens_total = 0
+            baseline_task_tokens_has_value = False
+            for baseline in baseline_runs_for_group.values():
+                tokens_used = _to_optional_int(baseline.get("tokens_used"))
+                if tokens_used is None:
+                    continue
+                baseline_task_tokens_total += tokens_used
+                baseline_task_tokens_has_value = True
             baseline_task_tokens = (
-                sum(baseline_task_tokens_values)
-                if baseline_task_tokens_values
-                else None
+                baseline_task_tokens_total if baseline_task_tokens_has_value else None
             )
-            miner_task_tokens_values = [
-                _to_optional_int(run.get("tokens_with_compression"))
-                for run in runs
-                if _to_optional_int(run.get("tokens_with_compression")) is not None
-            ]
+
+            miner_task_tokens_total = 0
+            miner_task_tokens_has_value = False
+            for run in runs:
+                tokens_with_compression = _to_optional_int(
+                    run.get("tokens_with_compression")
+                )
+                if tokens_with_compression is None:
+                    continue
+                miner_task_tokens_total += tokens_with_compression
+                miner_task_tokens_has_value = True
             miner_task_tokens = (
-                sum(miner_task_tokens_values)
-                if miner_task_tokens_values
-                else None
+                miner_task_tokens_total if miner_task_tokens_has_value else None
             )
             baseline_weighted_tokens, miner_weighted_tokens = _group_weighted_token_totals(
                 group
@@ -2943,7 +3160,7 @@ router = APIRouter(
 @router.get("/economics", response_model=FrontendEconomicsResponse)
 async def frontend_economics(
     request: Request,
-    db: AsyncSession = Depends(get_db_session),
+    db: AsyncSession = Depends(get_db_read_session),
 ) -> FrontendEconomicsResponse:
     _cached = await _cache.get("economics")
     if _cached is not None:
@@ -2998,31 +3215,64 @@ async def frontend_economics(
 )
 async def get_competition_aggregate(
     request: Request,
-    db: AsyncSession = Depends(get_db_session),
-    competition_id: int = Path(..., ge=1),
+    db: AsyncSession = Depends(get_db_read_session),
+    competition_id: int = FastAPIPath(..., ge=1),
     gzip_enabled: bool = Query(
         default=False,
         alias="gzip",
         description="When true, response body is returned as gzip-compressed JSON.",
     ),
 ) -> Response:
-    payload = await _get_competition_aggregate_payload(
-        request=request,
-        db=db,
-        competition_id=competition_id,
-    )
-    payload_bytes = _json_payload_bytes(payload)
-    if not gzip_enabled:
-        return Response(content=payload_bytes, media_type="application/json")
+    latest_competition_id = await _get_latest_competition_id(db)
+    if latest_competition_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Latest competition aggregate is unavailable because no competition exists yet",
+        )
 
-    compressed_payload = gzip.compress(payload_bytes)
-    return Response(
-        content=compressed_payload,
-        media_type="application/json",
-        headers={
-            "Content-Encoding": "gzip",
-            "Vary": "Accept-Encoding",
-        },
+    if int(competition_id) != int(latest_competition_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Competition aggregate is only served for the latest competition "
+                f"(latest_competition_id={int(latest_competition_id)})"
+            ),
+        )
+
+    cache = _get_latest_competition_aggregate_cache(request.app)
+    if (
+        cache.competition_id == int(competition_id)
+        and cache.payload_bytes is not None
+        and cache.gzip_payload_bytes is not None
+    ):
+        if not gzip_enabled:
+            return Response(content=cache.payload_bytes, media_type="application/json")
+        return Response(
+            content=cache.gzip_payload_bytes,
+            media_type="application/json",
+            headers={
+                "Content-Encoding": "gzip",
+                "Vary": "Accept-Encoding",
+            },
+        )
+
+    if cache.is_refreshing:
+        detail = "Latest competition aggregate is not ready yet; background refresh is in progress"
+    elif cache.last_error:
+        detail = (
+            "Latest competition aggregate is unavailable; "
+            f"last refresh failed: {cache.last_error}"
+        )
+    elif cache.competition_id != int(competition_id):
+        detail = (
+            "Latest competition aggregate cache is stale for the current competition; "
+            "wait for the next background refresh"
+        )
+    else:
+        detail = "Latest competition aggregate is not ready yet"
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=detail,
     )
 
 
@@ -3032,13 +3282,9 @@ async def get_competition_aggregate(
 )
 async def get_active_competitions(
     request: Request,
-    db: AsyncSession = Depends(get_db_session),
+    db: AsyncSession = Depends(get_db_read_session),
 ) -> list[MinerCompetitionItem]:
-    has_swe_tasks = (
-        select(SweBenchTask.id)
-        .where(SweBenchTask.competition_fk == Competition.id)
-        .exists()
-    )
+    has_swe_tasks = True
     has_compression_tasks = (
         select(CompetitionChallenge.challenge_fk)
         .where(CompetitionChallenge.competition_fk == Competition.id)
@@ -3129,7 +3375,7 @@ async def get_active_competitions(
 
 @router.get("/validators", response_model=ValidatorsListResponse)
 async def list_validators(
-    db: AsyncSession = Depends(get_db_session),
+    db: AsyncSession = Depends(get_db_read_session),
 ) -> ValidatorsListResponse:
     _cached = await _cache.get("validators")
     if _cached is not None:

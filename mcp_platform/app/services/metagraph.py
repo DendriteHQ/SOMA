@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import bittensor as bt
 from datetime import datetime, timezone
@@ -67,6 +68,9 @@ class MetagraphService:
         self._cached_block: int | None = None
         self._last_block_check_at: float | None = None
 
+        self._reader_subtensor: Any | None = None
+        self._reader_lock = threading.Lock()
+
     @property
     def latest_snapshot(self) -> dict[str, Any] | None:
         return self._latest_snapshot
@@ -114,25 +118,38 @@ class MetagraphService:
                 pass
         return subtensor_cls()
 
-    def _query_netuid_scalar(self, storage_function: str) -> int:
-        """Read a single-value storage item for the configured netuid, in rao."""
-        value = self._subtensor.substrate.query(
-            module="SubtensorModule",
-            storage_function=storage_function,
-            params=[settings.bt_netuid],
-        )
+    def _query_netuid_scalar_via_reader(self, storage_function: str) -> int:
+        """Read a single-value storage item for the configured netuid, in rao.
+
+        Runs on the dedicated reader connection (see `self._reader_subtensor`),
+        never on `self._subtensor`, so this can be called freely from API request
+        threads without racing the metagraph-service sync loop's own connection.
+        """
+        with self._reader_lock:
+            if self._reader_subtensor is None:
+                logger.info("metagraph_service_building_reader_subtensor")
+                self._reader_subtensor = self._build_subtensor()
+            value = self._reader_subtensor.substrate.query(
+                module="SubtensorModule",
+                storage_function=storage_function,
+                params=[settings.bt_netuid],
+            )
         raw = getattr(value, "value", value)
         # Some items decode to a single-element vector on finney, e.g. [50000000].
         return int(raw[0] if isinstance(raw, (list, tuple)) else raw)
 
     def get_registration_cost_tao(self) -> float:
         """Current registration burn cost in TAO, read straight from chain storage."""
-        return self._query_netuid_scalar("Burn") / 1e9
+        return self._query_netuid_scalar_via_reader("Burn") / 1e9
 
     def get_alpha_price_tao(self) -> float:
         """Current alpha price in TAO (1 ALPHA = X TAO), from the subnet pool reserves."""
-        alpha_in = self._query_netuid_scalar("SubnetAlphaIn")
-        return (self._query_netuid_scalar("SubnetTAO") / alpha_in) if alpha_in else 0.0
+        alpha_in = self._query_netuid_scalar_via_reader("SubnetAlphaIn")
+        return (
+            self._query_netuid_scalar_via_reader("SubnetTAO") / alpha_in
+            if alpha_in
+            else 0.0
+        )
 
     def _get_current_block(self) -> int | None:
         if self._subtensor is None:

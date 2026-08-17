@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.config import settings
+from app.db.session import close_reader_db, get_db_read_session, init_reader_db
 from app.core.logging import configure_logging, get_logger
 from soma_shared.db.session import (
     begin_db_request_metrics_scope,
@@ -33,6 +34,10 @@ from app.services.swebench_orchestrator import (
 )
 from app.services.metagraph import MetagraphService
 from app.services.metagraph_runner import MetagraphServiceRunner
+from app.api.routes.frontend import (
+    start_latest_competition_aggregate_refresh_task,
+    stop_latest_competition_aggregate_refresh_task,
+)
 from soma_shared.db.views.definitions import VIEW_DEFINITIONS
 
 logger = get_logger(__name__)
@@ -156,7 +161,7 @@ def create_app() -> FastAPI:
     async def _load_registered_validators() -> None:
         validators: dict[str, dict[str, object]] = {}
         try:
-            async for session in get_db_session():
+            async for session in get_db_read_session():
                 result = await session.execute(
                     select(ValidatorRegistration, Validator)
                     .join(Validator, ValidatorRegistration.validator_fk == Validator.id)
@@ -285,6 +290,16 @@ def create_app() -> FastAPI:
             _log_startup_failure("init_db", exc)
             raise
 
+        try:
+            await init_reader_db()
+        except BaseException as exc:
+            _log_startup_failure(
+                "init_reader_db",
+                exc,
+                event="reader_database_unavailable",
+                extra={"fallback": "writer"},
+            )
+
         if settings.debug:
             if settings.debug_clear_db:
                 try:
@@ -351,6 +366,11 @@ def create_app() -> FastAPI:
         except BaseException as exc:
             _log_startup_failure("swebench_orchestrator_start", exc)
             raise
+        try:
+            start_latest_competition_aggregate_refresh_task(app)
+        except BaseException as exc:
+            _log_startup_failure("latest_competition_aggregate_refresh_start", exc)
+            raise
         logger.info("startup_complete", extra={"env": settings.app_env})
 
     @app.on_event("shutdown")
@@ -373,6 +393,8 @@ def create_app() -> FastAPI:
 
         stop_heartbeat_thread(app)
         await stop_swebench_orchestrator_task(app)
+        await stop_latest_competition_aggregate_refresh_task(app)
+        await close_reader_db()
         await close_db()
         logger.info("shutdown_complete")
 
