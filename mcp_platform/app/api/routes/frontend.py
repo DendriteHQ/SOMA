@@ -3233,12 +3233,37 @@ async def get_competition_aggregate(
         )
 
     if int(competition_id) != int(latest_competition_id):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "Competition aggregate is only served for the latest competition "
-                f"(latest_competition_id={int(latest_competition_id)})"
-            ),
+        snapshot_payload = await _load_aggregate_snapshot_from_local(competition_id)
+        if snapshot_payload is None:
+            snapshot_payload = await _load_aggregate_snapshot_from_s3(
+                request,
+                competition_id,
+            )
+            if snapshot_payload is not None:
+                await _save_aggregate_snapshot_to_local(competition_id, snapshot_payload)
+
+        if snapshot_payload is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Competition aggregate is only served live for the latest competition "
+                    f"(latest_competition_id={int(latest_competition_id)}); "
+                    "no cached snapshot is available for the requested competition"
+                ),
+            )
+
+        payload_bytes = _json_payload_bytes(snapshot_payload)
+        if not gzip_enabled:
+            return Response(content=payload_bytes, media_type="application/json")
+
+        compressed_payload = gzip.compress(payload_bytes)
+        return Response(
+            content=compressed_payload,
+            media_type="application/json",
+            headers={
+                "Content-Encoding": "gzip",
+                "Vary": "Accept-Encoding",
+            },
         )
 
     cache = _get_latest_competition_aggregate_cache(request.app)
