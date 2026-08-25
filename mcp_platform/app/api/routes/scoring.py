@@ -326,12 +326,13 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
 SCORING_ALPHA = 0.8           
 SCORING_R_MIN = -2.0          
 SCORING_R_MAX = 2.0           
-SCORING_BONUS_CAP = 3.0       
+SCORING_BONUS_MAX = 0.1
+SCORING_BONUS_MIN_EXTRA = 2
 SCORING_PENALTY_FLOOR = -4.0  
 SCORING_PENALTY_CEIL = -2.0
 
 SWE_SCORE_MIN = SCORING_PENALTY_FLOOR
-SWE_SCORE_MAX = SCORING_BONUS_CAP
+SWE_SCORE_MAX = SCORING_R_MAX + SCORING_BONUS_MAX
 
 
 def _compression_ratio(
@@ -355,6 +356,27 @@ def _penalty_threshold(x: int) -> int:
     return floor(x * SCORING_ALPHA)
 
 
+def _bonus_component(*, x: int, y: int, task_run_count: int) -> float:
+    """Quadratic bonus for materially outperforming baseline quality.
+
+    The bonus is intentionally small and only starts once the miner exceeds the
+    baseline by at least ``SCORING_BONUS_MIN_EXTRA`` resolved runs and clears
+    half of the effective remaining headroom.
+    """
+    extra = max(0, y - x)
+    if extra < SCORING_BONUS_MIN_EXTRA:
+        return 0.0
+
+    remaining_headroom = max(0, task_run_count - x)
+    effective_headroom = max(SCORING_BONUS_MIN_EXTRA, remaining_headroom)
+    progress = extra / effective_headroom
+    if progress <= 0.5:
+        return 0.0
+
+    scaled = (progress - 0.5) / 0.5
+    return SCORING_BONUS_MAX * (scaled**2)
+
+
 def compute_swe_task_score(
     x: int,
     y: int,
@@ -376,8 +398,9 @@ def compute_swe_task_score(
     tokens_with_compression : average weighted miner tokens across runs with
         a valid token count.
     task_run_count : total run count for this task, typically the planned
-        repeat count for the task. The bonus zone uses the remaining run
-        budget (``task_run_count - x``) instead of a fixed constant.
+        repeat count for the task. The bonus zone is a capped quadratic
+        tie-break reward that only starts after the miner clears a minimum
+        absolute and relative overperformance threshold above baseline.
 
     Returns a dict with:
       score       — numeric per-task score, or ``None`` for no-contribution
@@ -409,10 +432,9 @@ def compute_swe_task_score(
             raw = r
             zone = "maintain"
         else:
-            denom = task_run_count - x
-            bonus = (y - x) / denom if denom > 0 else 0.0
-            raw = max(SCORING_R_MIN, min(SCORING_BONUS_CAP, r + bonus))
-            zone = "bonus"
+            bonus = _bonus_component(x=x, y=y, task_run_count=task_run_count)
+            raw = max(SCORING_R_MIN, min(SWE_SCORE_MAX, r + bonus))
+            zone = "bonus" if bonus > 0 else "maintain"
 
         return {
             "score": raw,
@@ -435,10 +457,9 @@ def compute_swe_task_score(
         raw = r
         zone = "maintain"
     else:
-        denom = task_run_count - x
-        bonus = (y - x) / denom if denom > 0 else 0.0
-        raw = max(SCORING_R_MIN, min(SCORING_BONUS_CAP, r + bonus))
-        zone = "bonus"
+        bonus = _bonus_component(x=x, y=y, task_run_count=task_run_count)
+        raw = max(SCORING_R_MIN, min(SWE_SCORE_MAX, r + bonus))
+        zone = "bonus" if bonus > 0 else "maintain"
 
     return {
         "score": raw,
