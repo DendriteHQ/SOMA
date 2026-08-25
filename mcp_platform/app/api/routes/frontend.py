@@ -3150,7 +3150,7 @@ async def _get_current_competition_days(db: AsyncSession) -> float:
             detail="No active competition timeframe found",
         )
 
-    return (row.eval_ends_at - row.upload_starts_at).total_seconds() / 86400.0
+    return min(14,int((row.eval_ends_at - row.upload_starts_at).total_seconds() / 86400.0))
 
 router = APIRouter(
     prefix="/api/private/frontend",
