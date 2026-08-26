@@ -136,6 +136,7 @@ mcp_platform/app/services/dash_rows_cache/dash_rows_cache_backup.json
 
 # Gateway runtime artifacts
 gateway/metadata/
+auto_run_restarter/metadata/
 
 # Temporary competition override data
 tmp/competition_112_stage2_override/
