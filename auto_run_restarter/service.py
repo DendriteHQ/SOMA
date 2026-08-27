@@ -129,6 +129,8 @@ def _classify_restart_reason(
         return "provider_520"
     if "502 Bad Gateway" in error:
         return "provider_502"
+    if "all predefined address pools have been fully subnetted" in error:
+        return "docker_network_address_pool_exhausted"
     if error.startswith("Volume soma-copilot-"):
         return "container_startup_output_as_error"
     if "Failed to clone benchmark repository" in error:

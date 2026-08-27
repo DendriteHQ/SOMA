@@ -17,6 +17,7 @@ Current restart rules:
 - `500 Internal Server Error`
 - provider `520` errors
 - `502 Bad Gateway`
+- Docker network pool exhaustion (`all predefined address pools have been fully subnetted`)
 - container startup output accidentally captured in `last_error`
 - git clone / fetch / checkout failures for benchmark repos
 - missing copilot container `.env`
