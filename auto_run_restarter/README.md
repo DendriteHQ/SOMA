@@ -15,6 +15,7 @@ Current restart rules:
 - exact `400 Provider returned error`
 - proxy DNS failures containing `ENOTFOUND`
 - `500 Internal Server Error`
+- provider `520` errors
 - `502 Bad Gateway`
 - container startup output accidentally captured in `last_error`
 - git clone / fetch / checkout failures for benchmark repos

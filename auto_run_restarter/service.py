@@ -125,6 +125,8 @@ def _classify_restart_reason(
         return "proxy_dns_failure"
     if "500 Internal Server Error" in error:
         return "provider_500"
+    if '"code":520' in error or "error code: 520" in error:
+        return "provider_520"
     if "502 Bad Gateway" in error:
         return "provider_502"
     if error.startswith("Volume soma-copilot-"):
