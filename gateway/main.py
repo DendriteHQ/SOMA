@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import json
 import logging
 import os
+from pathlib import Path
+import random
 import subprocess
 from typing import AsyncIterator
 from urllib.parse import quote
@@ -146,6 +149,155 @@ def _resolve_upstream_url(path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
+def _failed_calls_dir() -> Path:
+    return Path(os.getenv("GATEWAY_FAILED_CALLS_DIR", "/root/SOMA/gateway/metadata/failed_calls"))
+
+
+def _decode_body_preview(body: bytes, *, limit: int = 20000) -> str:
+    if not body:
+        return ""
+    return body[:limit].decode("utf-8", errors="replace")
+
+
+def _load_json_body(body: bytes) -> dict | list | None:
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return None
+    if isinstance(payload, (dict, list)):
+        return payload
+    return None
+
+
+def _failed_call_record_path(now: datetime) -> Path:
+    return _failed_calls_dir() / f"{now.date().isoformat()}.jsonl"
+
+
+def _append_text_line(path: Path, line: str) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+
+
+async def _dump_failed_call(
+    *,
+    run_id: int,
+    miner_hotkey: str,
+    method: str,
+    path: str,
+    url: str,
+    stream: bool,
+    request_body: bytes,
+    response_status_code: int | None,
+    response_headers: httpx.Headers | dict[str, str] | None,
+    response_body: bytes | None,
+    attempts_used: int,
+    retry_reason: str | None,
+    forced_provider: str | None,
+    actual_provider: str | None,
+    exception_message: str | None = None,
+) -> None:
+    now = datetime.now(UTC)
+    payload = {
+        "timestamp": now.isoformat(),
+        "run_id": run_id,
+        "miner_hotkey": miner_hotkey,
+        "method": method,
+        "path": f"/v1/{path}",
+        "url": url,
+        "stream": stream,
+        "status_code": response_status_code,
+        "attempts_used": attempts_used,
+        "max_attempts": _provider_retry_max_attempts(),
+        "retry_reason": retry_reason,
+        "forced_provider": forced_provider,
+        "actual_provider": actual_provider,
+        "request": _load_json_body(request_body) or _decode_body_preview(request_body),
+        "response_headers": dict(response_headers.items()) if response_headers is not None else None,
+        "response_json": _load_json_body(response_body or b""),
+        "response_body_preview": _decode_body_preview(response_body or b""),
+        "exception_message": exception_message,
+    }
+    output_path = _failed_call_record_path(now)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, ensure_ascii=True) + "\n"
+    await asyncio.to_thread(_append_text_line, output_path, line)
+
+
+def _provider_retry_max_attempts() -> int:
+    try:
+        value = int(os.getenv("GATEWAY_PROVIDER_RETRY_MAX_ATTEMPTS", "3"))
+    except ValueError:
+        value = 3
+    return max(1, value)
+
+
+def _provider_retry_base_delay_seconds() -> float:
+    try:
+        value = float(os.getenv("GATEWAY_PROVIDER_RETRY_BASE_DELAY_SECONDS", "0.75"))
+    except ValueError:
+        value = 0.75
+    return max(0.0, value)
+
+
+def _provider_retry_max_delay_seconds() -> float:
+    try:
+        value = float(os.getenv("GATEWAY_PROVIDER_RETRY_MAX_DELAY_SECONDS", "3.0"))
+    except ValueError:
+        value = 3.0
+    return max(0.0, value)
+
+
+def _provider_retry_jitter_seconds() -> float:
+    try:
+        value = float(os.getenv("GATEWAY_PROVIDER_RETRY_JITTER_SECONDS", "0.35"))
+    except ValueError:
+        value = 0.35
+    return max(0.0, value)
+
+
+def _extract_response_error_message(body: bytes) -> str:
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return body.decode("utf-8", errors="replace")
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str):
+                return message
+        message = payload.get("message")
+        if isinstance(message, str):
+            return message
+    return body.decode("utf-8", errors="replace")
+
+
+def _classify_retryable_provider_error(status_code: int, body: bytes) -> str | None:
+    message = _extract_response_error_message(body)
+    if status_code == 404 and (
+        "not found on provider" in message
+        or "No endpoints found for" in message
+    ):
+        return "provider_model_404"
+    if status_code == 400:
+        return "provider_400"
+    return None
+
+
+def _provider_retry_delay_seconds(attempt_no: int) -> float:
+    base_delay = _provider_retry_base_delay_seconds()
+    max_delay = _provider_retry_max_delay_seconds()
+    jitter = _provider_retry_jitter_seconds()
+    delay = min(max_delay, base_delay * (2 ** max(0, attempt_no - 1)))
+    if jitter > 0:
+        delay += random.uniform(0.0, jitter)
+    return delay
+
+
 async def _resolve_run_auth_context(run_id: int) -> tuple[bool, str | None, str | None]:
     engine: AsyncEngine = app.state.db_engine
     query = text(
@@ -229,30 +381,98 @@ async def _resolve_authorization_header(run_id: int) -> tuple[str, str]:
 
 
 async def _stream_upstream_response(
+    *,
+    run_id: int,
+    miner_hotkey: str,
     method: str,
     url: str,
     headers: dict[str, str],
     body_bytes: bytes,
     timeout: httpx.Timeout,
-) -> tuple[AsyncIterator[bytes], int, dict[str, str], httpx.Headers]:
-    client = httpx.AsyncClient(timeout=timeout)
-    stream_ctx = client.stream(method=method, url=url, headers=headers, content=body_bytes)
-    response = await stream_ctx.__aenter__()
-
-    async def _iterator() -> AsyncIterator[bytes]:
+) -> tuple[
+    AsyncIterator[bytes] | None,
+    int,
+    dict[str, str],
+    httpx.Headers | None,
+    bytes | None,
+    int,
+    str | None,
+]:
+    max_attempts = _provider_retry_max_attempts()
+    for attempt_no in range(1, max_attempts + 1):
+        client = httpx.AsyncClient(timeout=timeout)
+        stream_ctx = client.stream(method=method, url=url, headers=headers, content=body_bytes)
         try:
-            async for chunk in response.aiter_bytes():
-                yield chunk
-        finally:
+            response = await stream_ctx.__aenter__()
+        except Exception:
+            await client.aclose()
+            raise
+
+        retry_reason: str | None = None
+        error_body: bytes | None = None
+        if response.status_code >= 400:
+            error_body = await response.aread()
+            retry_reason = _classify_retryable_provider_error(response.status_code, error_body)
+
+        if retry_reason is not None and attempt_no < max_attempts:
             await stream_ctx.__aexit__(None, None, None)
             await client.aclose()
+            delay_seconds = _provider_retry_delay_seconds(attempt_no)
+            logger.warning(
+                "gateway_provider_retry run_id=%s miner_hotkey=%s attempt=%s max_attempts=%s status_code=%s reason=%s delay_seconds=%.3f stream=true",
+                run_id,
+                miner_hotkey,
+                attempt_no,
+                max_attempts,
+                response.status_code,
+                retry_reason,
+                delay_seconds,
+            )
+            await asyncio.sleep(delay_seconds)
+            continue
 
-    response_headers = _select_passthrough_response_headers(response.headers)
-    response_headers.setdefault(
-        "content-type",
-        response.headers.get("content-type", "text/event-stream"),
-    )
-    return _iterator(), response.status_code, response_headers, response.headers
+        if error_body is not None:
+            response_headers = _select_passthrough_response_headers(response.headers)
+            response_headers.setdefault(
+                "content-type",
+                response.headers.get("content-type", "application/json"),
+            )
+            await stream_ctx.__aexit__(None, None, None)
+            await client.aclose()
+            return (
+                None,
+                response.status_code,
+                response_headers,
+                response.headers,
+                error_body,
+                attempt_no,
+                retry_reason,
+            )
+
+        async def _iterator() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            finally:
+                await stream_ctx.__aexit__(None, None, None)
+                await client.aclose()
+
+        response_headers = _select_passthrough_response_headers(response.headers)
+        response_headers.setdefault(
+            "content-type",
+            response.headers.get("content-type", "text/event-stream"),
+        )
+        return (
+            _iterator(),
+            response.status_code,
+            response_headers,
+            response.headers,
+            None,
+            attempt_no,
+            None,
+        )
+
+    raise RuntimeError("provider retry loop exhausted unexpectedly")
 
 
 def _extract_actual_provider(headers: httpx.Headers, body: bytes | None = None) -> str | None:
@@ -294,6 +514,56 @@ def _build_upstream_url(path: str, query_string: str) -> str:
     if query_string:
         return f"{base}?{query_string}"
     return base
+
+
+async def _send_upstream_request_with_retries(
+    *,
+    run_id: int,
+    miner_hotkey: str,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body_bytes: bytes,
+    timeout: httpx.Timeout,
+) -> tuple[httpx.Response, int, str | None]:
+    max_attempts = _provider_retry_max_attempts()
+    last_response: httpx.Response | None = None
+    for attempt_no in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.request(method, url, headers=headers, content=body_bytes)
+        except Exception:
+            logger.exception(
+                "gateway_upstream_failed run_id=%s miner_hotkey=%s method=%s path=%s attempt=%s",
+                run_id,
+                miner_hotkey,
+                method,
+                url,
+                attempt_no,
+            )
+            raise
+
+        last_response = resp
+        retry_reason = _classify_retryable_provider_error(resp.status_code, resp.content)
+        if retry_reason is None or attempt_no >= max_attempts:
+            return resp, attempt_no, retry_reason
+
+        delay_seconds = _provider_retry_delay_seconds(attempt_no)
+        logger.warning(
+            "gateway_provider_retry run_id=%s miner_hotkey=%s attempt=%s max_attempts=%s status_code=%s reason=%s delay_seconds=%.3f stream=false",
+            run_id,
+            miner_hotkey,
+            attempt_no,
+            max_attempts,
+            resp.status_code,
+            retry_reason,
+            delay_seconds,
+        )
+        await asyncio.sleep(delay_seconds)
+
+    if last_response is None:
+        raise RuntimeError("provider retry loop exhausted without response")
+    return last_response, max_attempts, None
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
@@ -356,15 +626,44 @@ async def proxy_openai_compatible(
     timeout = httpx.Timeout(float(os.getenv("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", "180")))
 
     if isinstance(parsed, dict) and bool(parsed.get("stream")):
-        stream, status_code, response_headers, upstream_headers = await _stream_upstream_response(
-            method=method,
-            url=url,
-            headers=headers,
-            body_bytes=body_bytes,
-            timeout=timeout,
-        )
+        try:
+            stream, status_code, response_headers, upstream_headers, error_body, attempts_used, retry_reason = await _stream_upstream_response(
+                run_id=run_id,
+                miner_hotkey=miner_hotkey,
+                method=method,
+                url=url,
+                headers=headers,
+                body_bytes=body_bytes,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            logger.exception(
+                "gateway_upstream_failed run_id=%s miner_hotkey=%s method=%s path=/v1/%s",
+                run_id,
+                miner_hotkey,
+                method,
+                path,
+            )
+            await _dump_failed_call(
+                run_id=run_id,
+                miner_hotkey=miner_hotkey,
+                method=method,
+                path=path,
+                url=url,
+                stream=True,
+                request_body=body_bytes,
+                response_status_code=502,
+                response_headers=None,
+                response_body=None,
+                attempts_used=1,
+                retry_reason=None,
+                forced_provider=force_provider if provider_was_forced else None,
+                actual_provider=None,
+                exception_message=str(exc),
+            )
+            raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
         if provider_was_forced:
-            actual_provider = _extract_actual_provider(upstream_headers)
+            actual_provider = _extract_actual_provider(upstream_headers or httpx.Headers(), error_body)
             match = actual_provider.lower() == force_provider.lower() if actual_provider else None
             logger.info(
                 "gateway_provider_verification run_id=%s forced_provider=%s actual_provider=%s match=%s stream=true",
@@ -380,6 +679,39 @@ async def proxy_openai_compatible(
                     force_provider,
                     actual_provider,
                 )
+        else:
+            actual_provider = _extract_actual_provider(upstream_headers or httpx.Headers(), error_body)
+        if stream is None:
+            await _dump_failed_call(
+                run_id=run_id,
+                miner_hotkey=miner_hotkey,
+                method=method,
+                path=path,
+                url=url,
+                stream=True,
+                request_body=body_bytes,
+                response_status_code=status_code,
+                response_headers=upstream_headers,
+                response_body=error_body,
+                attempts_used=attempts_used,
+                retry_reason=retry_reason,
+                forced_provider=force_provider if provider_was_forced else None,
+                actual_provider=actual_provider,
+            )
+            logger.info(
+                "gateway_request_completed run_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s stream=true",
+                run_id,
+                miner_hotkey,
+                method,
+                path,
+                status_code,
+            )
+            return Response(
+                content=error_body or b"",
+                status_code=status_code,
+                media_type=response_headers.get("content-type"),
+                headers=response_headers,
+            )
         stream_response_headers = {
             key: value
             for key, value in response_headers.items()
@@ -401,8 +733,15 @@ async def proxy_openai_compatible(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.request(method, url, headers=headers, content=body_bytes)
+        resp, attempts_used, retry_reason = await _send_upstream_request_with_retries(
+            run_id=run_id,
+            miner_hotkey=miner_hotkey,
+            method=method,
+            url=url,
+            headers=headers,
+            body_bytes=body_bytes,
+            timeout=timeout,
+        )
     except Exception as exc:
         logger.exception(
             "gateway_upstream_failed run_id=%s miner_hotkey=%s method=%s path=/v1/%s",
@@ -410,6 +749,23 @@ async def proxy_openai_compatible(
             miner_hotkey,
             method,
             path,
+        )
+        await _dump_failed_call(
+            run_id=run_id,
+            miner_hotkey=miner_hotkey,
+            method=method,
+            path=path,
+            url=url,
+            stream=False,
+            request_body=body_bytes,
+            response_status_code=502,
+            response_headers=None,
+            response_body=None,
+            attempts_used=1,
+            retry_reason=None,
+            forced_provider=force_provider if provider_was_forced else None,
+            actual_provider=None,
+            exception_message=str(exc),
         )
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
@@ -431,6 +787,25 @@ async def proxy_openai_compatible(
                 force_provider,
                 actual_provider,
             )
+    else:
+        actual_provider = _extract_actual_provider(resp.headers, resp.content)
+    if resp.status_code >= 400:
+        await _dump_failed_call(
+            run_id=run_id,
+            miner_hotkey=miner_hotkey,
+            method=method,
+            path=path,
+            url=url,
+            stream=False,
+            request_body=body_bytes,
+            response_status_code=resp.status_code,
+            response_headers=resp.headers,
+            response_body=resp.content,
+            attempts_used=attempts_used,
+            retry_reason=retry_reason,
+            forced_provider=force_provider if provider_was_forced else None,
+            actual_provider=actual_provider,
+        )
     logger.info(
         "gateway_request_completed run_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s",
         run_id,
