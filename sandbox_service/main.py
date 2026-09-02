@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from collections import Counter
@@ -25,6 +26,7 @@ from soma_shared.contracts.sandbox.v1.messages import (
     CompactBenchRunTaskResponse,
 )
 
+import volume_janitor
 from app.callback_queue import CallbackQueue
 from app.compact_bench_executor import CompactBenchExecutor
 
@@ -172,6 +174,28 @@ def _prune_stale_copilot_networks() -> None:
         logger.warning("Startup network prune failed: %s", exc)
 
 
+def _volume_janitor_loop(stop_event: threading.Event) -> None:
+    """Background-thread loop: periodically sweep orphaned Docker volumes.
+
+    Runs on a plain OS thread (not an asyncio task) because volume_janitor's
+    work is blocking subprocess calls to the docker CLI - running it as a
+    thread keeps it off the event loop entirely instead of needing
+    run_in_executor for every call.
+    """
+    logger.info(
+        "Volume janitor thread started: interval=%ds min_age=%ds",
+        volume_janitor.SWEEP_INTERVAL_SECONDS,
+        volume_janitor.MIN_AGE_SECONDS,
+    )
+    while not stop_event.is_set():
+        try:
+            volume_janitor.sweep()
+        except Exception:
+            logger.exception("Volume janitor sweep failed")
+        stop_event.wait(volume_janitor.SWEEP_INTERVAL_SECONDS)
+    logger.info("Volume janitor thread stopped")
+
+
 @app.on_event("startup")
 async def startup() -> None:
     """Initialize compact-bench executor and shared capacity controls."""
@@ -189,6 +213,16 @@ async def startup() -> None:
 
     app.state.callback_queue = CallbackQueue(_get_callback_queue_path())
     app.state.callback_retry_task = asyncio.create_task(_callback_retry_loop())
+
+    app.state.volume_janitor_stop = threading.Event()
+    app.state.volume_janitor_thread = threading.Thread(
+        target=_volume_janitor_loop,
+        args=(app.state.volume_janitor_stop,),
+        name="volume-janitor",
+        daemon=True,
+    )
+    app.state.volume_janitor_thread.start()
+
     logger.info(
         "Sandbox initialized: max_concurrent=%d callback_queue=%s cooldown_seconds=%.2f",
         max_concurrent,
@@ -209,6 +243,13 @@ async def shutdown() -> None:
             pass
         except Exception:
             logger.exception("Callback retry task shutdown failed")
+
+    janitor_stop: threading.Event | None = getattr(app.state, "volume_janitor_stop", None)
+    if janitor_stop is not None:
+        janitor_stop.set()
+        janitor_thread: threading.Thread | None = getattr(app.state, "volume_janitor_thread", None)
+        if janitor_thread is not None:
+            janitor_thread.join(timeout=5)
 
     executor = getattr(app.state, "compact_bench_executor", None)
     if executor is not None:
