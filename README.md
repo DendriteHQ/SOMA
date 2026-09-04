@@ -4,161 +4,178 @@
 
 ## Overview
 
-This subnet brings **MCP (Model Context Protocol) servers** into the Bittensor ecosystem, enabling AI models to securely interact with external tools, data sources, and execution environments.
+**SOMA is a Bittensor subnet focused on context compression for AI agents.**
 
-By combining MCP with Bittensor's incentive-driven design, the subnet creates a competitive environment where miners are rewarded for delivering **high-availability, low-latency, and high-quality MCP services**.
+Modern AI agents repeatedly send large amounts of context to language models: conversation history, tool outputs, repository files, previous actions, and intermediate state. As tasks become longer and more complex, this context grows rapidly, increasing inference cost and limiting how efficiently agents can operate.
+
+SOMA creates an open competition for developing better ways to compress this context.
+
+Miners build **compression algorithms, models, and hybrid approaches** designed to reduce the number of tokens processed by an agent while preserving its ability to complete real tasks.
+
+These solutions are evaluated against uncompressed baselines on real agent workloads, with performance measured across both:
+
+- **agent task quality**
+- **weighted token consumption**
+
+The strongest approaches can contribute to SOMA's production compression infrastructure.
+
+**Agent → SOMA → LLM**
 
 
 ## Vision
 
-Our goal is to build a decentralized platform of production-ready MCP servers that:
+AI agents are becoming one of the largest consumers of LLM inference.
 
-- extend AI models with real-world capabilities through standardized tool interfaces
-- enable seamless integrations across systems, databases, and APIs
-- support businesses, individual users, and other Bittensor subnets with reliable infrastructure
-- continuously improve through competition, real usage metrics, and community feedback
+Unlike simple chat interactions, agents can make dozens or hundreds of model calls while completing a single task. Each call may require sending significant parts of the agent's previous context again.
 
-The subnet aims to become the **standard for decentralized AI tooling infrastructure** - a universal platform designed for the entire Bittensor ecosystem and beyond. We're building flexible, production-ready MCP servers that any subnet, developer, or business can leverage, where quality and performance are rewarded through market-driven incentives.
+SOMA aims to build an open research and incentive layer for making those agents significantly more compute-efficient.
 
+Our long-term goals are to:
+
+- reduce the amount of context required by AI agents without degrading task performance
+- continuously discover better compression strategies through miner competition
+- combine algorithmic compression with compression models
+- evaluate compression on real agent workloads rather than static text benchmarks alone
+- support more models, agent harnesses, and inference providers
+- turn successful research into infrastructure that developers can use in production
+
+SOMA's objective is not simply to maximize compression ratio.
+
+The objective is to find the **maximum useful compression an AI agent can sustain while continuing to complete real work.**
 
 
 ## Architecture
 
 ### Platform
 
-The Platform serves as the central orchestration layer of the subnet, responsible for:
+The SOMA platform coordinates the competition and evaluation infrastructure.
 
-- **Service Management**: Hosting and ensuring availability of MCP services
-- **Algorithm Registry**: Managing and collecting models/algorithms submitted by miners
-- **Analytics Dashboard**: Providing real-time performance metrics and insights
-- **Miner Registration**: Processing and validating new miner submissions
-- **Validation Orchestration**: Coordinating task distribution across validators
-- **Quality Assessment**: Final evaluation of miner performance based on validator data
+It is responsible for:
 
-![Platform](docs/images/platform.png)
+- **Algorithm Registry**: Managing compression models and algorithms submitted by miners
+- **Miner Registration**: Associating submissions with registered miner hotkeys
+- **Competition Management**: Managing submission, screening, qualification, and evaluation cycles
+- **Evaluation Orchestration**: Coordinating agent tasks and evaluation workloads across validators
+- **Analytics Dashboard**: Providing competition and performance metrics
+- **Scoring Infrastructure**: Aggregating evaluation results used for competition rankings
+
+
 
 ### Validators
 
-Validators score miner solutions by:
-- Fetching execution results from the platform
-- Evaluatimg solution quality based on competition criteria
-- Reporting scores to the platform for weight calculation
+Validators evaluate miner compression solutions against standardized agent workloads.
 
-**Min Hardware Requirements:**
+Depending on the active competition, validators:
+
+- execute agent tasks with miner compression enabled
+- compare results against an uncompressed baseline
+- measure agent task performance
+- measure weighted token consumption
+- aggregate results across tasks and repeated runs
+- report scores used to calculate competition rankings and subnet weights
+
+The evaluation framework is designed to reward solutions that reduce inference usage **without sacrificing agent performance**.
+
+**Minimum Hardware Requirements:**
+
 - 4 CPU cores
 - 16 GB RAM
 - 500 GB SSD storage
 
 [**→ Validator Setup Guide**](docs/validator/validator-setup.md)
 
+
 ### Miners
 
+Miners develop techniques for making AI agents more token-efficient.
 
-On SOMA, any problem that can be meaningfully solved using an MCP server - and that can significantly improve agent performance - may become a competition target. Miners compete to deliver the most effective model or algorithm for a given task.
+A miner submission may use should be consistent with the [**→ Rules**](miner/README_prompting.md)
 
-
-The miner's responsibility is to design and implement model or algorithm that solves the defined problem as effectively as possible and upload it to the platform
+The miner's responsibility is to build a solution that reduces the amount of context processed by the agent while preserving its ability to successfully complete the underlying task.
 
 **All a miner needs to participate is:**
-- A working algorithm that solves the active MCP task
-- A registered hotkey on netuid 114
 
-The platform handles orchestration and evaluation. Validators automatically retrieve submitted solutions associated with registered hotkeys and score them according to the active competition criteria.
+- a working compression solution compatible with the active competition
+- a registered hotkey on netuid 114
+
+Submissions are uploaded to the SOMA platform and associated with the miner's hotkey.
+
+The platform and validators handle task execution, baseline comparison, evaluation, and scoring.
 
 [**→ Miner Setup Guide**](docs/miner/miner-setup.md)
 
 
 
 
-## Current competition: Agent CoT Compression
+## Evaluation
 
-The second MCP challenge focuses on **CoT compression** - a critical problem for reducing costs and improving quality for AI agents.
+Compression is evaluated relative to an **uncompressed baseline**.
 
-### Why context compression?
-- Lower inference costs
-- Faster responses
-- Longer effective memory windows
-- Stronger reasoning from distilled context
-- Scalable intelligence for multi-agent systems
+A miner should not receive a strong score simply because it removes a large number of tokens. The compressed agent must still be able to perform the task successfully.
+
+Evaluation therefore considers both **quality and efficiency**.
+
+Core signals include:
+
+- **Task Performance** - whether the agent successfully completes the task
+- **Weighted Token Consumption** - how many effective tokens are consumed during the run
+- **Token Savings** - reduction relative to the uncompressed baseline
+- **Quality Preservation** - whether compression causes previously successful tasks to fail
+- **Consistency** - whether results remain stable across multiple tasks and repeated runs
+
+Weighted token accounting can distinguish between different token categories such as:
+
+- input tokens
+- cached input tokens
+- output tokens
+
+This allows SOMA to evaluate the real economic impact of a compression strategy rather than relying only on raw token counts.
 
 
-### Competition Cycle
+## Competition Cycle
 
-Each competition lasts **two week** and consists of three distinct phases:
+Each competition consists of several stages.
 
-#### 1️⃣ Submission Window
 
-- Miners upload their algorithms and OpenRouter keys on the platform
-- Submissions must be associated with a registered hotkey
-- Only code submitted during this window is eligible for the current cycle
+### 1️⃣ Submission Window
 
-#### 2️⃣ Screening & Qualification Phase (During Submission Window)
+During the submission period:
 
-- Submitted solutions undergo automated validation and integrity checks
-- The platform evaluates baseline performance and technical correctness
-- A subset of **top-performing qualified submissions** is selected to advance to the main competition phase
+- miners upload their compression solutions
+- submissions are associated with registered hotkeys
+- miners can test and iterate on their approaches
+- only eligible submissions advance to evaluation
 
-This screening stage ensures:
-- Stability and security of evaluated solutions
-- Minimum quality standards
-- Efficient allocation of validator resources
 
-#### 3️⃣ Competition Phase
+### 2️⃣ Screening & Qualification
 
-- Qualified solutions are evaluated continuously under live competition conditions
-- Validators score miners according to the active task criteria
-- Final rankings are computed at the end of the cycle
+Before full evaluation, submissions go through automated checks.
+
+Screening is designed to verify that a solution:
+
+- executes correctly
+- preserves basic agent functionality
+- does not introduce unacceptable quality regressions
+- satisfies the technical and competition-specific requirements
+
+Qualification may use additional tasks to determine which submissions advance to full evaluation.
+
+
+### 3️⃣ Evaluation
+
+Qualified miners are evaluated on a larger set of agent tasks.
+
+Each miner is compared against an uncompressed baseline under the same evaluation setup.
+
+Multiple tasks and repeated runs are used where appropriate to reduce variance and provide a more reliable estimate of compression performance.
+
+
+### 4️⃣ Review & Rewards
+
+Top-performing submissions undergo additional code and integrity review.
+
+Final competition results determine subnet incentives according to the active incentive mechanism.
 
 [**→ Incentive Mechanism**](docs/miner/INCENTIVE_MECHANISM.md)
 
 
-This structure:
-
-- Encourages rapid iteration and continuous improvement
-- Prevents stagnant dominance without sustained performance
-- Ensures only stable and high-quality solutions reach the competitive stage
-- Creates predictable and recurring incentive cycles
-
-
-
-
-## Cross-Subnet Integrations
-
-SOMA is designed for seamless integration with other Bittensor subnets.
-
-> **Coming Soon**: Details about confirmed partnerships and integrations across subnets.
-
-
-
-
-## Community & Governance
-
-This subnet is **community-driven** and values transparency and collaboration:
-
-- **Cross-Subnet Partnerships**: Actively seeking integrations with complementary subnets
-- **Community Voting**: Future governance model for selecting new MCP server types
-- **Bug Bounty Program**: Planned initiative to ensure validation integrity and security
-- **Open Development**: Public roadmap and regular updates on subnet evolution
-
-### Get Involved
-
-- Join our Discord for technical discussions
-- Contribute to the GitHub repository
-- Propose new MCP server types and use cases
-- Participate in testing and feedback cycles
-
-
-## Contact
-
-- **Discord**: [Join our server](https://discord.com/invite/durr4Sg6sM)
-- **Twitter**: [@SomaSubnet](https://x.com/SomaSubnet)
-- **GitHub**: [github.com/DendriteHQ/SOMA](https://github.com/DendriteHQ/SOMA)
-- **Email**:  thesoma@dendrite.holdings
-
----
-
-<div align="center">
-
-**Built on [Bittensor](https://bittensor.com) | Powered by the Community**
-
-</div>
