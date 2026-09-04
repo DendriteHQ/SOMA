@@ -32,8 +32,6 @@ from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
 from soma_shared.db.models.swe_bench_verified_validation import SweBenchVerifiedValidation
-from soma_shared.db.models.swe_explorer_edit_validation import SweExplorerEditValidation
-from soma_shared.db.models.swe_explorer_validation import SweExplorerValidation
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
 from soma_shared.db.session import get_db_session
@@ -70,7 +68,6 @@ from app.services.swebench_screening import (
 logger = get_logger(__name__)
 router = APIRouter(tags=["validator"])
 
-_EXPLORER_METRIC_KEYS = ("precision", "recall", "f1_score", "hit_file_rate", "noise_file_rate", "weighted_core_coverage")
 _VALIDATION_PREFETCH_BATCH_SIZE = 400
 _VALIDATION_PREFETCH_REFILL_THRESHOLD = 100
 _VALIDATION_PREFETCH_CACHE_TTL_SECONDS = 30.0
@@ -181,51 +178,26 @@ async def _insert_benchmark_sub_row(
     validation_fk: int,
     benchmark_type: str,
     resolved: bool,
-    metrics: dict | None,
 ) -> None:
-    if benchmark_type == "swe_explorer_explore":
-        m = metrics or {}
-        values = {
-            "validation_fk": validation_fk,
-            **{k: float(m.get(k, 0.0)) for k in _EXPLORER_METRIC_KEYS},
-        }
-        stmt = (
-            pg_insert(SweExplorerValidation)
-            .values(**values)
-            .on_conflict_do_update(
-                index_elements=[SweExplorerValidation.validation_fk],
-                set_={k: values[k] for k in _EXPLORER_METRIC_KEYS},
-            )
+    """Record a validation's outcome in the per-benchmark result table.
+
+    ``benchmark_type`` is accepted (and logged by callers) but no longer branches:
+    every run is a ``swebench_verified`` solve-the-issue run, scored as a single
+    resolved/not-resolved outcome.
+    """
+    stmt = (
+        pg_insert(SweBenchVerifiedValidation)
+        .values(
+            validation_fk=validation_fk,
+            resolved=resolved,
+            details=None,
         )
-        await db.execute(stmt)
-    elif benchmark_type == "swe_explorer_edit":
-        stmt = (
-            pg_insert(SweExplorerEditValidation)
-            .values(
-                validation_fk=validation_fk,
-                resolved=resolved,
-                details=None,
-            )
-            .on_conflict_do_update(
-                index_elements=[SweExplorerEditValidation.validation_fk],
-                set_={"resolved": resolved, "details": None},
-            )
+        .on_conflict_do_update(
+            index_elements=[SweBenchVerifiedValidation.validation_fk],
+            set_={"resolved": resolved, "details": None},
         )
-        await db.execute(stmt)
-    else:
-        stmt = (
-            pg_insert(SweBenchVerifiedValidation)
-            .values(
-                validation_fk=validation_fk,
-                resolved=resolved,
-                details=None,
-            )
-            .on_conflict_do_update(
-                index_elements=[SweBenchVerifiedValidation.validation_fk],
-                set_={"resolved": resolved, "details": None},
-            )
-        )
-        await db.execute(stmt)
+    )
+    await db.execute(stmt)
 
 
 def _model_attr(model: type, name: str):
@@ -1174,7 +1146,6 @@ async def get_swebench_validation(
                 validation_fk=int(validation_row.id),
                 benchmark_type=str(run_row.benchmark_type),
                 resolved=False,
-                metrics=None,
             )
             validation_row.scored_at = now
             if logs_col is not None:
@@ -1211,7 +1182,6 @@ async def get_swebench_validation(
                 validation_fk=int(validation_row.id),
                 benchmark_type=str(run_row.benchmark_type),
                 resolved=False,
-                metrics=None,
             )
             validation_row.scored_at = now
             if logs_col is not None:
@@ -1363,7 +1333,6 @@ async def submit_swebench_validation_score(
         validation_fk=int(validation_row.id),
         benchmark_type=str(_run_row.benchmark_type),
         resolved=bool(payload.resolved),
-        metrics=payload.metrics,
     )
     if logs_col is not None:
         validation_row.logs = payload.logs

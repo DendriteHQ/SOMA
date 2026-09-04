@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -68,6 +69,17 @@ DEFAULT_PLUGIN_REPOSITORY_URL = "https://github.com/DendriteHQ/SOMA-plugin.git"
 COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_RETENTION_SECONDS"
 COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS"
 COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV = "COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS"
+SOMA_TASKS_FILE_ENV = "SOMA_TASKS_FILE"
+SOMA_TASK_DIND_PREBAKED_REPO_ENV = "SOMA_TASK_DIND_PREBAKED_REPO"
+# Docker Hub repo the pre-baked dind image of a SOMA task is pulled from. Without
+# this, SOMA-benchmark derives the repo from the task row's own env image reference,
+# which points at the build-time repo rather than the one the competition serves.
+DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO = "dendritexhq/soma-competition-tasks-dind"
+# Default location of the SOMA task rows inside the checkout, resolved from this file
+# rather than the cwd. The file is provisioned onto sandbox hosts rather than committed
+# (it carries the hidden tasks' problem statements) - see
+# docs/ops/soma-task-provisioning.md.
+DEFAULT_SOMA_TASKS_FILE = Path(__file__).resolve().parents[2] / "tasks" / "soma_tasks.jsonl"
 COMPACT_BENCH_DEFAULT_OUTPUT_RETENTION_SECONDS = 24 * 60 * 60
 COMPACT_BENCH_DEFAULT_OUTPUT_CLEANUP_INTERVAL_SECONDS = 5 * 60
 
@@ -615,134 +627,71 @@ def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
     cache_path.write_bytes(payload)
     return cache_path
 
-_EXPLORE_RESULT_FILENAME = "explore-result.json"
-_WORKSPACE_PREFIX = "/workspace/"
+
+def _resolve_soma_tasks_file() -> Path:
+    configured = (os.getenv(SOMA_TASKS_FILE_ENV) or "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_SOMA_TASKS_FILE
 
 
-def _strip_workspace_prefix(regions_json: str) -> str:
-    """Remove /workspace/ prefix from path fields in a regions JSON array."""
-    try:
-        regions = json.loads(regions_json)
-        if not isinstance(regions, list):
-            return regions_json
-        changed = False
-        for region in regions:
-            if isinstance(region, dict):
-                path = region.get("path", "")
-                if isinstance(path, str) and path.startswith(_WORKSPACE_PREFIX):
-                    region["path"] = path[len(_WORKSPACE_PREFIX):]
-                    changed = True
-        return json.dumps(regions, ensure_ascii=False) if changed else regions_json
-    except (json.JSONDecodeError, TypeError):
-        return regions_json
+def _materialize_soma_task_cache() -> dict[str, int]:
+    """Make the SOMA task rows resolvable offline by `benchmark-solve --benchmark`.
 
+    A SOMA task list is not a Hugging Face dataset: it is a local JSONL whose rows
+    carry their own env/test images. SOMA-benchmark handles that by writing the rows
+    into the same on-disk row cache its runner already prefers over the datasets
+    server, keyed by the benchmark name (`soma_tasks.materialize_task_cache`, exposed
+    as the `benchmark-load-tasks` command). Doing it here, at service start, means the
+    platform can dispatch a SOMA benchmark name without a separate provisioning step
+    having been run on this host first.
 
-def _read_explore_result_file(tmp_run_dir: str) -> str:
-    """Read regions JSON written by the agent to /workspace/explore-result.json.
-
-    The copilot backend snapshots the workspace volume to
-    ``tmp_run_dir/patch-eval/workspace-snapshot/`` before cleanup, so the file
-    is accessible on the host at that path after the run completes.
-    Returns the raw JSON string if valid, empty string otherwise.
+    Rows are grouped by their own `benchmark_name`, so one file can serve several
+    benchmark names. Missing file is not an error: a sandbox host that only ever runs
+    SWE-bench Verified has nothing to materialize.
     """
-    if not tmp_run_dir:
-        return ""
-    candidate = Path(tmp_run_dir) / "patch-eval" / "workspace-snapshot" / _EXPLORE_RESULT_FILENAME
-    if not candidate.is_file():
-        return ""
-    try:
-        text = candidate.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-    if not text:
-        return ""
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list):
-            return text
-    except json.JSONDecodeError:
-        pass
-    return ""
+    tasks_file = _resolve_soma_tasks_file()
+    if not tasks_file.is_file():
+        logger.info(
+            "No SOMA task file at %s; only Hugging Face benchmarks will resolve on this host "
+            "(set %s to override the path)",
+            tasks_file,
+            SOMA_TASKS_FILE_ENV,
+        )
+        return {}
 
+    from soma_bench.benchmark.soma_tasks import (
+        DEFAULT_BENCHMARK_NAME,
+        load_task_rows,
+        materialize_task_cache,
+    )
 
-def _extract_text_from_event(event: dict) -> str:
-    """Return the human-readable text payload from a trajectory event, or ''."""
-    data = event.get("data") or {}
-    text = data.get("message") or data.get("text") or ""
-    if not text:
-        content = data.get("content")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            text = "\n".join(parts)
-    if not text:
-        result = data.get("result")
-        if isinstance(result, dict):
-            rc = result.get("content")
-            if isinstance(rc, str):
-                text = rc
-    return text if isinstance(text, str) else ""
+    rows = load_task_rows(tasks_file)
+    rows_by_benchmark: dict[str, list[dict]] = {}
+    for row in rows:
+        benchmark_name = str(row.get("benchmark_name") or "").strip() or DEFAULT_BENCHMARK_NAME
+        rows_by_benchmark.setdefault(benchmark_name, []).append(row)
 
+    materialized: dict[str, int] = {}
+    with tempfile.TemporaryDirectory(prefix="soma-task-cache-") as staging_dir:
+        for benchmark_name, benchmark_rows in rows_by_benchmark.items():
+            # materialize_task_cache() takes a file, and each benchmark name needs its
+            # own cache entry, so each group is staged as its own single-benchmark file.
+            staged = Path(staging_dir) / f"{_slug(benchmark_name, default='benchmark')}.jsonl"
+            staged.write_text(
+                "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in benchmark_rows),
+                encoding="utf-8",
+            )
+            summary = materialize_task_cache(
+                tasks_path=staged,
+                benchmark_name=benchmark_name,
+            )
+            materialized[benchmark_name] = int(summary["row_count"])
 
-def _extract_explore_regions_json(trajectory_path: str) -> str:
-    """Fallback: extract regions JSON from trajectory JSONL by scanning events.
-
-    Prefers events whose full text IS a valid JSON list. Falls back to finding
-    the last fenced or bare JSON array of objects within an event.
-    Scans both assistant.message and tool.execution_complete events.
-    """
-    import re as _re
-    if not trajectory_path:
-        return ""
-    path = Path(trajectory_path)
-    if not path.is_file():
-        return ""
-
-    SCAN_TYPES = {"assistant.message", "tool.execution_complete"}
-    last_exact: str = ""
-    last_embedded: str = ""
-
-    with path.open(encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") not in SCAN_TYPES:
-                continue
-            text = _extract_text_from_event(event).strip()
-            if not text:
-                continue
-
-            # Best case: the entire event text is the JSON array
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, list):
-                    last_exact = text
-                    continue
-            except json.JSONDecodeError:
-                pass
-
-            # Second pass: find the last fenced or bare array of objects
-            for m in _re.finditer(r'```(?:json)?\s*(\[[\s\S]*?\])\s*```|(\[[\s\S]*?\])', text):
-                candidate = (m.group(1) or m.group(2) or "").strip()
-                try:
-                    parsed = json.loads(candidate)
-                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-                        last_embedded = candidate
-                except (json.JSONDecodeError, IndexError):
-                    continue
-
-    return last_exact or last_embedded
+    logger.info(
+        "Materialized SOMA task row cache from %s: %s",
+        tasks_file,
+        materialized,
+    )
+    return materialized
 
 
 class CompactBenchExecutor:
@@ -790,7 +739,24 @@ class CompactBenchExecutor:
 
         self._preload_plugin_template()
         self._preload_tiktoken_cache()
+        self._soma_task_benchmarks = self._preload_soma_task_cache()
         self._ensure_copilot_shared_proxy_stack()
+
+    def _preload_soma_task_cache(self) -> dict[str, int]:
+        """Materialize the SOMA task rows once, at start, rather than per run.
+
+        A failure here must not stop the service: SWE-bench Verified runs do not
+        depend on it, and a SOMA run that finds no cached row fails on its own with a
+        clear "instance not found in benchmark" error from the runner.
+        """
+        try:
+            return _materialize_soma_task_cache()
+        except Exception:
+            logger.exception(
+                "Failed to materialize the SOMA task row cache; SOMA task runs will not "
+                "resolve on this host until it is fixed"
+            )
+            return {}
 
     def _ensure_copilot_shared_proxy_stack(self) -> None:
         if not self._copilot_shared_proxy_enabled:
@@ -1116,6 +1082,12 @@ class CompactBenchExecutor:
             if plugin_path is not None:
                 env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
                 env["SOMA_OPENCLAW_PLUGIN_PATH"] = str(plugin_path)
+            # setdefault, so a host that configures its own repo keeps it. Pulling from
+            # it needs DOCKERHUB_USERNAME/DOCKERHUB_TOKEN in the service environment
+            # while the repo is private; both are inherited through os.environ above.
+            env.setdefault(
+                SOMA_TASK_DIND_PREBAKED_REPO_ENV, DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO
+            )
 
             started_at = time.monotonic()
             logger.info(
@@ -1216,12 +1188,7 @@ class CompactBenchExecutor:
             patch_path = patch_capture.get("patch_path") if isinstance(patch_capture, dict) else None
             patch_capture_status = False
             patch_text = ""
-            if task.benchmark_type == "swe_explorer_explore":
-                regions_json = _read_explore_result_file(tmp_run_dir) or _extract_explore_regions_json(trajectory_path)
-                if regions_json:
-                    patch_capture_status = True
-                    patch_text = _strip_workspace_prefix(regions_json)
-            elif isinstance(patch_path, str) and patch_path.strip():
+            if isinstance(patch_path, str) and patch_path.strip():
                 patch_file = Path(patch_path)
                 if patch_file.is_file():
                     patch_capture_status = True
@@ -1454,9 +1421,9 @@ class CompactBenchExecutor:
             if task.agent_name != "openclaw":
                 self._cleanup_copilot_run_resources(run_id=task.run_id, output_dir=output_dir)
             if 'tmp_run_dir' in locals() and tmp_run_dir:
-                # tmp_run_dir is the copilot backend's own run directory (holds the workspace
-                # snapshot used above to read the explore result) - it lives outside output_dir
-                # under soma-benchmark-copilot-runs and is otherwise never cleaned up.
+                # tmp_run_dir is the copilot backend's own run directory - it lives outside
+                # output_dir under soma-benchmark-copilot-runs and is otherwise never
+                # cleaned up.
                 if self._debug_preserve_outputs:
                     logger.info(
                         "Keeping copilot run directory for debug inspection: run_id=%s tmp_run_dir=%s",

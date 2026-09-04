@@ -19,13 +19,12 @@ from app.services.blob.s3 import S3BlobStorage
 from app.services.blob.text_artifact_storage import TextArtifactStorage
 from app.services.blob.trajectory_artifact_storage import TrajectoryArtifactStorage
 from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
+from app.services import benchmarks as benchmark_registry
 from app.services import swebench_screening as screening_shared
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
 from soma_shared.db.models.swe_bench_verified_validation import SweBenchVerifiedValidation
-from soma_shared.db.models.swe_explorer_validation import SweExplorerValidation
-from soma_shared.db.models.swe_explorer_edit_validation import SweExplorerEditValidation
 from soma_shared.db.models.competition import Competition
 from soma_shared.db.models.competition_config import CompetitionConfig
 from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
@@ -34,10 +33,11 @@ from soma_shared.db.session import get_db_session, get_engine
 
 logger = get_logger(__name__)
 
-_BENCHMARK_TYPES = ("swebench_verified", "swe_explorer_explore", "swe_explorer_edit")
-# Two-stage screening evaluates all benchmark types (verified + both explorer
-# variants), not verified-only.
-_SCREENING_BENCHMARK_TYPES = ("swebench_verified", "swe_explorer_explore", "swe_explorer_edit")
+# Every run is a solve-the-issue run. What varies between tasks is the dataset the
+# instance comes from (swe_bench_tasks.benchmark_name), not the benchmark type - see
+# app/services/benchmarks.py.
+_BENCHMARK_TYPES = benchmark_registry.BENCHMARK_TYPES
+_SCREENING_BENCHMARK_TYPES = benchmark_registry.BENCHMARK_TYPES
 
 # Screening tiers on swe_bench_tasks.screener_stage.
 _STAGE1 = 1  # liveness / non-regression gate, public tasks, upload window
@@ -477,34 +477,17 @@ def _derive_run_quality_and_resolved(
     benchmark_type: str,
     *,
     verified_resolved: bool | None,
-    edit_resolved: bool | None,
-    explore_f1: float | None,
-    explore_hit: float | None,
-    explore_noise: float | None,
 ) -> tuple[bool | None, float | None]:
-    """Resolve a validation row into (resolved, quality) per benchmark type.
+    """Resolve a validation row into (resolved, quality).
 
-    - verified: resolved from the verified validation table
-    - edit:     resolved from the edit validation table
-    - explore:  resolved := f1_score > 0; quality := hit_file_rate - noise_file_rate
+    ``resolved`` comes from the verified validation table; quality is that boolean as
+    a 0..1 fraction.
     """
-    if benchmark_type == "swe_explorer_explore":
-        resolved = None if explore_f1 is None else (float(explore_f1) > 0.0)
-        quality = screening_shared.quality_for_benchmark_type(
-            benchmark_type,
-            resolved=None,
-            hit_file_rate=explore_hit,
-            noise_file_rate=explore_noise,
-        )
-        return resolved, quality
-    resolved = edit_resolved if benchmark_type == "swe_explorer_edit" else verified_resolved
     quality = screening_shared.quality_for_benchmark_type(
         benchmark_type,
-        resolved=resolved,
-        hit_file_rate=None,
-        noise_file_rate=None,
+        resolved=verified_resolved,
     )
-    return resolved, quality
+    return verified_resolved, quality
 
 
 def _screening_validation_columns() -> tuple:
@@ -513,10 +496,6 @@ def _screening_validation_columns() -> tuple:
     output_tokens_col = _model_attr(SweBenchRun, "output_tokens")
     return (
         SweBenchVerifiedValidation.resolved.label("verified_resolved"),
-        SweExplorerEditValidation.resolved.label("edit_resolved"),
-        SweExplorerValidation.f1_score.label("explore_f1"),
-        SweExplorerValidation.hit_file_rate.label("explore_hit"),
-        SweExplorerValidation.noise_file_rate.label("explore_noise"),
         SweBenchRun.tokens_used,
         (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
         (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
@@ -525,20 +504,11 @@ def _screening_validation_columns() -> tuple:
 
 
 def _apply_validation_joins(stmt):
-    return (
-        stmt.join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
-        .outerjoin(
-            SweBenchVerifiedValidation,
-            SweBenchVerifiedValidation.validation_fk == SweBenchRunValidation.id,
-        )
-        .outerjoin(
-            SweExplorerEditValidation,
-            SweExplorerEditValidation.validation_fk == SweBenchRunValidation.id,
-        )
-        .outerjoin(
-            SweExplorerValidation,
-            SweExplorerValidation.validation_fk == SweBenchRunValidation.id,
-        )
+    return stmt.join(
+        SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id
+    ).outerjoin(
+        SweBenchVerifiedValidation,
+        SweBenchVerifiedValidation.validation_fk == SweBenchRunValidation.id,
     )
 
 
@@ -574,10 +544,6 @@ async def _load_screening_baseline_states(
         _resolved, quality = _derive_run_quality_and_resolved(
             benchmark_type,
             verified_resolved=row["verified_resolved"],
-            edit_resolved=row["edit_resolved"],
-            explore_f1=row["explore_f1"],
-            explore_hit=row["explore_hit"],
-            explore_noise=row["explore_noise"],
         )
         weighted = _weighted_tokens_for_screening(
             total_tokens=_coerce_optional_int(row["tokens_used"]),
@@ -634,10 +600,6 @@ async def _load_screening_miner_run_states(
         resolved, quality = _derive_run_quality_and_resolved(
             benchmark_type,
             verified_resolved=row["verified_resolved"],
-            edit_resolved=row["edit_resolved"],
-            explore_f1=row["explore_f1"],
-            explore_hit=row["explore_hit"],
-            explore_noise=row["explore_noise"],
         )
         weighted = _weighted_tokens_for_screening(
             total_tokens=_coerce_optional_int(row["tokens_used"]),
@@ -1603,6 +1565,7 @@ async def _dispatch_due_runs(
                             t.id AS task_id,
                             t.competition_fk,
                             t.instance_id,
+                            t.benchmark_name,
                             t.planned_repeats,
                             t.is_screener,
                             t.screener_stage,
@@ -1686,6 +1649,7 @@ async def _dispatch_due_runs(
                         rc.task_id,
                         rc.competition_fk,
                         rc.instance_id,
+                        rc.benchmark_name,
                         rc.planned_repeats,
                         rc.is_screener,
                         rc.screener_stage
@@ -1906,10 +1870,20 @@ async def _dispatch_due_runs(
         ) -> tuple[dict, int, bool, str | None, bool]:
             row, run_id, script_presigned_url, trajectory_presigned_url, compression_logs_presigned_url = prepared
             try:
-                run_benchmark_type = str(row.get("benchmark_type") or "swebench_verified")
+                run_benchmark_type = str(
+                    row.get("benchmark_type") or benchmark_registry.BENCHMARK_TYPE_VERIFIED
+                )
+                # The dataset comes from the task row, not from one global setting: a
+                # competition mixes SWE-bench Verified screener tasks with SOMA task
+                # lists, and the sandbox resolves the instance from whichever the name
+                # selects.
+                run_benchmark = benchmark_registry.resolve_benchmark_name(
+                    row.get("benchmark_name"),
+                    screener_stage=_coerce_optional_int(row.get("screener_stage")),
+                )
                 ok, error, retryable = await manager.dispatch_swebench_run(
                     run_id=run_id,
-                    benchmark=str(settings.swebench_benchmark_name),
+                    benchmark=run_benchmark,
                     instance_id=str(row["instance_id"]),
                     storage_uuid=str(row["diff_storage_uuid"]),
                     script_presigned_url=script_presigned_url,
@@ -1924,6 +1898,8 @@ async def _dispatch_due_runs(
                         "baseline_run": bool(row["baseline_run"]),
                         "is_screener": bool(row["is_screener"]),
                         "benchmark_type": run_benchmark_type,
+                        "benchmark_name": run_benchmark,
+                        "screener_stage": _coerce_optional_int(row.get("screener_stage")),
                     },
                 )
                 return row, run_id, bool(ok), error, bool(retryable)

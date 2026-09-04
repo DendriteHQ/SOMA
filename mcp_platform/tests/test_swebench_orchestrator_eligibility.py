@@ -135,25 +135,16 @@ def test_split_tasks_by_stage() -> None:
     assert [t.id for t in eval_tasks] == [3, 4]
 
 
-def test_derive_run_quality_and_resolved_per_benchmark_type() -> None:
+def test_derive_run_quality_and_resolved() -> None:
     assert orchestrator._derive_run_quality_and_resolved(
-        "swebench_verified", verified_resolved=True, edit_resolved=None,
-        explore_f1=None, explore_hit=None, explore_noise=None,
+        "swebench_verified", verified_resolved=True
     ) == (True, 1.0)
     assert orchestrator._derive_run_quality_and_resolved(
-        "swe_explorer_edit", verified_resolved=None, edit_resolved=False,
-        explore_f1=None, explore_hit=None, explore_noise=None,
+        "swebench_verified", verified_resolved=False
     ) == (False, 0.0)
-    resolved, quality = orchestrator._derive_run_quality_and_resolved(
-        "swe_explorer_explore", verified_resolved=None, edit_resolved=None,
-        explore_f1=0.4, explore_hit=0.8, explore_noise=0.3,
-    )
-    assert resolved is True
-    assert quality == pytest.approx(0.5)
     # Not scored -> resolved/quality None (incompleteness signal).
     assert orchestrator._derive_run_quality_and_resolved(
-        "swe_explorer_explore", verified_resolved=None, edit_resolved=None,
-        explore_f1=None, explore_hit=None, explore_noise=None,
+        "swebench_verified", verified_resolved=None
     ) == (None, None)
 
 

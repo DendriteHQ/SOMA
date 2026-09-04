@@ -5,19 +5,25 @@ This document describes the current SWE scoring logic implemented in
 
 ## Task types and scoring paths
 
-There are three benchmark task types:
+There is one benchmark task type, `swebench_verified`: the agent is given an issue and
+must produce a patch, which is graded against the task's own tests.
 
-1. `swebench_verified`
-2. `swe_explorer_edit`
-3. `swe_explorer_explore`
+A competition mixes two kinds of task under it, which differ only in where the instance
+and its images come from — screener stage 1 uses the public SWE-bench Verified dataset,
+while screener stage 2 and full evaluation use SOMA task lists whose rows ship their own
+env/test images. Both score through the same path below:
+`compute_swe_task_score`, `build_swe_miner_scores`, and `build_swe_miner_total_score`.
 
-Scoring is split into two paths:
+Where the graded result comes from differs per kind, and is the validator's concern
+rather than scoring's:
 
-- `swebench_verified` and `swe_explorer_edit` use the same SWE task-score path:
-  `compute_swe_task_score`, `build_swe_miner_scores`, and
-  `build_swe_miner_total_score`.
-- `swe_explorer_explore` uses a separate explore-quality path:
-  `compute_explore_task_score` and `compute_explore_miner_total_score`.
+- SWE-bench Verified instances are graded by the SWE-bench harness
+  (`validator/evaluation/swebench_evaluator.py`).
+- SOMA tasks are graded by running the task's own test image
+  (`validator/evaluation/soma_task_evaluator.py`).
+
+Either way the validator reports one `resolved` boolean per run, which is what this
+document's `x` and `y` counts are built from.
 
 ## Token counting
 
@@ -49,11 +55,6 @@ Current behavior of `compute_weighted_tokens`:
   token count is negative.
 
 ## SWE path
-
-This path is used for:
-
-- `swebench_verified`
-- `swe_explorer_edit`
 
 ### Per-task scoring inputs
 
@@ -246,116 +247,3 @@ S_N = \frac{2S_C+1}{7}
 
 This normalized value is consumed by downstream category and leaderboard
 scoring.
-
-## Explore path
-
-This path is used for:
-
-- `swe_explorer_explore`
-
-Explore scoring has a different objective: preserve exploration quality while
-reducing weighted token usage.
-
-### Per-task explore score
-
-The per-task score is calculated by `compute_explore_task_score`.
-
-### Exploration quality
-
-Let:
-
-- `f` be the hit-file rate,
-- `n` be the noise-file rate.
-
-Quality is:
-
-```math
-q = f-n
-```
-
-The quality margin is:
-
-```math
-m = q_A-q_B
-```
-
-Where:
-
-- `q_A` is miner quality.
-- `q_B` is baseline quality.
-
-The default quality threshold is:
-
-```math
-\delta = 0.20
-```
-
-### Hard quality floor
-
-If `m <= -delta`, the task receives the hard-floor score:
-
-```math
-s_E = -2
-```
-
-### Quality-aware token score
-
-Otherwise, a smooth quality gate `g` in `[0, 1]` is computed:
-
-```math
-g = 3r^2 - 2r^3
-```
-
-where:
-
-```math
-r = \max\left(0,\min\left(\frac{m+\delta}{2\delta},1\right)\right)
-```
-
-This gate is used asymmetrically:
-
-- for token savings, it unlocks reward as quality improves;
-- for token overspend, it softens the penalty as quality improves.
-
-The token term is:
-
-```math
-\tau = \max\left(-2,\min\left(2\log_2\left(\frac{T_B}{T_A}\right),2\right)\right)
-```
-
-Let:
-
-```math
-\eta = 0.25
-```
-
-The final per-task explore score is:
-
-```math
-s_E =
-\begin{cases}
-g\tau & \text{if } \tau \ge 0 \\
-\left(\eta + (1-\eta)(1-g)\right)\tau & \text{if } \tau < 0
-\end{cases}
-```
-
-This means:
-
-- when the miner saves tokens, better quality is required to unlock the reward;
-- when the miner uses more tokens than baseline, better quality reduces the
-  size of the penalty, but does not remove it entirely;
-- once the miner quality margin drops to `m <= -delta`, the hard floor still
-  applies.
-
-## Explore miner aggregation
-
-Miner-level explore aggregation is performed by
-`compute_explore_miner_total_score`.
-
-The aggregate:
-
-1. starts from the mean of the per-task explore scores,
-2. applies the hard floor only if the miner is worse than baseline on both
-   average quality margin and total weighted token usage,
-3. otherwise keeps the per-task mean unchanged,
-4. normalizes the resulting score to `[-1, 1]`.

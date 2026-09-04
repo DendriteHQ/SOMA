@@ -1,5 +1,6 @@
 from math import isclose
 
+import app.services.incentive_calculator as incentive_calculator
 from app.services.incentive_calculator import (
     BENCHMARK_TYPES,
     build_incentive_layers,
@@ -7,89 +8,51 @@ from app.services.incentive_calculator import (
 )
 
 
-def test_build_incentive_layers_for_three_benchmarks() -> None:
+def test_build_incentive_layers_for_the_single_benchmark() -> None:
     layers = build_incentive_layers(list(BENCHMARK_TYPES))
 
-    assert layers == (
-        (("swebench_verified", "swe_explorer_explore", "swe_explorer_edit"),),
-        (
-            ("swebench_verified", "swe_explorer_explore"),
-            ("swebench_verified", "swe_explorer_edit"),
-            ("swe_explorer_explore", "swe_explorer_edit"),
-        ),
-        (
-            ("swebench_verified",),
-            ("swe_explorer_explore",),
-            ("swe_explorer_edit",),
-        ),
-    )
+    assert layers == ((("swebench_verified",),),)
 
 
-def test_layer_and_element_weights_are_static() -> None:
+def test_single_benchmark_layer_takes_the_whole_weight() -> None:
+    """With one benchmark type the sole singles layer absorbs the full weight.
+
+    ``_layer_weights_for`` renormalizes the static per-subset-size weights over the
+    layers that actually exist, so the 0.30 the singles layer carries in a
+    three-benchmark configuration becomes 1.0 here rather than leaving 0.70 unassigned.
+    """
     result = calculate_incentive_weights(
         {"A": {benchmark: 1.0 for benchmark in BENCHMARK_TYPES}},
         BENCHMARK_TYPES,
         burn_ratio=0.0,
     )
 
-    assert isclose(result.layers[0].layer_weight, 0.25)
-    assert isclose(result.layers[1].layer_weight, 0.45)
-    assert isclose(result.layers[2].layer_weight, 0.30)
-    assert isclose(result.layers[0].element_weight, 0.25)
-    assert isclose(result.layers[1].element_weight, 0.15)
-    assert isclose(result.layers[2].element_weight, 0.10)
-    assert isclose(sum(layer.layer_weight for layer in result.layers), 1.0)
+    assert len(result.layers) == 1
+    assert isclose(result.layers[0].layer_weight, 1.0)
+    assert isclose(result.layers[0].element_weight, 1.0)
+    assert isclose(sum(result.layers[0].element_weight for _ in result.layers), 1.0)
 
 
-def test_calculate_incentive_weights_uses_benchmark_weighted_subsets() -> None:
+def test_calculate_incentive_weights_awards_the_best_scorer() -> None:
     result = calculate_incentive_weights(
         {
-            "A": {
-                "swebench_verified": 0.8,
-                "swe_explorer_explore": 0.2,
-                "swe_explorer_edit": 0.0,
-            },
-            "B": {
-                "swebench_verified": 0.4,
-                "swe_explorer_explore": 0.8,
-                "swe_explorer_edit": 0.6,
-            },
+            "A": {"swebench_verified": 0.8},
+            "B": {"swebench_verified": 0.4},
         },
         BENCHMARK_TYPES,
         burn_ratio=0.5,
     )
 
-    # L0 uses S_bench = 0.50*v + 0.25*x + 0.25*e: A=0.45, B=0.55 -> B wins.
-    triple = result.layers[0].elements[0]
-    assert triple.winners == ("B",)
-    assert isclose(triple.winning_score, 0.55)
-
-    # Pairs renormalize the base weights over subset members.
-    pair_winners = {element.subset: element.winners for element in result.layers[1].elements}
-    assert pair_winners[("swebench_verified", "swe_explorer_explore")] == ("A",)
-    assert pair_winners[("swebench_verified", "swe_explorer_edit")] == ("A",)
-    assert pair_winners[("swe_explorer_explore", "swe_explorer_edit")] == ("B",)
-
-    single_winners = {element.subset: element.winners for element in result.layers[2].elements}
-    assert single_winners[("swebench_verified",)] == ("A",)
-    assert single_winners[("swe_explorer_explore",)] == ("B",)
-    assert single_winners[("swe_explorer_edit",)] == ("B",)
-
-    # A: (v,x)+(v,e)+v = 0.15+0.15+0.10; B: L0+(x,e)+x+e = 0.25+0.15+0.10+0.10.
-    assert isclose(result.raw_weights["A"], 0.40)
-    assert isclose(result.raw_weights["B"], 0.60)
-    assert isclose(sum(result.final_weights.values()), 0.5)
+    assert result.layers[0].elements[0].winners == ("A",)
+    assert isclose(result.layers[0].elements[0].winning_score, 0.8)
+    assert isclose(result.raw_weights["A"], 1.0)
+    assert "B" not in result.raw_weights
+    assert isclose(result.final_weights["A"], 0.5)
     assert isclose(result.burn_weight, 0.5)
-    assert isclose(result.final_weights["A"], 0.20)
-    assert isclose(result.final_weights["B"], 0.30)
 
 
 def test_calculate_incentive_weights_splits_ties() -> None:
-    scores = {
-        "swebench_verified": 0.5,
-        "swe_explorer_explore": 0.5,
-        "swe_explorer_edit": 0.5,
-    }
+    scores = {benchmark: 0.5 for benchmark in BENCHMARK_TYPES}
     result = calculate_incentive_weights(
         {"A": dict(scores), "B": dict(scores)},
         BENCHMARK_TYPES,
@@ -106,36 +69,18 @@ def test_calculate_incentive_weights_splits_ties() -> None:
 def test_calculate_incentive_weights_requires_complete_subset_scores() -> None:
     result = calculate_incentive_weights(
         {
-            "A": {
-                "swebench_verified": 0.1,
-                "swe_explorer_explore": 0.1,
-                "swe_explorer_edit": 0.1,
-            },
-            # B has no swe_explorer_edit score: it cannot compete on any
-            # subset containing that benchmark.
-            "B": {
-                "swebench_verified": 1.0,
-                "swe_explorer_explore": 1.0,
-            },
+            "A": {"swebench_verified": 0.1},
+            # B has no score at all: it cannot compete, even though it would have
+            # outranked A on any benchmark it did have a score for.
+            "B": {},
         },
         BENCHMARK_TYPES,
         burn_ratio=0.0,
     )
 
-    triple = result.layers[0].elements[0]
-    assert triple.winners == ("A",)
-
-    edit_elements = [
-        element
-        for layer in result.layers
-        for element in layer.elements
-        if "swe_explorer_edit" in element.subset
-    ]
-    assert all(element.winners == ("A",) for element in edit_elements)
-
-    # A: L0 + (v,e) + (x,e) + e; B: (v,x) + v + x.
-    assert isclose(result.raw_weights["A"], 0.25 + 0.15 + 0.15 + 0.10)
-    assert isclose(result.raw_weights["B"], 0.15 + 0.10 + 0.10)
+    assert result.layers[0].elements[0].winners == ("A",)
+    assert isclose(result.raw_weights["A"], 1.0)
+    assert "B" not in result.raw_weights
     assert isclose(sum(result.final_weights.values()), 1.0)
 
 
@@ -145,3 +90,46 @@ def test_calculate_incentive_weights_burns_everything_without_scores() -> None:
     assert result.raw_weights == {}
     assert result.final_weights == {}
     assert isclose(result.burn_weight, 1.0)
+
+
+def test_subset_machinery_still_generalizes_to_several_benchmarks(monkeypatch) -> None:
+    """The layer/subset maths stays correct for more than one benchmark type.
+
+    Only ``swebench_verified`` is in use, so this drives the machinery with an
+    explicit tuple instead of ``BENCHMARK_TYPES``. It guards the property that makes
+    adding a benchmark type back a configuration change rather than a rewrite: layer
+    weights keyed by subset size, and per-subset scores weighted by
+    ``BENCHMARK_WEIGHTS`` renormalized over the subset's members.
+    """
+    types = ("swebench_verified", "benchmark_x")
+    monkeypatch.setattr(
+        incentive_calculator,
+        "BENCHMARK_WEIGHTS",
+        {"swebench_verified": 0.5, "benchmark_x": 0.5},
+    )
+
+    layers = build_incentive_layers(list(types))
+    assert layers == (
+        (("swebench_verified", "benchmark_x"),),
+        (("swebench_verified",), ("benchmark_x",)),
+    )
+
+    result = calculate_incentive_weights(
+        {
+            "A": {"swebench_verified": 0.8, "benchmark_x": 0.2},
+            "B": {"swebench_verified": 0.4, "benchmark_x": 0.9},
+        },
+        types,
+        burn_ratio=0.0,
+    )
+
+    # Pair layer: A=0.50, B=0.65 -> B wins. Singles split A (verified) / B (x).
+    assert result.layers[0].elements[0].winners == ("B",)
+    single_winners = {element.subset: element.winners for element in result.layers[1].elements}
+    assert single_winners[("swebench_verified",)] == ("A",)
+    assert single_winners[("benchmark_x",)] == ("B",)
+
+    # Layer weights: pairs 0.45 and singles 0.30 renormalized over the two layers.
+    assert isclose(result.layers[0].layer_weight, 0.45 / 0.75)
+    assert isclose(result.layers[1].layer_weight, 0.30 / 0.75)
+    assert isclose(sum(result.final_weights.values()), 1.0)
