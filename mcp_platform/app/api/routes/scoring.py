@@ -64,31 +64,6 @@ def compute_weighted_tokens(
     )
 
 
-EXPLORE_QUALITY_DELTA = 0.20
-EXPLORE_SCORE_FLOOR = -2.0
-EXPLORE_NEGATIVE_TAU_QUALITY_FLOOR = 0.25
-
-
-def _normalize_explore_score(score: float | None) -> float | None:
-    """Normalize an explore score to [-1, 1].
-
-    compute_explore_task_score returns a raw score in [-2, 2], either by
-    quality-gating positive token savings or by scaling negative token
-    penalties down as quality improves. The aggregate produced by
-    compute_explore_miner_total_score therefore also lives in [-2, 2]. That
-    makes normalization a simple halving; the clamp is just a safety net
-    against floating point drift.
-    """
-    if score is None:
-        return None
-    return max(-1.0, min(1.0, score / 2.0))
-
-
-def _smoothstep_unit_interval(value: float) -> float:
-    clamped = max(0.0, min(1.0, value))
-    return (3 * clamped**2) - (2 * clamped**3)
-
-
 def _normalize_to_unit_interval(
     score: float | None,
     score_min: float,
@@ -109,75 +84,6 @@ def _normalize_to_unit_interval(
     clamped = max(score_min, min(score_max, score))
     span = score_max - score_min
     return ((clamped - score_min) / span) * 2.0 - 1.0
-
-
-def compute_explore_task_score(
-    miner_quality: float | None,
-    baseline_quality: float | None,
-    miner_weighted_tokens: float | None,
-    baseline_weighted_tokens: float | None,
-    *,
-    delta: float = EXPLORE_QUALITY_DELTA,
-    floor: float = EXPLORE_SCORE_FLOOR,
-) -> float | None:
-    """Per-task explore score: quality gates rewards and softens penalties.
-
-    miner_quality/baseline_quality are the task-level averages of
-    (hit_file_rate - noise_file_rate) over the miner's own repeats and the
-    baseline's repeats respectively (averaged before comparing, not per-run).
-    """
-    if miner_quality is None or baseline_quality is None:
-        return None
-
-    margin = miner_quality - baseline_quality
-    if margin <= -delta:
-        return floor
-
-    if (
-        miner_weighted_tokens is None
-        or baseline_weighted_tokens is None
-        or miner_weighted_tokens <= 0
-        or baseline_weighted_tokens <= 0
-    ):
-        return None
-
-    gate = _smoothstep_unit_interval((margin + delta) / (2 * delta))
-    tau = max(-2.0, min(2.0, 2 * log2(baseline_weighted_tokens / miner_weighted_tokens)))
-    if tau >= 0:
-        return gate * tau
-
-    penalty_scale = EXPLORE_NEGATIVE_TAU_QUALITY_FLOOR + (
-        (1.0 - EXPLORE_NEGATIVE_TAU_QUALITY_FLOOR) * (1.0 - gate)
-    )
-    return penalty_scale * tau
-
-
-def compute_explore_miner_total_score(
-    task_scores: list[float],
-    task_margins: list[float],
-    total_miner_weighted_tokens: float | None,
-    total_baseline_weighted_tokens: float | None,
-    *,
-    floor: float = EXPLORE_SCORE_FLOOR,
-) -> float | None:
-    """Aggregate explore score across all of a miner's scored tasks.
-
-    Uses the mean of the scored explore tasks directly.
-
-    Earlier versions forced the whole category to the explore floor whenever a
-    miner's aggregate quality and aggregate weighted-token usage were both worse
-    than baseline. That introduced a large discontinuity where small changes in
-    aggregate totals could flip the final explore category straight to ``-1``
-    after normalization, which made leaderboard movement noisier than intended.
-
-    The raw aggregate lives in [-2, 2]; the value returned here is normalized
-    to [-1, 1] (a straight halving).
-    """
-    if not task_scores:
-        return None
-
-    p_avg = sum(task_scores) / len(task_scores)
-    return _normalize_explore_score(p_avg)
 
 
 def _summarize_baseline_pass(baseline_runs: dict[int, dict[str, object]]) -> bool | None:

@@ -32,6 +32,10 @@ from app.services.swebench_orchestrator import (
     start_swebench_orchestrator_task,
     stop_swebench_orchestrator_task,
 )
+from app.services.dockerhub_visibility import (
+    start_dockerhub_visibility_task,
+    stop_dockerhub_visibility_task,
+)
 from app.services.metagraph import MetagraphService
 from app.services.metagraph_runner import MetagraphServiceRunner
 from app.api.routes.frontend import (
@@ -371,6 +375,13 @@ def create_app() -> FastAPI:
         except BaseException as exc:
             _log_startup_failure("latest_competition_aggregate_refresh_start", exc)
             raise
+        try:
+            start_dockerhub_visibility_task(app)
+        except BaseException:
+            # Non-fatal: the platform still orchestrates runs without it. Only the
+            # hidden-task images stay at whatever visibility they currently have,
+            # which an operator can flip by hand (scripts/dockerhub_task_repo.py).
+            logger.exception("dockerhub_visibility_start_failed")
         logger.info("startup_complete", extra={"env": settings.app_env})
 
     @app.on_event("shutdown")
@@ -394,6 +405,7 @@ def create_app() -> FastAPI:
         stop_heartbeat_thread(app)
         await stop_swebench_orchestrator_task(app)
         await stop_latest_competition_aggregate_refresh_task(app)
+        await stop_dockerhub_visibility_task(app)
         await close_reader_db()
         await close_db()
         logger.info("shutdown_complete")

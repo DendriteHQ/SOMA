@@ -4,45 +4,49 @@ This document explains the current miner incentive mechanism.
 
 ## Benchmark types
 
-The system uses three benchmark types:
+There is one benchmark type:
 
-1. `swebench_verified`
-2. `swe_explorer_explore`
-3. `swe_explorer_edit`
+1. `swebench_verified` — the agent is given an issue and must produce a patch, which is
+   graded against the task's own tests.
+
+Both kinds of task in a competition run under it. What differs between them is the
+dataset an instance is resolved from, not how it is scored:
+
+| Stage | Dataset (`swe_bench_tasks.benchmark_name`) | Task images |
+|---|---|---|
+| Screener stage 1 | `SWE-bench/SWE-bench_Verified` (public Hugging Face) | SWE-bench naming conventions |
+| Screener stage 2, full evaluation | SOMA task lists (e.g. `soma-is-tasks`) | Each row ships its own env/test image |
+
+See [`mcp_platform/app/services/benchmarks.py`](../../mcp_platform/app/services/benchmarks.py)
+for how a task's dataset is resolved, and
+[Task images and repository visibility](#task-images-and-repository-visibility) below for
+how validators obtain the images they grade with.
 
 ## Base benchmark weighting
 
-Per-miner aggregate benchmark score uses:
+Per-miner aggregate benchmark score:
 
-- `swebench_verified`: **50%**
-- `swe_explorer_explore`: **25%**
-- `swe_explorer_edit`: **25%**
+- `swebench_verified`: **100%**
 
-Let:
-
-- $S_v(m)$ be miner $m$'s score on `swebench_verified`,
-- $S_x(m)$ be miner $m$'s score on `swe_explorer_explore`,
-- $S_e(m)$ be miner $m$'s score on `swe_explorer_edit`.
-
-Then:
+Let $S_v(m)$ be miner $m$'s score on `swebench_verified`. Then:
 
 $$
-S_{bench}(m) = 0.50 \cdot S_v(m) + 0.25 \cdot S_x(m) + 0.25 \cdot S_e(m)
+S_{bench}(m) = S_v(m)
 $$
 
 ## Layered incentive weighting
 
-Incentives are distributed through three layers over the benchmark-type subsets:
+Incentives are distributed through layers over the benchmark-type subsets. Layer weights
+are static per subset size:
 
-1. **L0 (triple):** `{(v, x, e)}`
-2. **L1 (pairs):** `{(v, x), (v, e), (x, e)}`
-3. **L2 (singles):** `{(v), (x), (e)}`
+- $W(\text{triples})=0.25$
+- $W(\text{pairs})=0.45$
+- $W(\text{singles})=0.30$
 
-Layer weights are static:
+and are renormalized over the layers that actually exist, so with a single benchmark type
+only the singles layer remains and it carries the full weight:
 
-- $W(L0)=0.25$
-- $W(L1)=0.45$
-- $W(L2)=0.30$
+1. **L0 (singles):** `{(v)}`, $W(L0)=1.0$
 
 Element weight inside each layer:
 
@@ -50,23 +54,22 @@ $$
 W(elem \in L_i)=\frac{W(L_i)}{|L_i|}
 $$
 
-So:
-
-- `L0` has 1 element, each worth `0.25`
-- `L1` has 3 elements, each worth `0.45 / 3 = 0.15`
-- `L2` has 3 elements, each worth `0.30 / 3 = 0.10`
+So `L0` has 1 element, worth `1.0`.
 
 ### Subset score
 
-The score of miner $m$ on a subset is the base-weighted average over the subset members, with the base benchmark weights renormalized within the subset:
+The score of miner $m$ on a subset is the base-weighted average over the subset members,
+with the base benchmark weights renormalized within the subset:
 
 $$
 S_{subset}(m)=\frac{\sum_{b\in subset} w_b \cdot S_b(m)}{\sum_{b\in subset} w_b}
 $$
 
-where $w_v=0.50$, $w_x=0.25$, $w_e=0.25$. For the `L0` triple this reduces to $S_{bench}(m)$; for singles it is the raw per-benchmark score. A miner with no score on any member benchmark does not compete on that element.
+where $w_v=1.0$. For a single benchmark this reduces to the raw per-benchmark score. A
+miner with no score on any member benchmark does not compete on that element.
 
-For each element, winner(s) are miner(s) with the top score on that subset. If tied, element weight is split evenly.
+For each element, winner(s) are miner(s) with the top score on that subset. If tied,
+element weight is split evenly.
 
 ## Miner raw incentive weight
 
@@ -87,3 +90,34 @@ then:
 $$
 INC(m)=\frac{W_{total}(m)}{\sum_{n\in EligibleMiners}W_{total}(n)}\cdot X
 $$
+
+## Task images and repository visibility
+
+A SOMA task is graded by running its own `test` image: the repository at `base_commit`
+with the task's test patch applied, plus a `run_tests` entrypoint that reproduces the
+command the task was validated with. The validator pulls that image, applies the miner's
+patch inside it, runs `run_tests`, and checks the task's `FAIL_TO_PASS` / `PASS_TO_PASS`
+ids against the pytest JSON report.
+
+Those images live in a **private** Docker Hub repository, because publishing a
+competition's hidden tasks in advance would let miners inspect the tests they are about
+to be scored on. Rather than distributing registry credentials to every validator, the
+platform flips that repository public for as long as the hidden tasks are being run and
+graded, and back to private afterwards.
+
+Both phases that use hidden tasks — screener stage 2 and full evaluation — happen inside
+the **evaluation** window. Stage 2 begins at `eval_starts_at`, not at `upload_ends_at`;
+full evaluation follows it once the stage-2 cohort has been ranked. The stretch between
+`upload_ends_at` and `eval_starts_at` is idle, with no hidden-task run in existence yet:
+
+```
+    upload_starts_at          upload_ends_at            eval_starts_at                  eval_ends_at
+     |                         |                         |                               |
+     |--- stage 1, uploads ----|--------- idle ----------|-- stage 2, then evaluation ---|
+     |                         |                         |                               |
+                                                         |----- task images public ------|  + grace
+```
+
+So the repository goes public exactly when the first stage-2 run can be dispatched, and
+stays public until `eval_ends_at` plus a grace period, so a validation still in flight
+when the competition closes can finish pulling.

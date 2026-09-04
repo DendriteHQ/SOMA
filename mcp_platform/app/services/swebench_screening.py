@@ -277,9 +277,8 @@ async def evaluate_screening_for_script(
     """Stage-2 screening gate: resolved pass-ratio across tasks AND weighted
     token saving over baseline >= threshold.
 
-    ``benchmark_types`` defaults to the verified-only tuple for backward
-    compatibility; the two-stage orchestrator passes all screening benchmark
-    types so stage 2 evaluates verified, explore and edit together.
+    ``benchmark_types`` defaults to the screening tuple; the two-stage orchestrator
+    passes it explicitly.
     """
     if not screener_task_ids:
         return True, True
@@ -349,9 +348,11 @@ def required_screening_weighted_token_saving_ratio() -> float:
     return min(1.0, max(0.0, ratio))
 
 
-# Only these benchmark types gate the stage-1 outcome; swe_explorer_explore
-# results never affect stage-1 pass/fail (quality or tokens).
-STAGE1_GATED_BENCHMARK_TYPES = ("swebench_verified", "swe_explorer_edit")
+# The benchmark types that gate the stage-1 outcome. There is only one benchmark type,
+# so this is the same tuple as SCREENING_BENCHMARK_TYPES; it stays a separate name
+# because "what runs at stage 1" and "what stage 1 is judged on" are distinct concepts
+# and have diverged before.
+STAGE1_GATED_BENCHMARK_TYPES = SCREENING_BENCHMARK_TYPES
 
 
 def stage1_quality_epsilon_for_benchmark_type(benchmark_type: str) -> float:
@@ -362,7 +363,6 @@ def stage1_quality_epsilon_for_benchmark_type(benchmark_type: str) -> float:
     """
     mapping = {
         "swebench_verified": settings.swebench_screening_stage1_quality_epsilon_verified,
-        "swe_explorer_edit": settings.swebench_screening_stage1_quality_epsilon_edit,
     }
     return max(0.0, float(mapping.get(benchmark_type, 0.0)))
 
@@ -370,12 +370,10 @@ def stage1_quality_epsilon_for_benchmark_type(benchmark_type: str) -> float:
 def stage1_required_token_saving_ratio_for_benchmark_type(benchmark_type: str) -> float | None:
     """Minimum required pooled weighted-token savings vs baseline for stage 1.
 
-    Returns ``None`` for benchmark types that are not gated on tokens at
-    stage 1 (i.e. anything other than swebench_verified / swe_explorer_edit).
+    Returns ``None`` for a benchmark type that is not gated on tokens at stage 1.
     """
     mapping = {
         "swebench_verified": settings.swebench_screening_stage1_token_saving_ratio_verified,
-        "swe_explorer_edit": settings.swebench_screening_stage1_token_saving_ratio_edit,
     }
     ratio = mapping.get(benchmark_type)
     if ratio is None:
@@ -387,22 +385,14 @@ def quality_for_benchmark_type(
     benchmark_type: str,
     *,
     resolved: bool | None,
-    hit_file_rate: float | None,
-    noise_file_rate: float | None,
 ) -> float | None:
     """Normalize a validation row into a scalar quality value for stage-1.
 
-    - verified / edit: resolved -> 1.0, not-resolved -> 0.0, missing -> None
-    - explore: hit_file_rate - noise_file_rate in [-1, 1], missing -> None
+    resolved -> 1.0, not-resolved -> 0.0, missing -> None.
 
     ``None`` means "no quality signal available yet" (used to detect
-    incompleteness); a failed-but-scored run reports a concrete 0.0 / low value.
+    incompleteness); a failed-but-scored run reports a concrete 0.0.
     """
-    if benchmark_type == "swe_explorer_explore":
-        if hit_file_rate is None or noise_file_rate is None:
-            return None
-        return float(hit_file_rate) - float(noise_file_rate)
-    # verified / edit and any other resolved-based benchmark
     if resolved is None:
         return None
     return 1.0 if bool(resolved) else 0.0
@@ -420,10 +410,6 @@ async def evaluate_stage1_for_script(
 ) -> tuple[bool, bool]:
     """Stage-1 liveness / non-regression + savings gate.
 
-    Only ``swebench_verified`` and ``swe_explorer_edit`` gate the stage-1
-    outcome (see ``STAGE1_GATED_BENCHMARK_TYPES``); ``swe_explorer_explore``
-    results never affect pass/fail here, whether in quality or in tokens.
-
     Returns ``(complete, passed)``. Two gates, both evaluated per gated
     benchmark type and pooled over the WHOLE stage-1 sample for that type:
 
@@ -437,9 +423,7 @@ async def evaluate_stage1_for_script(
        for that type must be reduced from pooled baseline weighted tokens by
        at least stage1_required_token_saving_ratio_for_benchmark_type, i.e.
        (baseline_total - miner_total) / baseline_total >= required_ratio.
-       Verified and edit are never pooled together since their thresholds
-       differ. Skipped when the weighted maps are not provided (backward
-       compat).
+       Skipped when the weighted maps are not provided (backward compat).
 
     ``complete`` is False while any required (task, attempt, benchmark_type)
     miner run or baseline run has not been scored yet.

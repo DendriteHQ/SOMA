@@ -42,6 +42,16 @@ class Settings(BaseModel):
     swebench_validation_submit_path: str
     swebench_competition_state_file: Path
     swebench_eval_image_prefix: str
+    # SOMA task grading. These tasks are not a Hugging Face dataset: each one ships a
+    # test image that carries the repo at base_commit with the test patch applied and
+    # a run_tests entrypoint, so grading runs that image instead of the SWE-bench
+    # harness (see validator/evaluation/soma_task_evaluator.py).
+    soma_task_test_image_repository: str
+    soma_task_test_image_tag_suffix: str
+    soma_task_grading_file: Path
+    soma_task_eval_timeout_seconds: int
+    soma_task_eval_network: str
+    soma_task_eval_remove_image_after_run: bool
      
     @classmethod
     def from_env(cls) -> "Settings":
@@ -149,6 +159,30 @@ class Settings(BaseModel):
             swebench_validation_submit_path=os.getenv(
                 "SWEBENCH_VALIDATION_SUBMIT_PATH",
                 "/validator/submit_swebench_validation_score",
+            ),
+            soma_task_test_image_repository=os.getenv(
+                "SOMA_TASK_TEST_IMAGE_REPOSITORY",
+                "dendritexhq/soma-competition-tasks-dind",
+            ),
+            soma_task_test_image_tag_suffix=os.getenv(
+                "SOMA_TASK_TEST_IMAGE_TAG_SUFFIX", ".test"
+            ),
+            soma_task_grading_file=Path(
+                os.getenv(
+                    "SOMA_TASK_GRADING_FILE",
+                    str(Path(__file__).resolve().parents[2] / "tasks" / "soma_tasks_grading.jsonl"),
+                )
+            ),
+            soma_task_eval_timeout_seconds=cls._get_int(
+                "SOMA_TASK_EVAL_TIMEOUT_SECONDS",
+                1800,
+            ),
+            # The graded container has every dependency baked in and must not be able
+            # to reach the network (least of all the run's LLM proxy).
+            soma_task_eval_network=os.getenv("SOMA_TASK_EVAL_NETWORK", "none"),
+            soma_task_eval_remove_image_after_run=cls._get_bool(
+                "SOMA_TASK_EVAL_REMOVE_IMAGE_AFTER_RUN",
+                True,
             ),
         )
         return settings

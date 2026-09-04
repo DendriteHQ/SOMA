@@ -205,6 +205,59 @@ class Settings(BaseSettings):
         default="SWE-bench/SWE-bench_Verified",
         alias="SWEBENCH_BENCHMARK_NAME",
     )
+    # Benchmark a task is dispatched against is read from swe_bench_tasks.benchmark_name
+    # (a task row knows which dataset it belongs to). These two settings are only the
+    # fallbacks used when that column is empty, keyed by the task's screener stage:
+    # stage 1 stays on public SWE-bench Verified, while stage 2 and full evaluation run
+    # SOMA's own task lists, whose rows ship their own env/test images.
+    swebench_screener1_benchmark_name: str = Field(
+        default="SWE-bench/SWE-bench_Verified",
+        alias="SWEBENCH_SCREENER1_BENCHMARK_NAME",
+    )
+    soma_tasks_benchmark_name: str = Field(
+        default="soma-is-tasks",
+        alias="SOMA_TASKS_BENCHMARK_NAME",
+    )
+
+    # Docker Hub visibility automation for the hidden-task image repository.
+    # SOMA task rows are graded from container images the validator has to pull, and
+    # those images live in a private Docker Hub repository. Rather than distributing
+    # registry credentials to every validator, the platform flips that one repository
+    # public for the evaluation window and back to private afterwards.
+    dockerhub_username: str | None = Field(default=None, alias="DOCKERHUB_USERNAME")
+    dockerhub_token: str | None = Field(default=None, alias="DOCKERHUB_TOKEN")
+    dockerhub_task_repositories: list[str] = Field(
+        default_factory=list,
+        alias="DOCKERHUB_TASK_REPOSITORIES",
+    )
+    dockerhub_visibility_enabled: bool = Field(
+        default=False,
+        alias="DOCKERHUB_VISIBILITY_ENABLED",
+    )
+    dockerhub_visibility_interval_seconds: float = Field(
+        default=300.0,
+        alias="DOCKERHUB_VISIBILITY_INTERVAL_SECONDS",
+    )
+    # Which timeframe boundary opens the public window. Screener stage 2 and full
+    # evaluation both run inside the evaluation window (stage-2 seeding is gated on
+    # now >= eval_starts_at), so "eval_starts_at" already covers every hidden-task run.
+    # "upload_ends_at" only opens earlier, during the idle stretch before stage 2; it
+    # grades nothing extra and exists to avoid the up-to-one-tick window in which the
+    # repository is still private right after eval_starts_at.
+    dockerhub_visibility_public_from: Literal["eval_starts_at", "upload_ends_at"] = Field(
+        default="eval_starts_at",
+        alias="DOCKERHUB_VISIBILITY_PUBLIC_FROM",
+    )
+    # How long the repository stays public past eval_ends_at, so validations still in
+    # flight when the competition closes can finish pulling.
+    dockerhub_visibility_grace_seconds: float = Field(
+        default=4 * 3600.0,
+        alias="DOCKERHUB_VISIBILITY_GRACE_SECONDS",
+    )
+    dockerhub_api_timeout_seconds: float = Field(
+        default=30.0,
+        alias="DOCKERHUB_API_TIMEOUT_SECONDS",
+    )
     swebench_default_model: str = Field(
         default="qwen/qwen3-coder",
         alias="SWEBENCH_DEFAULT_MODEL",
@@ -286,40 +339,28 @@ class Settings(BaseSettings):
         alias="SWEBENCH_DYNAMIC_SCREENER_TASK_COUNT",
     )
     # Two-stage screening. Stage 1 is a liveness / non-regression + savings gate
-    # that runs during the upload window on public tasks. It is gated ONLY by
-    # swebench_verified and swe_explorer_edit — swe_explorer_explore results
-    # never affect the stage-1 outcome (quality or tokens). Stage 2 keeps the
-    # existing pass-ratio + weighted saving threshold on hidden tasks after the
-    # upload window closes.
+    # that runs during the upload window on public SWE-bench Verified tasks.
+    # Stage 2 keeps the existing pass-ratio + weighted saving threshold on the
+    # hidden SOMA tasks after the upload window closes.
     #
-    # Quality-drop tolerance for stage 1, per gated benchmark type. Stage 1
-    # pools the quality of the WHOLE stage-1 sample per benchmark type (all
-    # tasks × all attempts, e.g. 5 tasks × 5 runs = 25 samples) and passes the
-    # type when pooled_miner_mean >= pooled_baseline_mean - epsilon. Quality is
-    # a resolved fraction (0..1); the default (5%) tolerates roughly a
-    # one-to-two-run swing from baseline (variance floor) without letting a
-    # real regression through. Epsilon is an absolute margin on the pooled
-    # mean, NOT a per-task tolerance.
+    # Quality-drop tolerance for stage 1. Stage 1 pools the quality of the WHOLE
+    # stage-1 sample (all tasks × all attempts, e.g. 5 tasks × 5 runs = 25
+    # samples) and passes when pooled_miner_mean >= pooled_baseline_mean -
+    # epsilon. Quality is a resolved fraction (0..1); the default (5%) tolerates
+    # roughly a one-to-two-run swing from baseline (variance floor) without
+    # letting a real regression through. Epsilon is an absolute margin on the
+    # pooled mean, NOT a per-task tolerance.
     swebench_screening_stage1_quality_epsilon_verified: float = Field(
         default=0.05,
         alias="SWEBENCH_SCREENING_STAGE1_QUALITY_EPSILON_VERIFIED",
     )
-    swebench_screening_stage1_quality_epsilon_edit: float = Field(
-        default=0.05,
-        alias="SWEBENCH_SCREENING_STAGE1_QUALITY_EPSILON_EDIT",
-    )
     # Stage-1 token savings: besides non-regressing quality, a script must
     # reduce pooled WEIGHTED tokens vs pooled baseline weighted tokens by at
-    # least this ratio, evaluated separately per gated benchmark type (the
-    # thresholds differ, so verified and edit are never pooled together). A
-    # script fails when (baseline_total - miner_total) / baseline_total < ratio.
+    # least this ratio. A script fails when
+    # (baseline_total - miner_total) / baseline_total < ratio.
     swebench_screening_stage1_token_saving_ratio_verified: float = Field(
         default=0.0,
         alias="SWEBENCH_SCREENING_STAGE1_TOKEN_SAVING_RATIO_VERIFIED",
-    )
-    swebench_screening_stage1_token_saving_ratio_edit: float = Field(
-        default=0.0,
-        alias="SWEBENCH_SCREENING_STAGE1_TOKEN_SAVING_RATIO_EDIT",
     )
 
     @field_validator("debug", "debug_clear_db", mode="before")
@@ -419,6 +460,32 @@ class Settings(BaseSettings):
             return [item.strip() for item in raw.split(",") if item.strip()]
         raise ValueError(
             "COMPACT_BENCH_SERVICE_URLS must be a list or comma-separated string"
+        )
+
+    @field_validator("dockerhub_task_repositories", mode="before")
+    @classmethod
+    def _parse_dockerhub_task_repositories(cls, value: Any) -> list[str]:
+        """Normalize the repository list.
+
+        In the environment this must be a JSON array (``["ns/repo"]``), like every
+        other list setting here: pydantic-settings JSON-decodes a ``list[str]`` field
+        inside its env source, so a bare or comma-separated string is rejected before
+        this validator ever sees it. The string branches below therefore only apply
+        when Settings is constructed programmatically.
+        """
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                return [str(item).strip() for item in json.loads(raw) if str(item).strip()]
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        raise ValueError(
+            "DOCKERHUB_TASK_REPOSITORIES must be a JSON array of '<namespace>/<repo>' strings"
         )
 
     @field_validator("frontend_aggregate_snapshot_dir", mode="before")
@@ -620,9 +687,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "swebench_screening_stage1_quality_epsilon_verified",
-        "swebench_screening_stage1_quality_epsilon_edit",
         "swebench_screening_stage1_token_saving_ratio_verified",
-        "swebench_screening_stage1_token_saving_ratio_edit",
         mode="before",
     )
     @classmethod
