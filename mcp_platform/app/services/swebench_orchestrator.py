@@ -7,7 +7,6 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from sqlalchemy import and_, func, literal, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,47 +56,12 @@ _DISPATCH_FETCH_LOOKAHEAD_MULTIPLIER = 10000
 _DISPATCH_FETCH_LIMIT_CAP = 100000
 _DISPATCH_FETCH_GROUP_LIMIT = 40
 _DISPATCH_FETCH_ROWS_PER_GROUP_LIMIT = 40
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_COMP112_STAGE2_OVERRIDE_PATH = (
-    _REPO_ROOT / "tmp" / "competition_112_stage2_override" / "qualified_hotkeys.txt"
-)
-
 
 @dataclass(frozen=True)
 class _ScriptRef:
     script_id: int
     miner_fk: int
     ss58: str | None = None
-
-
-def _load_stage2_advancer_override_hotkeys(competition_id: int) -> set[str] | None:
-    if competition_id != 112:
-        return None
-    try:
-        hotkeys = {
-            line.strip()
-            for line in _COMP112_STAGE2_OVERRIDE_PATH.read_text().splitlines()
-            if line.strip()
-        }
-    except FileNotFoundError:
-        logger.warning(
-            "swebench_stage2_override_missing",
-            extra={
-                "competition_id": competition_id,
-                "path": str(_COMP112_STAGE2_OVERRIDE_PATH),
-            },
-        )
-        return None
-    except Exception:
-        logger.exception(
-            "swebench_stage2_override_load_failed",
-            extra={
-                "competition_id": competition_id,
-                "path": str(_COMP112_STAGE2_OVERRIDE_PATH),
-            },
-        )
-        return None
-    return hotkeys or None
 
 
 def _non_baseline_eligibility_sql(
@@ -790,13 +754,6 @@ async def _classify_stage2_scripts(
     )
     if stage1_passers and not cohort_complete:
         return False, []
-
-    override_hotkeys = _load_stage2_advancer_override_hotkeys(competition_id)
-    if override_hotkeys is not None:
-        advancers = [
-            script for script in stage1_passers if script.ss58 in override_hotkeys
-        ]
-        return True, advancers
 
     # Rank by the canonical SWE total score (quality + saving) computed from
     # stage-2 tasks only — the same formula as the final competition score,

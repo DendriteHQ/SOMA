@@ -46,9 +46,26 @@ def _load_scoring_module():
     )
     app_module = types.ModuleType("app")
     core_module = types.ModuleType("app.core")
+    services_module = types.ModuleType("app.services")
     sys.modules.setdefault("app", app_module)
     sys.modules.setdefault("app.core", core_module)
+    sys.modules.setdefault("app.services", services_module)
     sys.modules["app.core.config"] = config_module
+
+    # app.services.complexity is loaded for real, not stubbed: it has no imports of
+    # its own, and the category normalization it provides is part of what these tests
+    # exercise through build_swe_task_groups.
+    complexity_path = (
+        Path(__file__).resolve().parents[1] / "app" / "services" / "complexity.py"
+    )
+    complexity_spec = importlib.util.spec_from_file_location(
+        "app.services.complexity", complexity_path
+    )
+    complexity_module = importlib.util.module_from_spec(complexity_spec)
+    assert complexity_spec is not None and complexity_spec.loader is not None
+    complexity_spec.loader.exec_module(complexity_module)
+    sys.modules["app.services.complexity"] = complexity_module
+    services_module.complexity = complexity_module
 
     scoring_path = (
         Path(__file__).resolve().parents[1] / "app" / "api" / "routes" / "scoring.py"

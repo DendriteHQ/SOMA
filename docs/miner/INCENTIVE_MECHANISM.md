@@ -34,19 +34,44 @@ $$
 S_{bench}(m) = S_v(m)
 $$
 
+This is the complexity-blind total: one benchmark type, so it is the miner's plain
+score over its scored tasks. It is what the dashboard ranks on and what the screener
+stages are judged by. The layers below split the *incentive* over complexity, not this
+score.
+
+## Task complexity
+
+Every task carries a complexity category, recorded per task in
+`swe_bench_tasks.complexity`:
+
+| Category | Meaning |
+|---|---|
+| `short` | least agent effort expected |
+| `medium` | |
+| `long` | most agent effort expected |
+| *(empty)* | not classified |
+
+Complexity does **not** change a miner's score. Scoring is complexity-blind: a task
+scores the same whichever category it is in, and a miner's total is the same average
+over all its scored tasks as before. What complexity decides is **which contests a
+miner is in** — see the layers below.
+
 ## Layered incentive weighting
 
-Incentives are distributed through layers over the benchmark-type subsets. Layer weights
-are static per subset size:
+Incentives are distributed through layers over subsets of the complexity categories.
+Layer weights are static per subset size:
 
 - $W(\text{triples})=0.25$
 - $W(\text{pairs})=0.45$
 - $W(\text{singles})=0.30$
 
-and are renormalized over the layers that actually exist, so with a single benchmark type
-only the singles layer remains and it carries the full weight:
+With all three categories present, all three layers exist:
 
-1. **L0 (singles):** `{(v)}`, $W(L0)=1.0$
+| Layer | Elements | $W(L_i)$ | Weight per element |
+|---|---|---|---|
+| L0 (triple) | `{(s,m,l)}` | 0.25 | 0.250 |
+| L1 (pairs) | `{(s,m),(s,l),(m,l)}` | 0.45 | 0.150 |
+| L2 (singles) | `{(s),(m),(l)}` | 0.30 | 0.100 |
 
 Element weight inside each layer:
 
@@ -54,22 +79,38 @@ $$
 W(elem \in L_i)=\frac{W(L_i)}{|L_i|}
 $$
 
-So `L0` has 1 element, worth `1.0`.
+Layer weights are renormalized over the layers that actually exist, so a competition
+with only two categories keeps the remaining layers in the same proportion
+(`0.45/0.75` and `0.30/0.75`).
 
 ### Subset score
 
-The score of miner $m$ on a subset is the base-weighted average over the subset members,
-with the base benchmark weights renormalized within the subset:
+The score of miner $m$ on a subset is the weighted average of its per-category scores,
+with the category weights renormalized within the subset:
 
 $$
-S_{subset}(m)=\frac{\sum_{b\in subset} w_b \cdot S_b(m)}{\sum_{b\in subset} w_b}
+S_{subset}(m)=\frac{\sum_{c\in subset} w_c \cdot S_c(m)}{\sum_{c\in subset} w_c}
 $$
 
-where $w_v=1.0$. For a single benchmark this reduces to the raw per-benchmark score. A
-miner with no score on any member benchmark does not compete on that element.
+**The three categories weigh the same** ($w_{short}=w_{medium}=w_{long}=1.0$), so a
+subset score is the plain average of the miner's scores on its members. No complexity
+is worth more than another.
+
+$S_c(m)$ is miner $m$'s score computed over that category's tasks only — the same
+quantity as its total score, restricted. A miner with **no score in a member category
+does not compete on that element**: it has not lost that contest, it is not in it. So
+consistency across categories is what wins the pair and triple elements, while
+dominating one category wins a single element worth `0.100`.
 
 For each element, winner(s) are miner(s) with the top score on that subset. If tied,
 element weight is split evenly.
+
+### Unclassified tasks
+
+A task with no complexity recorded still counts towards a miner's total score, but
+feeds no layer element. If **nothing** in a competition is classified there are no
+categories at all, and incentives fall back to a single, complexity-blind element
+carrying the whole weight — the behaviour that predates the category.
 
 ## Miner raw incentive weight
 

@@ -58,7 +58,9 @@ def _miner_run(run_id: int, *, resolved: bool, tokens: int) -> dict:
     }
 
 
-def _task_groups(*, screener_stage: int | None, is_screener: bool) -> dict:
+def _task_groups(
+    *, screener_stage: int | None, is_screener: bool, complexity: str | None = None
+) -> dict:
     """One task group per hotkey, shaped like _build_swe_task_groups_by_hotkey_from_facts."""
     baseline_rows = [
         {
@@ -66,6 +68,7 @@ def _task_groups(*, screener_stage: int | None, is_screener: bool) -> dict:
             "task_name": "falconry__falcon-2673",
             "is_screener": is_screener,
             "screener_stage": screener_stage,
+            "complexity": complexity,
             "baseline_runs": [_baseline_run(10, resolved=True, tokens=1000)],
         }
     ]
@@ -78,8 +81,17 @@ def _task_groups(*, screener_stage: int | None, is_screener: bool) -> dict:
     )
 
 
-def _snapshot(monkeypatch, *, screener_stage: int | None, is_screener: bool, eligible=("hk-good",)):
-    groups = _task_groups(screener_stage=screener_stage, is_screener=is_screener)
+def _snapshot(
+    monkeypatch,
+    *,
+    screener_stage: int | None,
+    is_screener: bool,
+    eligible=("hk-good",),
+    complexity: str | None = None,
+):
+    groups = _task_groups(
+        screener_stage=screener_stage, is_screener=is_screener, complexity=complexity
+    )
     rows_snapshot = frontend.SweRowsSnapshot(
         comp_id=COMP_ID, rows=[], rows_by_hotkey={}, task_groups_by_hotkey=groups
     )
@@ -105,8 +117,9 @@ def test_snapshot_builds_and_ranks_miners(monkeypatch):
     assert snapshot.ordered_hotkeys[0] == "hk-good"
 
     good = snapshot.miners_by_hotkey["hk-good"]
-    assert good.category_scores is not None
-    assert set(good.category_scores) == {"swebench_verified"}
+    # The fixture task carries no complexity, so there is no per-category breakdown -
+    # the complexity-blind total is still there.
+    assert good.category_scores is None
     assert good.total_score is not None
     assert good.task_count == 1
     assert good.screener_passed is True
@@ -164,13 +177,6 @@ def test_sort_key_orders_unscored_miners_last():
     assert sorted([unscored, scored], key=frontend._swe_miner_snapshot_sort_key) == [scored, unscored]
 
 
-def test_category_scores_are_dropped_when_empty():
-    assert frontend._clean_swe_category_scores({"swebench_verified": None}) is None
-    assert frontend._clean_swe_category_scores({"swebench_verified": 0.0}) == {
-        "swebench_verified": 0.0
-    }
-
-
 @pytest.mark.parametrize(
     "baseline, miner, expected",
     [(100.0, 50.0, 0.5), (100.0, 100.0, 0.0), (None, 50.0, None), (100.0, None, None)],
@@ -189,7 +195,73 @@ def test_scored_rank_map_is_one_based_and_breaks_ties_by_hotkey():
     assert ranks == {"c": 1, "a": 2, "b": 3}
 
 
-def test_weighted_total_score_reduces_to_the_single_benchmark():
-    assert frontend._weighted_total_score({"swebench_verified": 0.4}) == pytest.approx(0.4)
-    assert frontend._weighted_total_score({}) is None
-    assert frontend._weighted_total_score(None) is None
+# ── complexity ─────────────────────────────────────────────────────────────
+
+
+def test_task_groups_from_facts_carry_the_complexity():
+    groups = _task_groups(screener_stage=None, is_screener=False, complexity="long")
+
+    assert groups["hk-good"][1]["complexity"] == "long"
+
+
+def test_category_scores_hold_the_complexity_breakdown(monkeypatch):
+    snapshot = _snapshot(monkeypatch, screener_stage=None, is_screener=False, complexity="short")
+    good = snapshot.miners_by_hotkey["hk-good"]
+
+    assert set(good.category_scores) == {"short"}
+    assert good.complexity_task_counts == {"short": 1}
+    # The single task is the miner's only scored task, so its category score is the
+    # miner's own total.
+    assert good.category_scores["short"] == pytest.approx(good.total_score)
+
+
+def test_snapshot_leaves_categories_empty_for_unclassified_tasks(monkeypatch):
+    snapshot = _snapshot(monkeypatch, screener_stage=None, is_screener=False, complexity=None)
+    good = snapshot.miners_by_hotkey["hk-good"]
+
+    assert good.category_scores is None
+    assert good.complexity_task_counts is None
+    # ...while the task itself still counts towards the total.
+    assert good.total_score is not None
+
+
+def test_task_meta_injection_adds_complexity_next_to_screener_stage():
+    payload = {
+        "miners": [
+            {"miner": {"hotkey": "hk"}, "tasks": [{"task": {"task_id": 1}}, {"task": {"task_id": 99}}]}
+        ]
+    }
+
+    frontend._inject_task_meta(
+        payload, {1: {"screener_stage": 2, "complexity": "medium"}}
+    )
+
+    tasks = payload["miners"][0]["tasks"]
+    assert tasks[0]["task"] == {"task_id": 1, "screener_stage": 2, "complexity": "medium"}
+    # A task the map does not know renders as one absent state, not a missing key.
+    assert tasks[1]["task"] == {"task_id": 99, "screener_stage": None, "complexity": None}
+
+
+def test_complexity_task_counts_are_injected_per_miner(monkeypatch):
+    """The scores ride the contract's category_scores; only the counts are injected."""
+    snapshot = _snapshot(monkeypatch, screener_stage=None, is_screener=False, complexity="long")
+    payload = {"miners": [{"miner": {"hotkey": "hk-good"}}, {"miner": {"hotkey": "unknown"}}]}
+
+    frontend._inject_complexity_task_counts_per_miner(payload, snapshot)
+
+    assert payload["miners"][0]["miner"]["complexity_task_counts"] == {"long": 1}
+    assert payload["miners"][1]["miner"]["complexity_task_counts"] is None
+
+
+def test_complexity_task_counts_are_ordered_shortest_first():
+    counts = frontend._complexity_task_counts(
+        {
+            1: {"complexity": "long"},
+            2: {"complexity": "short"},
+            3: {"complexity": "long"},
+            4: {"complexity": None},
+        }
+    )
+
+    assert list(counts) == ["short", "long"]
+    assert counts == {"short": 1, "long": 2}

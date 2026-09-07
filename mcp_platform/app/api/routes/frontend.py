@@ -45,6 +45,7 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import get_db_read_session
 from app.api.routes.scoring import (
+    build_swe_complexity_scores,
     build_swe_miner_total_score,
     build_swe_task_groups,
     build_swe_task_result_item,
@@ -53,6 +54,7 @@ from app.api.routes.scoring import (
     _scoring_token_weights,
 )
 from app.services import swebench_screening as screening_shared
+from app.services.complexity import COMPLEXITY_VALUES, normalize_complexity
 from app.services.swebench_orchestrator import (
     _classify_stage1_scripts,
     _classify_stage2_scripts,
@@ -85,42 +87,15 @@ class FrontendApiKeyContext:
     rate_limit_rpd: int | None
 
 
-SWE_BENCHMARK_TYPES = ("swebench_verified",)
-
-# Base benchmark weighting (docs/miner/INCENTIVE_MECHANISM.md). With one benchmark
-# type the blended total below reduces to that benchmark's own score.
-SWE_BENCHMARK_WEIGHTS: dict[str, float] = {
-    "swebench_verified": 1.0,
-}
-
-
-def _weighted_total_score(category_scores: dict[str, float] | None) -> float | None:
-    """Benchmark-weighted average of the per-benchmark scores.
-
-    Weights are renormalized over the benchmarks the miner has a score for,
-    so a missing benchmark does not drag the total. Every component is
-    already normalized to [-1, 1], hence the result stays in [-1, 1].
-    """
-    if not category_scores:
-        return None
-    weighted_sum = 0.0
-    weight_total = 0.0
-    for benchmark_type, score in category_scores.items():
-        weight = SWE_BENCHMARK_WEIGHTS.get(benchmark_type, 0.0)
-        if weight <= 0.0:
-            continue
-        weighted_sum += weight * float(score)
-        weight_total += weight
-    if weight_total <= 0.0:
-        return None
-    return weighted_sum / weight_total
-
-
 @dataclass(slots=True)
 class SweMinerSnapshotItem:
     hotkey: str
     total_score: float | None
     screener_passed: bool
+    # Per-complexity scores: each the miner's own score restricted to that
+    # category's tasks. An absent category means the miner has no scored task there,
+    # which is not the same as scoring zero - it is what keeps such a miner out of
+    # the incentive elements that mention the category.
     category_scores: dict[str, float] | None
     task_count: int
     screener_task_count: int
@@ -130,6 +105,7 @@ class SweMinerSnapshotItem:
     screener_stage2_baseline_weighted_tokens: float | None = None
     screener_stage2_miner_weighted_tokens: float | None = None
     screener_stage2_verified_savings_ratio: float | None = None
+    complexity_task_counts: dict[str, int] | None = None
 
 
 @dataclass(slots=True)
@@ -482,29 +458,46 @@ def _inject_screener_summary_per_miner(
         }
 
 
-async def _fetch_swe_task_screener_stage(
+async def _fetch_swe_task_meta(
     db: AsyncSession,
     *,
     comp_id: int,
-) -> dict[int, int | None]:
+) -> dict[int, dict[str, Any]]:
+    """Per-task attributes the aggregate payload carries but the scoring rows do not.
+
+    Both are read in one query because both are injected in the same pass; they are
+    task attributes rather than run attributes, so they cannot come out of the
+    run-shaped rows the scores are built from.
+    """
     rows = (
         await db.execute(
             select(
                 SweBenchTask.id,
                 SweBenchTask.screener_stage,
+                SweBenchTask.complexity,
             ).where(SweBenchTask.competition_fk == comp_id)
         )
     ).all()
-    return {int(row.id): _to_optional_int(row.screener_stage) for row in rows}
+    return {
+        int(row.id): {
+            "screener_stage": _to_optional_int(row.screener_stage),
+            "complexity": normalize_complexity(row.complexity),
+        }
+        for row in rows
+    }
 
 
-def _inject_task_screener_stage(
+def _inject_task_meta(
     payload: dict[str, Any],
-    screener_stage_by_task_id: dict[int, int | None],
+    meta_by_task_id: dict[int, dict[str, Any]],
 ) -> None:
-    """Attach each task's screener_stage (1, 2, or None for non-screener /
-    full-eval tasks) alongside is_screener, across every benchmark type, so
-    the frontend can group tasks by stage."""
+    """Attach each task's screener_stage and complexity alongside is_screener.
+
+    ``screener_stage`` is 1, 2, or None for a full-evaluation task; ``complexity`` is
+    short/medium/long, or None for a task nobody classified. Both are None when the
+    task is not in the map at all, so the frontend can render one absent state
+    instead of distinguishing "unknown task" from "unset value".
+    """
     for miner_dict in payload.get("miners", []):
         for task_entry in miner_dict.get("tasks", []):
             task_dict = task_entry.get("task") if isinstance(task_entry, dict) else None
@@ -513,7 +506,33 @@ def _inject_task_screener_stage(
             task_id = task_dict.get("task_id")
             if task_id is None:
                 continue
-            task_dict["screener_stage"] = screener_stage_by_task_id.get(int(task_id))
+            meta = meta_by_task_id.get(int(task_id)) or {}
+            task_dict["screener_stage"] = meta.get("screener_stage")
+            task_dict["complexity"] = meta.get("complexity")
+
+
+def _inject_complexity_task_counts_per_miner(
+    payload: dict[str, Any],
+    miners_snapshot: SweMinersSnapshot,
+) -> None:
+    """Attach how many scored tasks each miner has per complexity category.
+
+    Injected into the dumped payload rather than added to the shared response
+    contract, the same way the screener summaries are. The scores themselves ride the
+    contract's ``category_scores``; the counts go alongside them because a category
+    score computed from one task means something very different from one computed
+    from ten, and the layer a miner wins is decided on those numbers.
+    """
+    for miner_dict in payload.get("miners", []):
+        miner_summary = miner_dict.get("miner")
+        if not isinstance(miner_summary, dict):
+            continue
+        item = miners_snapshot.miners_by_hotkey.get(str(miner_summary.get("hotkey", "")))
+        miner_summary["complexity_task_counts"] = (
+            dict(item.complexity_task_counts)
+            if item and item.complexity_task_counts
+            else None
+        )
 
 
 def _inject_verified_task_pass_counts(
@@ -560,8 +579,9 @@ async def _get_competition_aggregate_payload(
         _inject_screener_summary_per_miner(payload, miners_snapshot, stage_cohort)
         _inject_verified_task_pass_counts(payload, verified_pass_counts)
         _recompute_miner_token_totals_across_benchmarks(payload)
-        screener_stage_by_task_id = await _fetch_swe_task_screener_stage(db, comp_id=competition_id)
-        _inject_task_screener_stage(payload, screener_stage_by_task_id)
+        _inject_complexity_task_counts_per_miner(payload, miners_snapshot)
+        task_meta_by_task_id = await _fetch_swe_task_meta(db, comp_id=competition_id)
+        _inject_task_meta(payload, task_meta_by_task_id)
         return payload
 
     local_snapshot_payload = await _load_aggregate_snapshot_from_local(competition_id)
@@ -591,8 +611,9 @@ async def _get_competition_aggregate_payload(
         _inject_screener_summary_per_miner(payload, miners_snapshot, stage_cohort)
         _inject_verified_task_pass_counts(payload, verified_pass_counts)
         _recompute_miner_token_totals_across_benchmarks(payload)
-        screener_stage_by_task_id = await _fetch_swe_task_screener_stage(db, comp_id=competition_id)
-        _inject_task_screener_stage(payload, screener_stage_by_task_id)
+        _inject_complexity_task_counts_per_miner(payload, miners_snapshot)
+        task_meta_by_task_id = await _fetch_swe_task_meta(db, comp_id=competition_id)
+        _inject_task_meta(payload, task_meta_by_task_id)
         await _save_aggregate_snapshot_to_local(competition_id, payload)
         await _save_aggregate_snapshot_to_s3(request, competition_id, payload)
         return payload
@@ -614,8 +635,9 @@ async def _build_latest_competition_aggregate_payload(
     _inject_screener_summary_per_miner(payload, miners_snapshot, stage_cohort)
     _inject_verified_task_pass_counts(payload, verified_pass_counts)
     _recompute_miner_token_totals_across_benchmarks(payload)
-    screener_stage_by_task_id = await _fetch_swe_task_screener_stage(db, comp_id=competition_id)
-    _inject_task_screener_stage(payload, screener_stage_by_task_id)
+    _inject_complexity_task_counts_per_miner(payload, miners_snapshot)
+    task_meta_by_task_id = await _fetch_swe_task_meta(db, comp_id=competition_id)
+    _inject_task_meta(payload, task_meta_by_task_id)
     return payload
 
 
@@ -809,6 +831,7 @@ def _build_swe_task_groups_by_hotkey_from_facts(
             "task_name": str(row["task_name"]),
             "is_screener": bool(row["is_screener"]),
             "screener_stage": _to_optional_int(row.get("screener_stage")),
+            "complexity": normalize_complexity(row.get("complexity")),
             "baseline_runs": baseline_runs,
         }
 
@@ -828,6 +851,7 @@ def _build_swe_task_groups_by_hotkey_from_facts(
                 "task_name": baseline_task["task_name"],
                 "is_screener": baseline_task["is_screener"],
                 "screener_stage": baseline_task["screener_stage"],
+                "complexity": baseline_task["complexity"],
                 "hotkey": hotkey,
                 "baseline_runs": {
                     run_id: dict(run_data)
@@ -904,6 +928,7 @@ async def _fetch_swe_task_groups_by_hotkey_live(
             t.instance_id AS task_name,
             t.is_screener AS is_screener,
             t.screener_stage AS screener_stage,
+            t.complexity AS complexity,
             COALESCE(
                 jsonb_agg(
                     jsonb_build_object(
@@ -927,7 +952,7 @@ async def _fetch_swe_task_groups_by_hotkey_live(
           ON bvc.run_fk = br.id
         WHERE t.competition_fk = :comp_id
         {task_filter_sql}
-        GROUP BY t.id, t.instance_id, t.is_screener, t.screener_stage
+        GROUP BY t.id, t.instance_id, t.is_screener, t.screener_stage, t.complexity
         ORDER BY t.instance_id ASC, t.id ASC
         """
     )
@@ -1018,15 +1043,22 @@ def _filter_groups_for_final_score(
     }
 
 
-def _clean_swe_category_scores(
-    category_scores: dict[str, float | None],
-) -> dict[str, float] | None:
-    cleaned_scores = {
-        category: float(score)
-        for category, score in category_scores.items()
-        if score is not None
-    }
-    return cleaned_scores or None
+def _complexity_task_counts(
+    task_groups: dict[int, dict[str, object]],
+) -> dict[str, int]:
+    """How many of the miner's scored tasks fall in each complexity category.
+
+    Reported next to the scores because a category score computed from one task
+    means something very different from one computed from ten, and the layer a miner
+    wins is decided on those numbers.
+    """
+    counts: dict[str, int] = {}
+    for group in task_groups.values():
+        category = normalize_complexity(group.get("complexity"))
+        if category is None:
+            continue
+        counts[category] = counts.get(category, 0) + 1
+    return {category: counts[category] for category in COMPLEXITY_VALUES if category in counts}
 
 
 def _category_token_savings_ratio(
@@ -1141,16 +1173,18 @@ async def _build_swe_miners_snapshot(
     miners_by_hotkey: dict[str, SweMinerSnapshotItem] = {}
     for hotkey in all_hotkeys:
         task_groups = verified_task_groups_by_hotkey.get(hotkey, {})
-        verified_score, _ = build_swe_miner_total_score(
-            _filter_groups_for_final_score(task_groups, competition_id=comp_id)
+        # The tasks that count towards the competition final score: stage-2 and
+        # full-evaluation, never stage-1.
+        final_score_groups = _filter_groups_for_final_score(
+            task_groups, competition_id=comp_id
         )
-
-        category_scores = _clean_swe_category_scores(
-            {
-                "swebench_verified": verified_score,
-            }
-        )
-        total_score = _weighted_total_score(category_scores)
+        # The total is complexity-blind - one average over every scored task. The
+        # per-category scores below are restrictions of that same quantity to one
+        # complexity each, computed from the same groups, so they are directly
+        # comparable to it and to other miners' scores in the same category.
+        total_score, _ = build_swe_miner_total_score(final_score_groups)
+        category_scores = build_swe_complexity_scores(final_score_groups) or None
+        complexity_task_counts = _complexity_task_counts(final_score_groups) or None
         (
             _verified_stage1_score,
             screener_stage1_baseline_weighted,
@@ -1183,6 +1217,7 @@ async def _build_swe_miners_snapshot(
             screener_stage2_verified_savings_ratio=_category_token_savings_ratio(
                 screener_stage2_baseline_weighted, screener_stage2_miner_weighted
             ),
+            complexity_task_counts=complexity_task_counts,
         )
 
     ordered_hotkeys = [

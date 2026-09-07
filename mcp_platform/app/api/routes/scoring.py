@@ -6,6 +6,7 @@ from typing import Any
 from soma_shared.contracts.api.v1.frontend import SweMinerTaskResultItem
 
 from app.core.config import settings
+from app.services.complexity import COMPLEXITY_VALUES, normalize_complexity
 
 
 def _to_optional_int(value: object) -> int | None:
@@ -158,6 +159,7 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
                 "task_name": task_name,
                 "is_screener": bool(row.is_screener),
                 "screener_stage": _to_optional_int(getattr(row, "screener_stage", None)),
+                "complexity": normalize_complexity(getattr(row, "complexity", None)),
                 "hotkey": str(row.hotkey),
                 "baseline_runs": {},
                 "runs_by_id": {},
@@ -525,6 +527,39 @@ def build_swe_miner_total_score(
     raw_score = main_score + hard_boost
     normalized_score = _normalize_to_unit_interval(raw_score, SWE_SCORE_MIN, SWE_SCORE_MAX)
     return normalized_score, task_scores
+
+
+def build_swe_complexity_scores(
+    task_groups: dict[int, dict[str, object]],
+) -> dict[str, float]:
+    """The miner's total score computed separately over each complexity category.
+
+    Each value is produced by the same ``build_swe_miner_total_score`` that yields the
+    miner's overall score, just restricted to that category's tasks - so a category
+    score is directly comparable to it and to other miners' scores in the same
+    category, which is what deciding an element's winner requires.
+
+    Categories the miner has no scored task in are absent rather than zero: a miner
+    that never ran a long task has not lost that contest, it is not in it. Tasks with
+    no complexity recorded appear in no category (they still count in the overall
+    score).
+    """
+    groups_by_category: dict[str, dict[int, dict[str, object]]] = {}
+    for task_id, group in task_groups.items():
+        category = normalize_complexity(group.get("complexity"))
+        if category is None:
+            continue
+        groups_by_category.setdefault(category, {})[task_id] = group
+
+    scores: dict[str, float] = {}
+    for category in COMPLEXITY_VALUES:
+        category_groups = groups_by_category.get(category)
+        if not category_groups:
+            continue
+        score, _task_scores = build_swe_miner_total_score(category_groups)
+        if score is not None:
+            scores[category] = float(score)
+    return scores
 
 
 def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultItem:
