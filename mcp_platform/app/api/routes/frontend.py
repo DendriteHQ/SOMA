@@ -59,6 +59,7 @@ from app.services.swebench_orchestrator import (
     _load_latest_scripts_for_competition,
 )
 from app.services.incentive_calculator import (
+    final_score_includes_screener_stage,
     load_stage1_miner_total_scores,
     load_stage2_miner_total_scores,
 )
@@ -999,6 +1000,124 @@ async def _fetch_swe_task_groups_by_hotkey_live(
         baseline_rows=[dict(row) for row in baseline_rows],
         miner_rows=[dict(row) for row in miner_rows],
     )
+
+
+def _filter_groups_for_final_score(
+    task_groups: dict[int, dict[str, object]],
+    *,
+    competition_id: int,
+) -> dict[int, dict[str, object]]:
+    """Keep only task groups that contribute to the competition final score."""
+    return {
+        task_id: group
+        for task_id, group in task_groups.items()
+        if final_score_includes_screener_stage(
+            competition_id,
+            _to_optional_int(group.get("screener_stage")),
+        )
+    }
+
+
+def _clean_swe_category_scores(
+    category_scores: dict[str, float | None],
+) -> dict[str, float] | None:
+    cleaned_scores = {
+        category: float(score)
+        for category, score in category_scores.items()
+        if score is not None
+    }
+    return cleaned_scores or None
+
+
+def _category_token_savings_ratio(
+    baseline_weighted: float | None,
+    miner_weighted: float | None,
+) -> float | None:
+    if baseline_weighted is None or miner_weighted is None:
+        return None
+    return screening_shared.compute_weighted_token_savings_ratio(
+        baseline_weighted_total=baseline_weighted,
+        miner_weighted_total=miner_weighted,
+    )
+
+
+def _screener_comparison_from_groups(
+    task_groups: dict[int, dict[str, object]],
+    *,
+    stage: int | None = None,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Miner-vs-baseline summary over screener tasks only.
+
+    Returns (score, baseline_weighted_tokens, miner_weighted_tokens,
+    token_savings_ratio) where score is the normalized SWE total restricted
+    to screener task groups and the ratio is (baseline - miner) / baseline.
+
+    When ``stage`` is given the summary is further restricted to screener
+    tasks whose ``screener_stage`` equals it (stage 1 = liveness gate,
+    stage 2 = relative top-N ranking); ``None`` covers all screener tasks.
+    """
+    screener_groups = {
+        task_id: group
+        for task_id, group in task_groups.items()
+        if bool(group["is_screener"])
+        and (stage is None or group.get("screener_stage") == stage)
+    }
+    if not screener_groups:
+        return None, None, None, None
+
+    score, _ = build_swe_miner_total_score(screener_groups)
+
+    baseline_total = 0.0
+    has_baseline = False
+    miner_total = 0.0
+    has_miner = False
+    for group in screener_groups.values():
+        for baseline in group["baseline_runs"].values():
+            weighted = compute_weighted_tokens(
+                input_tokens=baseline["input_tokens"],
+                cached_input_tokens=baseline["cached_input_tokens"],
+                output_tokens=baseline["output_tokens"],
+            )
+            if weighted is not None:
+                baseline_total += float(weighted)
+                has_baseline = True
+        for run in group["runs"]:
+            weighted = run.get("weighted_tokens_with_compression")
+            if weighted is not None:
+                miner_total += float(weighted)
+                has_miner = True
+
+    savings_ratio = (
+        (baseline_total - miner_total) / baseline_total
+        if has_baseline and has_miner and baseline_total > 0
+        else None
+    )
+    return (
+        score,
+        baseline_total if has_baseline else None,
+        miner_total if has_miner else None,
+        savings_ratio,
+    )
+
+
+def _swe_miner_snapshot_sort_key(item: SweMinerSnapshotItem) -> tuple[bool, float, bool, str]:
+    return (
+        item.total_score is None,
+        -(item.total_score or 0.0),
+        not item.screener_passed,
+        item.hotkey,
+    )
+
+
+def _build_scored_rank_map(
+    *,
+    items: list[tuple[str, float]],
+) -> dict[str, int]:
+    ordered = sorted(items, key=lambda item: (-item[1], item[0]))
+    return {
+        hotkey: idx
+        for idx, (hotkey, _total_score) in enumerate(ordered, start=1)
+    }
 
 
 async def _build_swe_miners_snapshot(

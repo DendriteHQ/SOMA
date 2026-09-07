@@ -107,6 +107,11 @@ repository so a competition's hidden tasks are not published in advance. Rather 
 distributing a shared registry token to every validator, the platform makes the
 repository public for the evaluation window and private again once it closes.
 
+That repository holds exactly the current competition's tasks: the platform mirrors the
+images of the tasks the competition actually references into it and removes the rest, so
+a tag you can pull there is a task that is being scored right now. Tags from past
+competitions disappear once their window has closed.
+
 ---
 
 ## ▶️ Running the Validator
@@ -206,6 +211,11 @@ INFO: No tasks available (attempt 1), backing off to 30.0s poll interval
 - ✅ Ignore an isolated occurrence in the first minutes of the evaluation window
 - ✅ If it persists, report it — the platform-side visibility flip may be failing, and
   no validator will be able to grade that competition's tasks until it is fixed
+
+A `manifest unknown` for a single task is a different problem: the repository is
+reachable but that task's image was never copied into it. Report the instance id —
+the platform holds such tasks back from dispatch, so a run existing for one means
+something copied only partially.
 
 ---
 

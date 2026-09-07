@@ -258,6 +258,39 @@ class Settings(BaseSettings):
         default=30.0,
         alias="DOCKERHUB_API_TIMEOUT_SECONDS",
     )
+
+    # Task image sync: the platform mirrors the images of the SOMA tasks that are
+    # actually in swe_bench_tasks from the long-lived source repository into the
+    # competition repository, so the repository it publishes contains exactly the
+    # current competition's hidden tasks and nothing else.
+    dockerhub_task_sync_enabled: bool = Field(
+        default=False,
+        alias="DOCKERHUB_TASK_SYNC_ENABLED",
+    )
+    dockerhub_task_source_repository: str = Field(
+        default="dendritexhq/soma-is-task-dind",
+        alias="DOCKERHUB_TASK_SOURCE_REPOSITORY",
+    )
+    # Defaults to the single entry of DOCKERHUB_TASK_REPOSITORIES; set explicitly only
+    # when more than one repository is kept under visibility management.
+    dockerhub_task_target_repository: str | None = Field(
+        default=None,
+        alias="DOCKERHUB_TASK_TARGET_REPOSITORY",
+    )
+    # Delete every tag in the target repository that no current competition asks for.
+    # This is what empties the repository at the start of a competition; it only ever
+    # runs while the repository is private (see dockerhub_task_sync).
+    dockerhub_task_sync_prune: bool = Field(
+        default=True,
+        alias="DOCKERHUB_TASK_SYNC_PRUNE",
+    )
+    # Hold back dispatch of a SOMA task whose images are not fully in the competition
+    # repository yet. Without this a run is sent to a sandbox that cannot pull its env
+    # image, and it fails for a reason the miner had no part in.
+    dockerhub_task_sync_block_dispatch: bool = Field(
+        default=True,
+        alias="DOCKERHUB_TASK_SYNC_BLOCK_DISPATCH",
+    )
     swebench_default_model: str = Field(
         default="qwen/qwen3-coder",
         alias="SWEBENCH_DEFAULT_MODEL",

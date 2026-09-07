@@ -44,14 +44,16 @@ This reconciles rather than reacting to events: every tick computes the visibili
 current time implies and only calls Docker Hub when it disagrees. A missed tick, a
 restart, or a manual change in the Docker Hub UI therefore self-corrects, and no state
 has to be persisted anywhere.
+
+The same tick also reconciles the repository's *contents* (``dockerhub_task_sync``), so
+that what gets published is exactly the current competition's tasks. Ordering within a
+tick is deliberate: contents are brought up to date first, and the sync only deletes
+tags when this tick has determined the repository stays private.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -59,21 +61,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services import dockerhub_registry as hub
+from app.services import dockerhub_task_sync
 from soma_shared.db.models.competition_config import CompetitionConfig
 from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.session import get_db_session
 
 logger = get_logger(__name__)
 
-HUB_API_BASE = "https://hub.docker.com/v2"
-_LOGIN_PATH = "/users/login/"
-
 PUBLIC_FROM_EVAL_START = "eval_starts_at"
 PUBLIC_FROM_UPLOAD_END = "upload_ends_at"
 
-
-class DockerHubVisibilityError(RuntimeError):
-    pass
+# The Docker Hub client lives in dockerhub_registry, which the operator CLI shares.
+# Kept as module-level aliases so the calls below (and the tests) have one name to
+# reach for.
+DockerHubVisibilityError = hub.DockerHubError
+_login = hub.login
+_split_repository = hub.split_repository
+_is_private = hub.is_private
+_set_private = hub.set_private
 
 
 # ---------------------------------------------------------------------------
@@ -166,102 +172,8 @@ def should_be_public(
 
 
 # ---------------------------------------------------------------------------
-# Docker Hub API
+# reconcile
 # ---------------------------------------------------------------------------
-
-
-def _hub_call(
-    path: str,
-    *,
-    method: str = "GET",
-    body: dict | None = None,
-    jwt: str | None = None,
-) -> dict:
-    data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(
-        f"{HUB_API_BASE}{path}",
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json"},
-    )
-    if jwt:
-        request.add_header("Authorization", f"Bearer {jwt}")
-    timeout = float(settings.dockerhub_api_timeout_seconds)
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")
-        raise DockerHubVisibilityError(
-            f"{method} {path} failed ({exc.code}): {detail}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise DockerHubVisibilityError(f"{method} {path} failed: {exc.reason}") from exc
-    return json.loads(raw) if raw else {}
-
-
-def _login() -> str:
-    username = (settings.dockerhub_username or "").strip()
-    token = (settings.dockerhub_token or "").strip()
-    if not username or not token:
-        raise DockerHubVisibilityError(
-            "DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are required for visibility management"
-        )
-    # A personal access token is exchanged for a short-lived JWT the same way the
-    # docker CLI does it; the token itself is never sent to the repository endpoints.
-    payload = _hub_call(
-        _LOGIN_PATH,
-        method="POST",
-        body={"username": username, "password": token},
-    )
-    jwt = str(payload.get("token") or "")
-    if not jwt:
-        raise DockerHubVisibilityError("Docker Hub login returned no token")
-    return jwt
-
-
-def _split_repository(repository: str) -> tuple[str, str]:
-    if "/" not in repository:
-        raise DockerHubVisibilityError(
-            f"repository must be '<namespace>/<name>', got {repository!r}"
-        )
-    namespace, name = repository.split("/", 1)
-    return namespace.strip(), name.strip()
-
-
-def _is_private(repository: str, *, jwt: str) -> bool:
-    namespace, name = _split_repository(repository)
-    payload = _hub_call(f"/repositories/{namespace}/{name}/", jwt=jwt)
-    return bool(payload.get("is_private"))
-
-
-def _set_private(repository: str, *, jwt: str, private: bool) -> bool:
-    """Set the repository's visibility and return what it actually became.
-
-    Visibility is changed through the dedicated ``privacy/`` endpoint, and the body
-    must always carry an explicit ``is_private`` boolean. Both details were verified
-    against the live API and both matter:
-
-    * ``PATCH /v2/repositories/{ns}/{repo}/`` accepts an ``is_private`` field and
-      echoes it back in its response, but does not apply it - it silently leaves the
-      repository as it was. Trusting that response reports a change that never
-      happened.
-    * The ``privacy/`` endpoint treats a body without a recognised ``is_private`` key
-      as a request to make the repository PUBLIC. A typo or a renamed field therefore
-      fails in the one direction that leaks hidden tasks, which is why the value is
-      sent as an explicit boolean and never as a status string.
-
-    The endpoint returns an empty body either way, so the result is read back from the
-    repository itself rather than inferred from the request having succeeded.
-    """
-    namespace, name = _split_repository(repository)
-    _hub_call(
-        f"/repositories/{namespace}/{name}/privacy/",
-        method="POST",
-        jwt=jwt,
-        body={"is_private": bool(private)},
-    )
-    return _is_private(repository, jwt=jwt)
 
 
 def _reconcile_repositories(repositories: list[str], *, public: bool) -> dict[str, str]:
@@ -299,7 +211,13 @@ def _reconcile_repositories(repositories: list[str], *, public: bool) -> dict[st
 
 
 async def run_visibility_tick(now: datetime | None = None) -> dict[str, str]:
-    """Bring every configured repository in line with the current competition phase."""
+    """Bring every configured repository in line with the current competition phase.
+
+    Contents first, visibility second, in one tick and in that order: the images have
+    to be in the repository before it is published, and the sync's destructive half is
+    only allowed to run when this tick is about to leave the repository private (see
+    ``dockerhub_task_sync``).
+    """
     repositories = [
         repository.strip()
         for repository in settings.dockerhub_task_repositories
@@ -310,11 +228,24 @@ async def run_visibility_tick(now: datetime | None = None) -> dict[str, str]:
 
     now = now or datetime.now(timezone.utc)
     windows: list[tuple[int, datetime, datetime]] = []
+    public = False
+    competition_id: int | None = None
     async for db in get_db_session():
         windows = await load_active_public_windows(db)
+        public, competition_id = should_be_public(windows, now=now)
+        if dockerhub_task_sync.sync_enabled():
+            try:
+                await dockerhub_task_sync.run_task_sync_tick(
+                    db=db, windows=windows, public=public, now=now
+                )
+            except Exception:
+                # A content sync that fails must not hold back the visibility flip:
+                # validators still need whatever images did make it in, and staying
+                # private would stall grading for the whole competition. Runs whose
+                # images are missing are held back at dispatch instead.
+                logger.exception("dockerhub_task_sync_failed")
         break
 
-    public, competition_id = should_be_public(windows, now=now)
     outcomes = await asyncio.to_thread(_reconcile_repositories, repositories, public=public)
 
     changed = {
@@ -379,6 +310,10 @@ def start_dockerhub_visibility_task(app) -> None:
     interval = max(30.0, float(settings.dockerhub_visibility_interval_seconds))
     task = asyncio.create_task(_run_visibility_loop(interval))
     app.state.dockerhub_visibility_task = task
+    # The dispatch gate is only armed once the loop that feeds it exists, so a
+    # deployment without this loop dispatches SOMA runs as it did before instead of
+    # waiting on a readiness snapshot nothing will ever publish.
+    dockerhub_task_sync.arm_dispatch_gate()
     logger.info(
         "dockerhub_visibility_started",
         extra={
@@ -386,11 +321,19 @@ def start_dockerhub_visibility_task(app) -> None:
             "repositories": repositories,
             "public_from": str(settings.dockerhub_visibility_public_from),
             "grace_seconds": float(settings.dockerhub_visibility_grace_seconds),
+            "task_sync_enabled": dockerhub_task_sync.sync_enabled(),
+            "task_sync_source": dockerhub_task_sync.source_repository(),
+            "task_sync_target": dockerhub_task_sync.target_repository(),
+            "task_sync_prune": bool(settings.dockerhub_task_sync_prune),
+            "task_sync_blocks_dispatch": bool(settings.dockerhub_task_sync_block_dispatch),
         },
     )
 
 
 async def stop_dockerhub_visibility_task(app) -> None:
+    # Disarmed first: from here on nothing is going to refresh the readiness snapshot,
+    # so the gate must not keep holding runs back on a stale one.
+    dockerhub_task_sync.disarm_dispatch_gate()
     task = getattr(app.state, "dockerhub_visibility_task", None)
     if task is None:
         return

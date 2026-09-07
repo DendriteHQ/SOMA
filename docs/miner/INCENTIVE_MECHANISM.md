@@ -105,6 +105,18 @@ to be scored on. Rather than distributing registry credentials to every validato
 platform flips that repository public for as long as the hidden tasks are being run and
 graded, and back to private afterwards.
 
+The repository's *contents* are derived from `swe_bench_tasks` as well. Tasks are built
+into a long-lived source repository that accumulates every task ever produced, and that
+one can never be published - it holds future competitions' tasks too. So the platform
+mirrors just the images of the SOMA tasks the current competitions reference into the
+published repository, and deletes everything else from it. What goes public is therefore
+exactly the set of tasks the competition is being scored on.
+
+Deletions only run while the repository is private, which in practice is the upload
+window: the repository is emptied there and refilled as a competition's tasks are
+imported. A task whose images have not landed yet is not dispatched at all - its runs
+wait in `pending` rather than failing in a sandbox that cannot pull them.
+
 Both phases that use hidden tasks — screener stage 2 and full evaluation — happen inside
 the **evaluation** window. Stage 2 begins at `eval_starts_at`, not at `upload_ends_at`;
 full evaluation follows it once the stage-2 cohort has been ranked. The stretch between

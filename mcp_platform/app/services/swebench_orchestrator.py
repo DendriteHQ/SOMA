@@ -20,6 +20,7 @@ from app.services.blob.text_artifact_storage import TextArtifactStorage
 from app.services.blob.trajectory_artifact_storage import TrajectoryArtifactStorage
 from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
 from app.services import benchmarks as benchmark_registry
+from app.services import dockerhub_task_sync
 from app.services import swebench_screening as screening_shared
 from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
@@ -1772,6 +1773,8 @@ async def _dispatch_due_runs(
         deferred_by_cooldown = 0
         deferred_by_baseline_limit = 0
         deferred_by_miner_limit = 0
+        deferred_by_task_images = 0
+        task_images_block_reasons: dict[str, str] = {}
         for row in due_rows:
             run_id = int(row["run_id"])
             retry_at = retry_not_before.get(run_id)
@@ -1780,6 +1783,26 @@ async def _dispatch_due_runs(
                 if strict_fifo_dispatch:
                     # Preserve strict queue order: do not bypass a cooling head run.
                     break
+                continue
+
+            # A SOMA task is only runnable once both of its images are in the
+            # competition repository: the sandbox pulls the env image and the
+            # validator grades on the test image. Dispatching earlier fails the run
+            # in the sandbox for a reason the miner had no part in, so it waits in
+            # `pending` until the sync has copied them (see dockerhub_task_sync).
+            images_block_reason = dockerhub_task_sync.dispatch_block_reason(
+                benchmark_name=row.get("benchmark_name"),
+                instance_id=row.get("instance_id"),
+                screener_stage=_coerce_optional_int(row.get("screener_stage")),
+            )
+            if images_block_reason is not None:
+                deferred_by_task_images += 1
+                task_images_block_reasons[str(row.get("instance_id") or "")] = (
+                    images_block_reason
+                )
+                # Bypassed rather than held at the head of the queue, like a capped
+                # miner: the tasks whose images are ready keep flowing, and a task
+                # missing from the source repository would otherwise idle the subnet.
                 continue
 
             if bool(row["baseline_run"]) and max_dispatched_baseline_runs > 0:
@@ -1811,11 +1834,21 @@ async def _dispatch_due_runs(
             ):
                 break
 
+        if deferred_by_task_images > 0:
+            logger.info(
+                "swebench_orchestrator_deferred_missing_task_images",
+                extra={
+                    "deferred_runs": deferred_by_task_images,
+                    "reasons_by_instance": task_images_block_reasons,
+                },
+            )
+
         if not dispatch_rows:
             deferred += (
                 deferred_by_cooldown
                 + deferred_by_baseline_limit
                 + deferred_by_miner_limit
+                + deferred_by_task_images
             )
             await db.rollback()
             break
@@ -1968,7 +2001,9 @@ async def _dispatch_due_runs(
                 )
                 failed += 1
 
-        deferred += deferred_by_cooldown + deferred_by_miner_limit
+        deferred += (
+            deferred_by_cooldown + deferred_by_miner_limit + deferred_by_task_images
+        )
         await db.commit()
         break
 
