@@ -78,3 +78,22 @@ def resolve_benchmark_name(
     if name:
         return name
     return default_benchmark_name_for_stage(screener_stage)
+
+
+def is_soma_task(benchmark_name: str | None, *, screener_stage: int | None) -> bool:
+    """Whether a task row carries its own images and rows, the way dispatch resolves it.
+
+    The name is passed through :func:`resolve_benchmark_name` first, so a row that
+    records no benchmark falls back to the same stage default the runner would use.
+    Deciding this from the raw column instead would let a blank name mean "SOMA task"
+    at dispatch and "not my problem" to whatever provisions the task - and a task
+    nobody provisions but everybody waits for never runs at all.
+
+    Lives here rather than in either sync because both of them - the task images and
+    the task rows - must answer it identically for the same row: a task one of them
+    considers part of a competition and the other does not is a run that can never
+    complete.
+    """
+    return is_soma_task_benchmark(
+        resolve_benchmark_name(benchmark_name, screener_stage=screener_stage)
+    )

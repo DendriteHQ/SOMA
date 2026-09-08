@@ -174,7 +174,8 @@ class SomaTaskContainerEvaluator:
     def __init__(self, settings=None, registry: SomaTaskRegistry | None = None):
         self.settings = settings
         self.registry = registry or SomaTaskRegistry(
-            self._get_setting("soma_task_grading_file", None)
+            self._get_setting("soma_task_grading_file", None),
+            dataset_repo=self._get_setting("soma_task_dataset_repo", None),
         )
 
     # -- public API ----------------------------------------------------------
@@ -501,6 +502,16 @@ class SomaTaskContainerEvaluator:
             return image_name.strip()
         if spec.test_image:
             return spec.test_image
+        # The row's own image reference is NOT consulted before the configured
+        # repository. It names the repository the task was built in, which is private
+        # and never published; the competition serves the image from
+        # soma_task_test_image_repository. It is only a last resort for a deployment
+        # that configured no repository at all.
+        if not str(
+            self._get_setting("soma_task_test_image_repository", DEFAULT_TEST_IMAGE_REPOSITORY)
+            or ""
+        ).strip() and spec.source_test_image:
+            return spec.source_test_image
         suffix = str(
             self._get_setting("soma_task_test_image_tag_suffix", DEFAULT_TEST_IMAGE_TAG_SUFFIX)
         )

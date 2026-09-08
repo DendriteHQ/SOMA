@@ -314,6 +314,45 @@ def test_per_task_test_image_override_wins_over_the_repository_default(tmp_path,
     assert result.image_name == "other/repo:pinned"
 
 
+def test_the_configured_repository_wins_over_the_rows_build_time_reference(tmp_path, monkeypatch):
+    """A published row names the repository the task was BUILT in, which is private.
+
+    The competition serves the image from soma_task_test_image_repository, so grading
+    a task whose row carries its own reference must still pull from there - otherwise
+    every SOMA grading would try to pull an image nobody outside the build has access
+    to.
+    """
+    from validator.evaluation import soma_task_evaluator
+
+    fake = _FakeDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    monkeypatch.setattr(soma_task_evaluator, "_run", fake)
+    monkeypatch.setattr(
+        SomaTaskContainerEvaluator, "_image_labels", staticmethod(lambda _image: dict(IMAGE_LABELS))
+    )
+    grading_file = _write_grading_file(
+        tmp_path,
+        [
+            {
+                "instance_id": INSTANCE_ID,
+                "FAIL_TO_PASS": FAIL_TO_PASS,
+                "PASS_TO_PASS": PASS_TO_PASS,
+                "images": {"test": {"ref": "private/build-repo:tag.test"}},
+            }
+        ],
+    )
+    evaluator = SomaTaskContainerEvaluator(
+        settings=SimpleNamespace(
+            soma_task_test_image_repository="example/soma-tasks",
+            soma_task_eval_remove_image_after_run=False,
+        ),
+        registry=SomaTaskRegistry(grading_file),
+    )
+
+    result = evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
+
+    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID}.test"
+
+
 # ── registry ───────────────────────────────────────────────────────────────
 
 
@@ -355,7 +394,10 @@ def test_registry_reads_the_nested_images_block(tmp_path):
     )
     spec = SomaTaskRegistry(grading_file).get(INSTANCE_ID)
 
-    assert spec.test_image == "ns/repo:tag.test"
+    # The row's own reference is the build-time repository, kept apart from the
+    # per-task override so it cannot displace the repository the competition serves.
+    assert spec.source_test_image == "ns/repo:tag.test"
+    assert spec.test_image is None
     assert spec.workdir == "/src"
     assert spec.run_tests == "/soma/other.sh"
 

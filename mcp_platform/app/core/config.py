@@ -291,6 +291,74 @@ class Settings(BaseSettings):
         default=True,
         alias="DOCKERHUB_TASK_SYNC_BLOCK_DISPATCH",
     )
+
+    # Hugging Face task dataset. The task *rows* - problem statement, image
+    # references, graded test ids - travel the same release schedule as the images
+    # themselves: the platform publishes the current competition's rows into one
+    # dataset repository, private while the tasks are hidden and public for the
+    # evaluation window. It replaces provisioning tasks/soma_tasks.jsonl onto every
+    # sandbox host and tasks/soma_tasks_grading.jsonl onto every validator by hand.
+    #
+    # The window itself is not configured twice: the dataset follows the same
+    # DOCKERHUB_VISIBILITY_PUBLIC_FROM / _GRACE_SECONDS boundaries, because a
+    # deployment where the images and the rows they describe open at different
+    # moments has no useful meaning.
+    huggingface_token: str | None = Field(default=None, alias="HUGGINGFACE_TOKEN")
+    hf_dataset_enabled: bool = Field(
+        default=False,
+        alias="HF_DATASET_ENABLED",
+    )
+    # The dataset repository the platform publishes. It must already exist: the
+    # competition token is scoped to a repository rather than carrying repo.create,
+    # and a repository the platform created itself would be one nobody reviewed the
+    # visibility of.
+    hf_dataset_repository: str = Field(
+        default="soma114/soma-competition-dataset",
+        alias="HF_DATASET_REPOSITORY",
+    )
+    # Where the task rows are read from. swe_bench_tasks records only which tasks a
+    # competition uses, not their content, so the rows come from the same file the
+    # importer was fed and the database decides which of them get published.
+    hf_dataset_source_file: str = Field(
+        default="tasks/soma_tasks.jsonl",
+        alias="HF_DATASET_SOURCE_FILE",
+    )
+    hf_dataset_target_path: str = Field(
+        default="tasks.jsonl",
+        alias="HF_DATASET_TARGET_PATH",
+    )
+    # Drop published rows no current competition asks for. This is what empties the
+    # dataset at the start of a competition; like the image prune it only ever runs
+    # while the repository is private (see hf_task_sync).
+    hf_dataset_prune: bool = Field(
+        default=True,
+        alias="HF_DATASET_PRUNE",
+    )
+    # Collapse the repository's commit history after a prune. A dataset repository is
+    # a git repository, so without this the commit listing of a published repository
+    # walks back through every previous competition's rows.
+    hf_dataset_squash_on_prune: bool = Field(
+        default=True,
+        alias="HF_DATASET_SQUASH_ON_PRUNE",
+    )
+    # Hold back dispatch of a SOMA task whose row is not published yet. Off by
+    # default: it only becomes true once the sandbox and validator actually read the
+    # dataset instead of a file provisioned onto the host.
+    hf_dataset_block_dispatch: bool = Field(
+        default=False,
+        alias="HF_DATASET_BLOCK_DISPATCH",
+    )
+    # Commits above this size have to go through LFS, which this client does not
+    # implement. Refusing early turns that into a log line instead of a rejected
+    # commit at publication time.
+    hf_dataset_max_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        alias="HF_DATASET_MAX_BYTES",
+    )
+    hf_api_timeout_seconds: float = Field(
+        default=60.0,
+        alias="HF_API_TIMEOUT_SECONDS",
+    )
     swebench_default_model: str = Field(
         default="qwen/qwen3-coder",
         alias="SWEBENCH_DEFAULT_MODEL",

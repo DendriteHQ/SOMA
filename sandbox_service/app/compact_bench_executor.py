@@ -16,6 +16,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
@@ -70,6 +71,23 @@ COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_RETENTION_SEC
 COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS"
 COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV = "COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS"
 SOMA_TASKS_FILE_ENV = "SOMA_TASKS_FILE"
+# The published task rows. The platform keeps this dataset private while the tasks are
+# hidden and flips it public for the evaluation window, so a sandbox host needs no
+# credentials and nothing copied onto it. Set it and the local file below becomes a
+# fallback for hosts that are still provisioned by hand.
+SOMA_TASKS_DATASET_REPO_ENV = "SOMA_TASKS_DATASET_REPO"
+SOMA_TASKS_DATASET_PATH_ENV = "SOMA_TASKS_DATASET_PATH"
+SOMA_TASKS_DATASET_REVISION_ENV = "SOMA_TASKS_DATASET_REVISION"
+SOMA_TASKS_DATASET_CACHE_ENV = "SOMA_TASKS_DATASET_CACHE"
+SOMA_TASKS_DATASET_REFRESH_SECONDS_ENV = "SOMA_TASKS_DATASET_REFRESH_SECONDS"
+SOMA_TASKS_DATASET_TIMEOUT_SECONDS_ENV = "SOMA_TASKS_DATASET_TIMEOUT_SECONDS"
+DEFAULT_SOMA_TASKS_DATASET_PATH = "tasks.jsonl"
+DEFAULT_SOMA_TASKS_DATASET_REVISION = "main"
+DEFAULT_SOMA_TASKS_DATASET_REFRESH_SECONDS = 300.0
+DEFAULT_SOMA_TASKS_DATASET_TIMEOUT_SECONDS = 60.0
+# Only needed to read the dataset while it is still private, which a host with runs to
+# execute never has to do.
+SOMA_TASKS_HF_TOKEN_ENVS = ("HUGGINGFACE_TOKEN", "HF_TOKEN")
 SOMA_TASK_DIND_PREBAKED_REPO_ENV = "SOMA_TASK_DIND_PREBAKED_REPO"
 # Docker Hub repo the pre-baked dind image of a SOMA task is pulled from. Without
 # this, SOMA-benchmark derives the repo from the task row's own env image reference,
@@ -127,6 +145,16 @@ def _coerce_positive_int(value: Any, default: int) -> int:
         return default
     try:
         parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
@@ -633,44 +661,133 @@ def _resolve_soma_tasks_file() -> Path:
     return Path(configured).expanduser() if configured else DEFAULT_SOMA_TASKS_FILE
 
 
-def _materialize_soma_task_cache() -> dict[str, int]:
-    """Make the SOMA task rows resolvable offline by `benchmark-solve --benchmark`.
+def _resolve_soma_tasks_dataset_cache() -> Path:
+    configured = (os.getenv(SOMA_TASKS_DATASET_CACHE_ENV) or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    candidate = _resolve_soma_tasks_file().parent / "soma_tasks_dataset.jsonl"
+    if candidate.parent.is_dir():
+        return candidate
+    return Path(tempfile.gettempdir()) / "soma_tasks_dataset.jsonl"
 
-    A SOMA task list is not a Hugging Face dataset: it is a local JSONL whose rows
-    carry their own env/test images. SOMA-benchmark handles that by writing the rows
-    into the same on-disk row cache its runner already prefers over the datasets
-    server, keyed by the benchmark name (`soma_tasks.materialize_task_cache`, exposed
-    as the `benchmark-load-tasks` command). Doing it here, at service start, means the
-    platform can dispatch a SOMA benchmark name without a separate provisioning step
-    having been run on this host first.
 
-    Rows are grouped by their own `benchmark_name`, so one file can serve several
-    benchmark names. Missing file is not an error: a sandbox host that only ever runs
-    SWE-bench Verified has nothing to materialize.
+def _soma_tasks_dataset_url() -> str:
+    repo = (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip()
+    path = (os.getenv(SOMA_TASKS_DATASET_PATH_ENV) or "").strip() or DEFAULT_SOMA_TASKS_DATASET_PATH
+    revision = (
+        os.getenv(SOMA_TASKS_DATASET_REVISION_ENV) or ""
+    ).strip() or DEFAULT_SOMA_TASKS_DATASET_REVISION
+    return f"https://huggingface.co/datasets/{repo}/resolve/{revision}/{path}"
+
+
+def _download_soma_tasks_dataset() -> str | None:
+    url = _soma_tasks_dataset_url()
+    headers: dict[str, str] = {}
+    for name in SOMA_TASKS_HF_TOKEN_ENVS:
+        token = (os.getenv(name) or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            break
+    timeout = _coerce_positive_float(
+        os.getenv(SOMA_TASKS_DATASET_TIMEOUT_SECONDS_ENV),
+        DEFAULT_SOMA_TASKS_DATASET_TIMEOUT_SECONDS,
+    )
+    try:
+        with urllib_request.urlopen(
+            urllib_request.Request(url, headers=headers), timeout=timeout
+        ) as response:
+            return response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        # 401/403 on a repository that is still private is the normal state before the
+        # evaluation window opens, not a misconfiguration.
+        logger.warning("SOMA task dataset %s returned HTTP %s", url, exc.code)
+    except (urllib_error.URLError, UnicodeDecodeError, OSError) as exc:
+        logger.warning("SOMA task dataset %s could not be fetched: %s", url, exc)
+    return None
+
+
+def _resolve_soma_task_rows() -> tuple[list[dict], str]:
+    """``(rows, source)`` - the published dataset, then its cache, then a local file.
+
+    A successful download is cached on disk, so a later network failure runs from the
+    last known-good rows rather than from nothing.
     """
+    from soma_bench.benchmark.soma_tasks import load_task_rows
+
+    if (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip():
+        cache = _resolve_soma_tasks_dataset_cache()
+        text = _download_soma_tasks_dataset()
+        if text is not None:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(text, encoding="utf-8")
+            except OSError as exc:
+                logger.warning("Could not cache the SOMA task dataset at %s: %s", cache, exc)
+            else:
+                return load_task_rows(cache), f"dataset {_soma_tasks_dataset_url()}"
+            # The rows are usable even when they could not be cached; stage them so
+            # load_task_rows still owns the parsing.
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".jsonl", delete=False, encoding="utf-8"
+            ) as staged:
+                staged.write(text)
+            try:
+                return load_task_rows(Path(staged.name)), f"dataset {_soma_tasks_dataset_url()}"
+            finally:
+                Path(staged.name).unlink(missing_ok=True)
+
+        if cache.is_file():
+            logger.warning(
+                "Using the cached SOMA task dataset at %s: the download failed", cache
+            )
+            return load_task_rows(cache), f"cache {cache}"
+
     tasks_file = _resolve_soma_tasks_file()
     if not tasks_file.is_file():
         logger.info(
-            "No SOMA task file at %s; only Hugging Face benchmarks will resolve on this host "
-            "(set %s to override the path)",
+            "No SOMA task rows on this host: dataset %r is unreachable or unset and there "
+            "is no file at %s, so only Hugging Face benchmarks will resolve (%s names the "
+            "published dataset, %s overrides the file path)",
+            (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip() or None,
             tasks_file,
+            SOMA_TASKS_DATASET_REPO_ENV,
             SOMA_TASKS_FILE_ENV,
         )
+        return [], "none"
+    return load_task_rows(tasks_file), f"file {tasks_file}"
+
+
+def _materialize_soma_task_cache() -> dict[str, set[str]]:
+    """Make the SOMA task rows resolvable offline by `benchmark-solve --benchmark`.
+
+    A SOMA task list is not a Hugging Face *dataset* in the shape the runner's dataset
+    path expects: its rows carry their own env/test images and none of their
+    repositories appear in SWE-bench's spec maps. SOMA-benchmark handles that by
+    writing the rows into the same on-disk row cache its runner already prefers over
+    the datasets server, keyed by the benchmark name
+    (`soma_tasks.materialize_task_cache`, exposed as the `benchmark-load-tasks`
+    command). Doing it here means the platform can dispatch a SOMA benchmark name
+    without a separate provisioning step having been run on this host first.
+
+    Rows are grouped by their own `benchmark_name`, so one source can serve several
+    benchmark names. No rows is not an error: a sandbox host that only ever runs
+    SWE-bench Verified has nothing to materialize.
+
+    Returns the instance ids materialized per benchmark name, which is what lets a run
+    for an unknown instance trigger a refresh instead of failing.
+    """
+    from soma_bench.benchmark.soma_tasks import DEFAULT_BENCHMARK_NAME, materialize_task_cache
+
+    rows, source = _resolve_soma_task_rows()
+    if not rows:
         return {}
 
-    from soma_bench.benchmark.soma_tasks import (
-        DEFAULT_BENCHMARK_NAME,
-        load_task_rows,
-        materialize_task_cache,
-    )
-
-    rows = load_task_rows(tasks_file)
     rows_by_benchmark: dict[str, list[dict]] = {}
     for row in rows:
         benchmark_name = str(row.get("benchmark_name") or "").strip() or DEFAULT_BENCHMARK_NAME
         rows_by_benchmark.setdefault(benchmark_name, []).append(row)
 
-    materialized: dict[str, int] = {}
+    materialized: dict[str, set[str]] = {}
     with tempfile.TemporaryDirectory(prefix="soma-task-cache-") as staging_dir:
         for benchmark_name, benchmark_rows in rows_by_benchmark.items():
             # materialize_task_cache() takes a file, and each benchmark name needs its
@@ -680,16 +797,17 @@ def _materialize_soma_task_cache() -> dict[str, int]:
                 "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in benchmark_rows),
                 encoding="utf-8",
             )
-            summary = materialize_task_cache(
-                tasks_path=staged,
-                benchmark_name=benchmark_name,
-            )
-            materialized[benchmark_name] = int(summary["row_count"])
+            materialize_task_cache(tasks_path=staged, benchmark_name=benchmark_name)
+            materialized[benchmark_name] = {
+                str(row.get("instance_id") or "").strip()
+                for row in benchmark_rows
+                if str(row.get("instance_id") or "").strip()
+            }
 
     logger.info(
         "Materialized SOMA task row cache from %s: %s",
-        tasks_file,
-        materialized,
+        source,
+        {name: len(ids) for name, ids in materialized.items()},
     )
     return materialized
 
@@ -739,10 +857,12 @@ class CompactBenchExecutor:
 
         self._preload_plugin_template()
         self._preload_tiktoken_cache()
+        self._soma_task_cache_lock = threading.Lock()
+        self._soma_task_cache_refreshed_at = time.monotonic()
         self._soma_task_benchmarks = self._preload_soma_task_cache()
         self._ensure_copilot_shared_proxy_stack()
 
-    def _preload_soma_task_cache(self) -> dict[str, int]:
+    def _preload_soma_task_cache(self) -> dict[str, set[str]]:
         """Materialize the SOMA task rows once, at start, rather than per run.
 
         A failure here must not stop the service: SWE-bench Verified runs do not
@@ -757,6 +877,51 @@ class CompactBenchExecutor:
                 "resolve on this host until it is fixed"
             )
             return {}
+
+    def _ensure_soma_task_row(self, *, benchmark: str, instance_id: str) -> None:
+        """Re-materialize the row cache for a SOMA task this host has never seen.
+
+        Tasks are imported and published while a competition is already running, so
+        the set materialized at start-up goes out of date. Without this the only cure
+        is restarting every sandbox host, and until then those runs fail with
+        "instance not found" for a reason the miner had no part in.
+
+        Rate-limited to one refresh per SOMA_TASKS_DATASET_REFRESH_SECONDS, and a
+        refresh that still does not know the instance is left to fail in the runner:
+        the instance may simply not be published yet.
+        """
+        from soma_bench.benchmark.swebench_images import is_swebench_benchmark
+
+        name = str(benchmark or "").strip()
+        instance = str(instance_id or "").strip()
+        if not name or not instance:
+            return
+        # SWE-bench instances resolve from a public Hugging Face dataset and are never
+        # in this cache, so a miss there means nothing. Asked of SOMA-benchmark rather
+        # than pattern-matched here, so the runner and this host cannot disagree about
+        # which benchmark a name refers to.
+        if is_swebench_benchmark(name):
+            return
+        if instance in self._soma_task_benchmarks.get(name, frozenset()):
+            return
+
+        interval = _coerce_positive_float(
+            os.getenv(SOMA_TASKS_DATASET_REFRESH_SECONDS_ENV),
+            DEFAULT_SOMA_TASKS_DATASET_REFRESH_SECONDS,
+        )
+        with self._soma_task_cache_lock:
+            if instance in self._soma_task_benchmarks.get(name, frozenset()):
+                return
+            elapsed = time.monotonic() - self._soma_task_cache_refreshed_at
+            if elapsed < interval:
+                return
+            logger.info(
+                "SOMA task row cache does not know benchmark=%s instance_id=%s; refreshing",
+                name,
+                instance,
+            )
+            self._soma_task_cache_refreshed_at = time.monotonic()
+            self._soma_task_benchmarks = self._preload_soma_task_cache()
 
     def _ensure_copilot_shared_proxy_stack(self) -> None:
         if not self._copilot_shared_proxy_enabled:
@@ -980,6 +1145,9 @@ class CompactBenchExecutor:
         timeout_per_task: float | None,
     ) -> CompactBenchExecutionOutput:
         self._maybe_cleanup_stale_output_dirs()
+        self._ensure_soma_task_row(
+            benchmark=str(task.benchmark or ""), instance_id=str(task.instance_id or "")
+        )
         output_dir = self._output_root / _slug(batch_id, default="batch") / _slug(
             f"{task.instance_id}-{uuid.uuid4().hex[:8]}",
             default="task",

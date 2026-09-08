@@ -21,6 +21,9 @@ Two rules keep the destructive half safe:
   holds only the new tasks), and it is exactly the operation that must never run while
   a validator is pulling. The visibility state the same tick is about to enforce
   decides whether pruning is allowed.
+* **While the repository is public, only competitions whose own window is open may be
+  copied in.** Competitions overlap at a handover, so the tasks the database asks for
+  can include the *next* competition's hidden tasks while this one is still published.
 * **A database read failure aborts the whole tick.** An empty desired set is a
   legitimate instruction to empty the repository, so it must not be reachable by
   accident.
@@ -184,20 +187,27 @@ def relevant_competition_ids(
     }
 
 
-def _is_soma_task(benchmark_name: str | None, screener_stage: int | None) -> bool:
-    """Whether a task row carries its own images, resolved the way dispatch resolves it.
+def publishable_competition_ids(
+    windows: list[tuple[int, datetime, datetime]],
+    *,
+    now: datetime,
+) -> set[int]:
+    """Competitions whose own public window is open.
 
-    The name is passed through ``resolve_benchmark_name`` first, so a row that records
-    no benchmark falls back to the same stage default the runner would use. Deciding
-    this from the raw column instead would let a blank name mean "SOMA task" at
-    dispatch and "not my problem" here - and a task nobody copies but everybody waits
-    for never runs at all.
+    Narrower than :func:`relevant_competition_ids`, which also covers a competition
+    being prepared. The difference matters at a handover: competitions overlap, so
+    "the tasks the database asks for" can include the *next* competition's hidden
+    tasks while this one is still published. Those may be staged into the repository
+    while it is private, but adding them while it is public would publish them.
+
+    Shared with the dataset sync, so both halves of a task - its images and its rows -
+    are held back by the same rule.
     """
-    return benchmark_registry.is_soma_task_benchmark(
-        benchmark_registry.resolve_benchmark_name(
-            benchmark_name, screener_stage=screener_stage
-        )
-    )
+    return {
+        competition_id
+        for competition_id, start, end in windows
+        if start <= now < end
+    }
 
 
 async def load_desired_instance_ids(
@@ -228,7 +238,9 @@ async def load_desired_instance_ids(
         str(instance_id).strip()
         for instance_id, benchmark_name, screener_stage in rows
         if str(instance_id or "").strip()
-        and _is_soma_task(benchmark_name, screener_stage)
+        and benchmark_registry.is_soma_task(
+            benchmark_name, screener_stage=screener_stage
+        )
     }
 
 
@@ -359,6 +371,11 @@ async def run_task_sync_tick(
         )
 
     competition_ids = relevant_competition_ids(windows, now=now)
+    if public:
+        # Copies are unconditional, so the set they are computed from is what keeps a
+        # competition being prepared out of a published repository (see
+        # publishable_competition_ids). Its images are staged on the next private tick.
+        competition_ids &= publishable_competition_ids(windows, now=now)
     desired_instance_ids = await load_desired_instance_ids(
         db, competition_ids=competition_ids
     )
@@ -425,8 +442,8 @@ def dispatch_block_reason(
     if not sync_enabled() or not bool(settings.dockerhub_task_sync_block_dispatch):
         return None
     # Resolved here rather than by the caller, so this and the sync's own filter
-    # cannot answer differently for the same row (see _is_soma_task).
-    if not _is_soma_task(benchmark_name, screener_stage):
+    # cannot answer differently for the same row (see benchmarks.is_soma_task).
+    if not benchmark_registry.is_soma_task(benchmark_name, screener_stage=screener_stage):
         return None
 
     instance = str(instance_id or "").strip()

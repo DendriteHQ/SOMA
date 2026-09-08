@@ -49,6 +49,16 @@ The same tick also reconciles the repository's *contents* (``dockerhub_task_sync
 that what gets published is exactly the current competition's tasks. Ordering within a
 tick is deliberate: contents are brought up to date first, and the sync only deletes
 tags when this tick has determined the repository stays private.
+
+Despite the module's name this is the release schedule for *two* channels, because a
+task is not runnable without both of them: the images (Docker Hub) and the rows that
+describe them - problem statement, image references, graded test ids - which are
+published to a Hugging Face dataset by ``hf_task_sync``. They deliberately share this
+one loop rather than running two: the window is computed once, the ordering
+(contents, then visibility) is the same for both, and a deployment where the images and
+the rows describing them open at different moments has no useful meaning. The settings
+keep their ``DOCKERHUB_VISIBILITY_*`` names for the same reason - they name the
+schedule, not the registry.
 """
 
 from __future__ import annotations
@@ -63,6 +73,7 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.services import dockerhub_registry as hub
 from app.services import dockerhub_task_sync
+from app.services import hf_task_sync
 from soma_shared.db.models.competition_config import CompetitionConfig
 from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.session import get_db_session
@@ -223,7 +234,7 @@ async def run_visibility_tick(now: datetime | None = None) -> dict[str, str]:
         for repository in settings.dockerhub_task_repositories
         if repository.strip()
     ]
-    if not repositories:
+    if not repositories and not hf_task_sync.sync_enabled():
         return {}
 
     now = now or datetime.now(timezone.utc)
@@ -244,9 +255,30 @@ async def run_visibility_tick(now: datetime | None = None) -> dict[str, str]:
                 # private would stall grading for the whole competition. Runs whose
                 # images are missing are held back at dispatch instead.
                 logger.exception("dockerhub_task_sync_failed")
+        if hf_task_sync.sync_enabled():
+            try:
+                await hf_task_sync.run_dataset_sync_tick(
+                    db=db, windows=windows, public=public, now=now
+                )
+            except Exception:
+                # Same reasoning as above, and independent of it: one channel failing
+                # must not take the other one down with it.
+                logger.exception("hf_task_sync_failed")
         break
 
-    outcomes = await asyncio.to_thread(_reconcile_repositories, repositories, public=public)
+    outcomes: dict[str, str] = {}
+    if repositories:
+        outcomes = await asyncio.to_thread(
+            _reconcile_repositories, repositories, public=public
+        )
+    if hf_task_sync.sync_enabled():
+        try:
+            outcomes[f"datasets/{hf_task_sync.repository()}"] = await asyncio.to_thread(
+                hf_task_sync.reconcile_visibility, public=public
+            )
+        except Exception as exc:
+            logger.exception("hf_dataset_visibility_failed")
+            outcomes[f"datasets/{hf_task_sync.repository()}"] = f"error: {exc}"
 
     changed = {
         repository: outcome
@@ -303,17 +335,18 @@ def start_dockerhub_visibility_task(app) -> None:
         for repository in settings.dockerhub_task_repositories
         if repository.strip()
     ]
-    if not repositories:
+    if not repositories and not hf_task_sync.sync_enabled():
         logger.warning("dockerhub_visibility_no_repositories_configured")
         return
 
     interval = max(30.0, float(settings.dockerhub_visibility_interval_seconds))
     task = asyncio.create_task(_run_visibility_loop(interval))
     app.state.dockerhub_visibility_task = task
-    # The dispatch gate is only armed once the loop that feeds it exists, so a
+    # The dispatch gates are only armed once the loop that feeds them exists, so a
     # deployment without this loop dispatches SOMA runs as it did before instead of
     # waiting on a readiness snapshot nothing will ever publish.
     dockerhub_task_sync.arm_dispatch_gate()
+    hf_task_sync.arm_dispatch_gate()
     logger.info(
         "dockerhub_visibility_started",
         extra={
@@ -326,14 +359,20 @@ def start_dockerhub_visibility_task(app) -> None:
             "task_sync_target": dockerhub_task_sync.target_repository(),
             "task_sync_prune": bool(settings.dockerhub_task_sync_prune),
             "task_sync_blocks_dispatch": bool(settings.dockerhub_task_sync_block_dispatch),
+            "dataset_sync_enabled": hf_task_sync.sync_enabled(),
+            "dataset_repository": hf_task_sync.repository(),
+            "dataset_source_file": str(settings.hf_dataset_source_file),
+            "dataset_prune": bool(settings.hf_dataset_prune),
+            "dataset_blocks_dispatch": bool(settings.hf_dataset_block_dispatch),
         },
     )
 
 
 async def stop_dockerhub_visibility_task(app) -> None:
-    # Disarmed first: from here on nothing is going to refresh the readiness snapshot,
-    # so the gate must not keep holding runs back on a stale one.
+    # Disarmed first: from here on nothing is going to refresh the readiness snapshots,
+    # so the gates must not keep holding runs back on a stale one.
     dockerhub_task_sync.disarm_dispatch_gate()
+    hf_task_sync.disarm_dispatch_gate()
     task = getattr(app.state, "dockerhub_visibility_task", None)
     if task is None:
         return

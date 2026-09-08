@@ -127,6 +127,17 @@ def test_relevant_competitions_include_the_not_yet_started():
     assert sync.relevant_competition_ids(windows, now=NOW) == {2, 3}
 
 
+def test_publishable_competitions_exclude_the_not_yet_started():
+    """Narrower than relevant: what may be copied in while the repository is public."""
+    windows = [
+        (1, NOW - timedelta(days=10), NOW - timedelta(days=1)),  # closed
+        (2, NOW - timedelta(days=1), NOW + timedelta(days=1)),  # open
+        (3, NOW + timedelta(days=5), NOW + timedelta(days=9)),  # future
+    ]
+
+    assert sync.publishable_competition_ids(windows, now=NOW) == {2}
+
+
 # ── plan ───────────────────────────────────────────────────────────────────
 
 
@@ -291,6 +302,43 @@ def _run_tick(monkeypatch, fake: _FakeHub, *, desired: set[str], public: bool):
     return asyncio.run(
         sync.run_task_sync_tick(db=None, windows=windows, public=public, now=NOW)
     )
+
+
+def _selected_competition_ids(monkeypatch, *, windows, public) -> set[int]:
+    """Which competitions a tick would copy images for, captured at the DB boundary."""
+    _install(monkeypatch, _FakeHub(tags=set(), source_tags=set()))
+    seen: dict[str, set[int]] = {}
+
+    async def _desired(db, *, competition_ids):
+        seen["ids"] = set(competition_ids)
+        return set()
+
+    monkeypatch.setattr(sync, "load_desired_instance_ids", _desired)
+    asyncio.run(sync.run_task_sync_tick(db=None, windows=windows, public=public, now=NOW))
+    return seen["ids"]
+
+
+def test_a_public_tick_does_not_copy_in_the_next_competitions_tasks(monkeypatch):
+    """A handover must not put the next competition's hidden images in a public repo.
+
+    Competition 1 is published; competition 2 is already configured but its own window
+    has not opened. Its images are staged on the next private tick instead.
+    """
+    windows = [
+        (1, NOW - timedelta(days=1), NOW + timedelta(days=1)),
+        (2, NOW + timedelta(days=5), NOW + timedelta(days=9)),
+    ]
+
+    assert _selected_competition_ids(monkeypatch, windows=windows, public=True) == {1}
+
+
+def test_a_private_tick_stages_the_next_competitions_tasks(monkeypatch):
+    windows = [
+        (1, NOW - timedelta(days=1), NOW + timedelta(days=1)),
+        (2, NOW + timedelta(days=5), NOW + timedelta(days=9)),
+    ]
+
+    assert _selected_competition_ids(monkeypatch, windows=windows, public=False) == {1, 2}
 
 
 def test_tick_does_not_delete_while_the_repository_is_public(monkeypatch):

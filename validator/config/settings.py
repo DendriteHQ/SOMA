@@ -48,6 +48,10 @@ class Settings(BaseModel):
     # harness (see validator/evaluation/soma_task_evaluator.py).
     soma_task_test_image_repository: str
     soma_task_test_image_tag_suffix: str
+    # Published task rows. The platform keeps this dataset private while the tasks are
+    # hidden and public for the evaluation window, so a validator needs no credentials
+    # and nothing provisioned onto its host. Empty falls back to the grading file.
+    soma_task_dataset_repo: str
     soma_task_grading_file: Path
     soma_task_eval_timeout_seconds: int
     soma_task_eval_network: str
@@ -167,6 +171,7 @@ class Settings(BaseModel):
             soma_task_test_image_tag_suffix=os.getenv(
                 "SOMA_TASK_TEST_IMAGE_TAG_SUFFIX", ".test"
             ),
+            soma_task_dataset_repo=os.getenv("SOMA_TASK_DATASET_REPO", ""),
             soma_task_grading_file=Path(
                 os.getenv(
                     "SOMA_TASK_GRADING_FILE",
