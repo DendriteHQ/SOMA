@@ -305,22 +305,39 @@ def test_build_swe_miner_category_scores_with_penalty_returns_scores_for_complet
     assert scores["miner-a"]["Medium"] is None
 
 
-def test_compute_swe_task_score_uses_dynamic_task_run_count_for_bonus_zone():
+def test_compute_swe_task_score_applies_symmetric_quality_curve():
+    scoring = _load_scoring_module()
+
+    token_score = scoring._compression_ratio(100.0, 90.0)
+
+    no_quality = scoring.compute_swe_task_score(20, 0, 100.0, 90.0, task_run_count=20)
+    fifty_percent = scoring.compute_swe_task_score(20, 10, 100.0, 90.0, task_run_count=20)
+    transition_midpoint = scoring.compute_swe_task_score(20, 13, 100.0, 90.0, task_run_count=20)
+    eighty_percent = scoring.compute_swe_task_score(20, 16, 100.0, 90.0, task_run_count=20)
+
+    assert no_quality["zone"] == "penalty"
+    assert no_quality["score"] == -2.0
+    assert fifty_percent["zone"] == "penalty"
+    assert fifty_percent["score"] == -1.0
+    assert transition_midpoint["zone"] == "penalty"
+    assert abs(transition_midpoint["score"] - ((-1.0 + token_score) / 2.0)) < 1e-9
+    assert eighty_percent["zone"] == "maintain"
+    assert abs(eighty_percent["score"] - token_score) < 1e-9
+
+
+def test_compute_swe_task_score_caps_bonus_at_symmetric_upper_bound():
     scoring = _load_scoring_module()
 
     result = scoring.compute_swe_task_score(
         10,
-        12,
+        20,
         100.0,
-        80.0,
+        25.0,
         task_run_count=20,
     )
 
-    expected_ratio = scoring._compression_ratio(100.0, 80.0)
-    expected_bonus = (12 - 10) / (20 - 10)
-
     assert result["zone"] == "bonus"
-    assert abs(result["score"] - (expected_ratio + expected_bonus)) < 1e-9
+    assert result["score"] == 2.0
 
 
 def test_task_input_summary_exposes_dynamic_task_run_count():
@@ -362,6 +379,26 @@ def test_task_input_summary_exposes_dynamic_task_run_count():
     assert task_run_count == 12
     assert tok_b is not None
     assert tok_a == 80.0
+
+
+def test_task_inputs_average_baseline_tokens_across_all_attempts():
+    scoring = _load_scoring_module()
+
+    group = {
+        "baseline_runs": {
+            1: {"resolved": True, "input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 0},
+            2: {"resolved": False, "input_tokens": 300, "cached_input_tokens": 0, "output_tokens": 0},
+        },
+        "runs": [],
+    }
+
+    x, y, tok_b, tok_a, task_run_count = scoring._task_inputs(group)
+
+    assert x == 1
+    assert y == 0
+    assert tok_b == 200.0
+    assert tok_a is None
+    assert task_run_count == 2
 
 
 def test_compute_explore_task_score_uses_quality_gate_for_rewards():

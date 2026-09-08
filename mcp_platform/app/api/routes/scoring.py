@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import floor, log2
+from math import ceil, log2
 from typing import Any
 
 from soma_shared.contracts.api.v1.frontend import SweMinerTaskResultItem
@@ -323,16 +323,15 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
     return tasks
 
 
-SCORING_ALPHA = 0.8           
-SCORING_R_MIN = -2.0          
-SCORING_R_MAX = 2.0           
+SCORING_R_MIN = -2.0
+SCORING_R_MAX = 2.0
 SCORING_BONUS_MAX = 0.1
 SCORING_BONUS_MIN_EXTRA = 2
-SCORING_PENALTY_FLOOR = -4.0  
-SCORING_PENALTY_CEIL = -2.0
+SCORING_QUALITY_PENALTY_ONLY_RATIO = 0.5
+SCORING_QUALITY_TOKEN_SCORE_RATIO = 0.8
 
-SWE_SCORE_MIN = SCORING_PENALTY_FLOOR
-SWE_SCORE_MAX = SCORING_R_MAX + SCORING_BONUS_MAX
+SWE_SCORE_MIN = SCORING_R_MIN
+SWE_SCORE_MAX = SCORING_R_MAX
 
 
 def _compression_ratio(
@@ -351,9 +350,35 @@ def _compression_ratio(
     return max(SCORING_R_MIN, min(SCORING_R_MAX, log2(ratio)))
 
 
-def _penalty_threshold(x: int) -> int:
-    """floor(x * alpha). x <= 1 is handled as a special case by the caller."""
-    return floor(x * SCORING_ALPHA)
+def _quality_token_score_threshold(x: int) -> int:
+    """Minimum integer resolved count that reaches the 80% quality boundary."""
+    return ceil(x * SCORING_QUALITY_TOKEN_SCORE_RATIO)
+
+
+def _quality_adjusted_score(*, x: int, y: int, token_score: float) -> tuple[float, str]:
+    """Blend quality and token efficiency into a symmetric raw score.
+
+    Below 50% of baseline quality, only the quality penalty contributes. From
+    50% to 80%, the score moves linearly from -1 to the token score. At 80%
+    and above, quality contributes no penalty and the token score applies in
+    full.
+    """
+    quality_ratio = max(0.0, min(1.0, y / x))
+    penalty_only_ratio = SCORING_QUALITY_PENALTY_ONLY_RATIO
+    token_score_ratio = SCORING_QUALITY_TOKEN_SCORE_RATIO
+
+    if quality_ratio <= penalty_only_ratio:
+        # -2 at zero resolved runs, rising linearly to -1 at 50% quality.
+        return SCORING_R_MIN + (2.0 * quality_ratio), "penalty"
+
+    if quality_ratio < token_score_ratio:
+        blend = (quality_ratio - penalty_only_ratio) / (
+            token_score_ratio - penalty_only_ratio
+        )
+        score = ((1.0 - blend) * -1.0) + (blend * token_score)
+        return score, "penalty"
+
+    return token_score, "maintain"
 
 
 def _bonus_component(*, x: int, y: int, task_run_count: int) -> float:
@@ -408,12 +433,12 @@ def compute_swe_task_score(
       zone        — 'penalty' | 'maintain' | 'bonus' | 'none'
       pool        — 'main' | 'hard_boost' | 'excluded'
       r           — compression ratio used
-      threshold   — penalty threshold for this task
+      threshold   — resolved-run count that reaches the 80% quality boundary
       hard_boost_contribution — contribution to the hard-boost pool (floored
                     at 0), or ``None`` if pool != 'hard_boost'
     """
     r = _compression_ratio(tokens_without_compression, tokens_with_compression)
-    threshold = _penalty_threshold(x)
+    threshold = _quality_token_score_threshold(x)
     task_run_count = max(int(task_run_count), x, y, 1)
 
     # ── Impossible / near-impossible baseline tasks (x <= 1) ─────────────
@@ -446,16 +471,8 @@ def compute_swe_task_score(
         }
 
     # ── Standard tasks (x >= 2) ────────────────────────────────────
-    if y < threshold:
-        if threshold == 0:
-            raw = SCORING_PENALTY_FLOOR
-        else:
-            raw = SCORING_PENALTY_CEIL - 2.0 * (1.0 - y / threshold)
-        raw = max(SCORING_PENALTY_FLOOR, min(SCORING_PENALTY_CEIL, raw))
-        zone = "penalty"
-    elif y <= x:
-        raw = r
-        zone = "maintain"
+    if y <= x:
+        raw, zone = _quality_adjusted_score(x=x, y=y, token_score=r)
     else:
         bonus = _bonus_component(x=x, y=y, task_run_count=task_run_count)
         raw = max(SCORING_R_MIN, min(SWE_SCORE_MAX, r + bonus))
@@ -481,9 +498,9 @@ def _task_inputs(
     resolved_baselines = [baseline for baseline in baselines if baseline["resolved"] is True]
     x = len(resolved_baselines)
 
-    resolved_baseline_tokens = [
+    baseline_tokens = [
         weighted
-        for baseline in resolved_baselines
+        for baseline in baselines
         if (
             weighted := compute_weighted_tokens(
                 input_tokens=baseline["input_tokens"],
@@ -494,8 +511,8 @@ def _task_inputs(
         is not None
     ]
     tok_b = (
-        sum(resolved_baseline_tokens) / len(resolved_baseline_tokens)
-        if resolved_baseline_tokens
+        sum(baseline_tokens) / len(baseline_tokens)
+        if baseline_tokens
         else None
     )
 
