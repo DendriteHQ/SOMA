@@ -121,6 +121,8 @@ def _classify_restart_reason(
         return "provider_model_404"
     if error == "400 Provider returned error":
         return "provider_400"
+    if "429 Rate limit exceeded: new-account-rpm/deepseek/deepseek-v4-pro-" in error:
+        return "provider_new_account_rpm_429"
     if "ENOTFOUND" in error:
         return "proxy_dns_failure"
     if "500 Internal Server Error" in error:
@@ -143,6 +145,18 @@ def _classify_restart_reason(
         return "missing_container_env_file"
     if "Connection refused" in error and "http://proxy:8080/chat/completions" in error:
         return "proxy_connection_refused"
+    if (
+        "connection closed before message completed" in error
+        and "http://proxy:8080/chat/completions" in error
+    ):
+        return "proxy_connection_closed_early"
+    if "Cannot connect to the Docker daemon" in error:
+        return "docker_daemon_unavailable"
+    if (
+        "unable to apply cgroup configuration" in error
+        and "Message recipient disconnected from message bus" in error
+    ):
+        return "docker_cgroup_start_failure"
 
     return None
 
@@ -170,9 +184,61 @@ _FETCH_CANDIDATE_ROWS_SQL = sa.text(
     LEFT JOIN miners m
       ON m.id = r.miner_fk
     WHERE r.status IN :terminal_statuses
+      -- Restart only the newest competition, even if older configs remain active.
+      AND t.competition_fk = (SELECT MAX(id) FROM competitions)
       AND r.last_error IS NOT NULL
       AND btrim(r.last_error) <> ''
+      AND btrim(r.last_error) NOT LIKE 'Platform is at capacity.%'
       AND r.updated_at <= :max_updated_at
+      -- Keep the fetch window limited to rows Python can classify for restart.
+      -- Without this predicate, old auth/credit failures can consume fetch_limit.
+      AND (
+          (
+              (
+                  lower(coalesce(r.status, '') || E'\n' || r.last_error) LIKE '%timeout%'
+                  OR lower(coalesce(r.status, '') || E'\n' || r.last_error) LIKE '%timed out%'
+                  OR lower(coalesce(r.status, '') || E'\n' || r.last_error) LIKE '%deadline%'
+              )
+              AND coalesce(r.tokens_used, 0) <= 0
+              AND coalesce(r.input_tokens, 0) <= 0
+              AND coalesce(r.cached_input_tokens, 0) <= 0
+              AND coalesce(r.output_tokens, 0) <= 0
+              AND coalesce(r.agent_steps, 0) <= 0
+          )
+          OR (
+              r.last_error LIKE '%not found on provider at http://proxy:8080/%'
+              AND r.last_error LIKE '%HTTP 404%'
+          )
+          OR btrim(r.last_error) = '400 Provider returned error'
+          OR r.last_error LIKE '%429 Rate limit exceeded: new-account-rpm/deepseek/deepseek-v4-pro-%'
+          OR r.last_error LIKE '%ENOTFOUND%'
+          OR r.last_error LIKE '%500 Internal Server Error%'
+          OR r.last_error LIKE '%"code"' || chr(58) || '520%'
+          OR r.last_error LIKE '%error code: 520%'
+          OR r.last_error LIKE '%502 Bad Gateway%'
+          OR r.last_error LIKE '%all predefined address pools have been fully subnetted%'
+          OR btrim(r.last_error) LIKE 'Volume soma-copilot-%'
+          OR r.last_error LIKE '%Failed to clone benchmark repository%'
+          OR r.last_error LIKE '%Failed to fetch benchmark base commit%'
+          OR r.last_error LIKE '%Failed to checkout benchmark base commit%'
+          OR (
+              btrim(r.last_error) LIKE 'env file %'
+              AND r.last_error LIKE '% not found:%'
+          )
+          OR (
+              r.last_error LIKE '%Connection refused%'
+              AND r.last_error LIKE '%http://proxy:8080/chat/completions%'
+          )
+          OR (
+              r.last_error LIKE '%connection closed before message completed%'
+              AND r.last_error LIKE '%http://proxy:8080/chat/completions%'
+          )
+          OR r.last_error LIKE '%Cannot connect to the Docker daemon%'
+          OR (
+              r.last_error LIKE '%unable to apply cgroup configuration%'
+              AND r.last_error LIKE '%Message recipient disconnected from message bus%'
+          )
+      )
       AND EXISTS (
           SELECT 1
           FROM competition_configs cc
@@ -414,11 +480,16 @@ async def run_service(settings: Settings) -> None:
     )
     try:
         while True:
+            tick_started_at = time.perf_counter()
             try:
                 await process_once(engine, settings)
             except Exception:
                 logger.exception("tick_failed")
-            await asyncio.sleep(settings.interval_seconds)
+            remaining_sleep_seconds = max(
+                0.0,
+                settings.interval_seconds - (time.perf_counter() - tick_started_at),
+            )
+            await asyncio.sleep(remaining_sleep_seconds)
     finally:
         await engine.dispose()
         logger.info("service_stopped")
