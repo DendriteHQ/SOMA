@@ -412,6 +412,64 @@ def test_gate_blocks_a_task_whose_images_are_not_there_yet(monkeypatch):
     )
 
 
+def test_gate_holds_back_a_ready_task_while_the_repository_is_private(monkeypatch):
+    """Tags in a private repository are not pullable, so the run must wait.
+
+    This is the window between eval_starts_at and the tick that opens the repository:
+    the sync has already copied everything, so readiness says yes while a pull would
+    still fail with 401.
+    """
+    sync.publish_visibility(False)
+    sync._publish_snapshot(
+        sync.TaskImageSnapshot(
+            target_repository=TARGET,
+            ready_instance_ids=frozenset({"ready"}),
+            pending_instance_ids=frozenset(),
+            updated_at=NOW,
+        )
+    )
+
+    assert (
+        sync.dispatch_block_reason(benchmark_name=SOMA_BENCHMARK, instance_id="ready")
+        == sync.BLOCK_REASON_REPOSITORY_PRIVATE
+    )
+
+
+def test_gate_releases_the_task_once_the_repository_is_observed_public():
+    sync.publish_visibility(True)
+    sync._publish_snapshot(
+        sync.TaskImageSnapshot(
+            target_repository=TARGET,
+            ready_instance_ids=frozenset({"ready"}),
+            pending_instance_ids=frozenset(),
+            updated_at=NOW,
+        )
+    )
+
+    assert (
+        sync.dispatch_block_reason(benchmark_name=SOMA_BENCHMARK, instance_id="ready")
+        is None
+    )
+
+
+def test_an_unobserved_visibility_does_not_gate_dispatch():
+    """A deployment that manages visibility elsewhere keeps dispatching as before."""
+    sync.publish_visibility(None)
+    sync._publish_snapshot(
+        sync.TaskImageSnapshot(
+            target_repository=TARGET,
+            ready_instance_ids=frozenset({"ready"}),
+            pending_instance_ids=frozenset(),
+            updated_at=NOW,
+        )
+    )
+
+    assert (
+        sync.dispatch_block_reason(benchmark_name=SOMA_BENCHMARK, instance_id="ready")
+        is None
+    )
+
+
 def test_gate_never_holds_back_a_swebench_task():
     """Stage-1 tasks come from the public dataset - this repository is irrelevant to
     them, and gating them would stall screening."""

@@ -61,6 +61,7 @@ logger = get_logger(__name__)
 
 BLOCK_REASON_SYNC_PENDING = "task_dataset_sync_pending"
 BLOCK_REASON_ROW_MISSING = "task_dataset_row_missing"
+BLOCK_REASON_DATASET_PRIVATE = "task_dataset_repository_private"
 
 #: Repository root, so a relative HF_DATASET_SOURCE_FILE resolves the same way
 #: wherever the process was started from.
@@ -91,6 +92,13 @@ class TaskDatasetSnapshot:
 
 _SNAPSHOT: TaskDatasetSnapshot | None = None
 
+# The visibility the last reconcile *observed*, for the same reason the image sync keeps
+# it (see dockerhub_task_sync._PUBLIC): rows are committed while the repository is still
+# private, so "the row is published" and "a sandbox can read it" are different claims,
+# and only the second one makes a run dispatchable. ``None`` means not observed yet and
+# does not block.
+_PUBLIC: bool | None = None
+
 # Whether the reconcile loop is actually running in this process; the gate is armed by
 # the loop, not by the setting, for the reason spelled out in dockerhub_task_sync.
 _LOOP_ARMED = False
@@ -120,9 +128,20 @@ def _publish_snapshot(snapshot: TaskDatasetSnapshot) -> None:
 
 
 def reset_snapshot() -> None:
-    """Drop the snapshot, so readiness is unknown again (used by tests)."""
-    global _SNAPSHOT
+    """Drop the snapshot and the observed visibility (used by tests)."""
+    global _SNAPSHOT, _PUBLIC
     _SNAPSHOT = None
+    _PUBLIC = None
+
+
+def publish_visibility(public: bool | None) -> None:
+    """Record the visibility a reconcile observed for the dataset repository."""
+    global _PUBLIC
+    _PUBLIC = public
+
+
+def observed_visibility() -> bool | None:
+    return _PUBLIC
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +372,7 @@ def reconcile_visibility(*, public: bool) -> str:
     repo = repository()
     want_private = not public
     currently_private = hf.is_private(repo)
+    publish_visibility(not currently_private)
     if currently_private == want_private:
         return "private" if currently_private else "public"
 
@@ -370,6 +390,7 @@ def reconcile_visibility(*, public: bool) -> str:
             )
 
     now_private = hf.set_private(repo, private=want_private)
+    publish_visibility(not now_private)
     if now_private != want_private:
         return (
             "error: visibility unchanged after request "
@@ -477,6 +498,10 @@ def dispatch_block_reason(
     snapshot = _SNAPSHOT
     if snapshot is None:
         return BLOCK_REASON_SYNC_PENDING
+    # Checked before readiness: a private dataset stops every task, so reporting the
+    # repository is more useful than reporting one task's row.
+    if _PUBLIC is False:
+        return BLOCK_REASON_DATASET_PRIVATE
     if instance in snapshot.ready_instance_ids:
         return None
     return BLOCK_REASON_ROW_MISSING

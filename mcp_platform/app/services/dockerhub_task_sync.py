@@ -28,10 +28,13 @@ Two rules keep the destructive half safe:
   legitimate instruction to empty the repository, so it must not be reachable by
   accident.
 
-Dispatch is gated on the result. A run whose task images are not in the competition
-repository yet cannot be graded and its sandbox cannot even pull the env image, so
-:func:`dispatch_block_reason` holds those runs back in ``pending`` until the copy has
-landed rather than letting them fail for a reason the miner had no part in.
+Dispatch is gated on the result, on two counts. A run whose task images are not in the
+competition repository yet cannot be graded and its sandbox cannot even pull the env
+image - and neither can a run whose images *are* there while the repository is still
+private, which is the state between ``eval_starts_at`` and the tick that opens it. So
+:func:`dispatch_block_reason` holds a run back until the copy has landed *and* the
+repository has been observed public, rather than letting it fail for a reason the miner
+had no part in.
 """
 
 from __future__ import annotations
@@ -64,6 +67,7 @@ TARGET_REPOSITORY_DESCRIPTION = (
 
 BLOCK_REASON_SYNC_PENDING = "task_images_sync_pending"
 BLOCK_REASON_IMAGES_MISSING = "task_images_missing"
+BLOCK_REASON_REPOSITORY_PRIVATE = "task_images_repository_private"
 
 
 class TaskSyncError(RuntimeError):
@@ -90,6 +94,20 @@ class TaskImageSnapshot:
 
 
 _SNAPSHOT: TaskImageSnapshot | None = None
+
+# The visibility the last reconcile *observed* for the target repository, not the one it
+# intended. Kept apart from the snapshot because the two are established at different
+# points of the same tick: contents are synced first (and the snapshot published), the
+# flip happens after. A tag being in the repository does not make it pullable - the
+# repository has to be public too, and between eval_starts_at and the tick that opens it
+# the repository still holds the tasks privately. Dispatching in that gap fails every
+# run for a reason the miner had no part in, which is exactly what this gate exists to
+# prevent.
+#
+# ``None`` means "not observed" - no visibility reconcile has reported yet, or the target
+# repository is not one this deployment manages. That is not treated as private: a
+# deployment that manages visibility elsewhere must keep dispatching as it did before.
+_PUBLIC: bool | None = None
 
 # Whether the reconcile loop is actually running in this process. The gate below is
 # armed by the loop, not by the setting: the loop is started from the visibility task,
@@ -123,9 +141,20 @@ def _publish_snapshot(snapshot: TaskImageSnapshot) -> None:
 
 
 def reset_snapshot() -> None:
-    """Drop the snapshot, so readiness is unknown again (used by tests)."""
-    global _SNAPSHOT
+    """Drop the snapshot and the observed visibility (used by tests)."""
+    global _SNAPSHOT, _PUBLIC
     _SNAPSHOT = None
+    _PUBLIC = None
+
+
+def publish_visibility(public: bool | None) -> None:
+    """Record the visibility a reconcile observed for the target repository."""
+    global _PUBLIC
+    _PUBLIC = public
+
+
+def observed_visibility() -> bool | None:
+    return _PUBLIC
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +482,10 @@ def dispatch_block_reason(
     snapshot = _SNAPSHOT
     if snapshot is None:
         return BLOCK_REASON_SYNC_PENDING
+    # Checked before readiness: a private repository stops every task, so reporting the
+    # repository is more useful than reporting one task's tags.
+    if _PUBLIC is False:
+        return BLOCK_REASON_REPOSITORY_PRIVATE
     if instance in snapshot.ready_instance_ids:
         return None
     return BLOCK_REASON_IMAGES_MISSING

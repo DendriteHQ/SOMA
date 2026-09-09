@@ -242,17 +242,13 @@ class Settings(BaseSettings):
     # evaluation both run inside the evaluation window (stage-2 seeding is gated on
     # now >= eval_starts_at), so "eval_starts_at" already covers every hidden-task run.
     # "upload_ends_at" only opens earlier, during the idle stretch before stage 2; it
-    # grades nothing extra and exists to avoid the up-to-one-tick window in which the
-    # repository is still private right after eval_starts_at.
+    # grades nothing extra and only lengthens the exposure window. The boundary itself
+    # is handled without it: the reconcile loop wakes on the window edge rather than on
+    # the interval, and the dispatch gates hold runs back until the repository has been
+    # observed public.
     dockerhub_visibility_public_from: Literal["eval_starts_at", "upload_ends_at"] = Field(
         default="eval_starts_at",
         alias="DOCKERHUB_VISIBILITY_PUBLIC_FROM",
-    )
-    # How long the repository stays public past eval_ends_at, so validations still in
-    # flight when the competition closes can finish pulling.
-    dockerhub_visibility_grace_seconds: float = Field(
-        default=4 * 3600.0,
-        alias="DOCKERHUB_VISIBILITY_GRACE_SECONDS",
     )
     dockerhub_api_timeout_seconds: float = Field(
         default=30.0,
@@ -300,7 +296,7 @@ class Settings(BaseSettings):
     # sandbox host and tasks/soma_tasks_grading.jsonl onto every validator by hand.
     #
     # The window itself is not configured twice: the dataset follows the same
-    # DOCKERHUB_VISIBILITY_PUBLIC_FROM / _GRACE_SECONDS boundaries, because a
+    # DOCKERHUB_VISIBILITY_PUBLIC_FROM boundary, because a
     # deployment where the images and the rows they describe open at different
     # moments has no useful meaning.
     huggingface_token: str | None = Field(default=None, alias="HUGGINGFACE_TOKEN")

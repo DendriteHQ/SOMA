@@ -515,6 +515,56 @@ def test_gate_passes_a_published_row_and_blocks_an_unpublished_one():
     assert _block_reason("pending") == sync.BLOCK_REASON_ROW_MISSING
 
 
+def test_gate_holds_back_a_published_row_while_the_dataset_is_private():
+    """Rows are committed while the repository is still private, so publication alone
+    does not mean a sandbox can read them."""
+    sync.publish_visibility(False)
+    sync._publish_snapshot(
+        sync.TaskDatasetSnapshot(
+            repository=REPO,
+            ready_instance_ids=frozenset({"ready"}),
+            pending_instance_ids=frozenset(),
+            updated_at=NOW,
+        )
+    )
+
+    assert _block_reason("ready") == sync.BLOCK_REASON_DATASET_PRIVATE
+
+
+def test_gate_releases_the_row_once_the_dataset_is_observed_public():
+    sync.publish_visibility(True)
+    sync._publish_snapshot(
+        sync.TaskDatasetSnapshot(
+            repository=REPO,
+            ready_instance_ids=frozenset({"ready"}),
+            pending_instance_ids=frozenset(),
+            updated_at=NOW,
+        )
+    )
+
+    assert _block_reason("ready") is None
+
+
+def test_reconcile_visibility_reports_what_it_observed(hub):
+    """The gate is fed by the reconcile itself, so the two cannot disagree."""
+    hub.private = True
+    sync.reconcile_visibility(public=False)
+    assert sync.observed_visibility() is False
+
+    sync.reconcile_visibility(public=True)
+    assert sync.observed_visibility() is True
+
+
+def test_a_flip_that_did_not_apply_leaves_the_gate_closed(hub, monkeypatch):
+    """Accepted-but-ignored must not read back as public, or runs would be released
+    against a repository nobody can pull from."""
+    hub.private = True
+    monkeypatch.setattr(hub, "set_private", lambda repo, *, private: True)
+
+    assert sync.reconcile_visibility(public=True).startswith("error:")
+    assert sync.observed_visibility() is False
+
+
 def test_gate_ignores_swebench_tasks():
     assert _block_reason("django__django-13821", benchmark_name=SWEBENCH_BENCHMARK) is None
 

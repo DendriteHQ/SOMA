@@ -24,21 +24,30 @@ the stage-2 cohort has been ranked. The stretch between ``upload_ends_at`` and
          |                         |                         |                               |
          |--- stage 1, uploads ----|--------- idle ----------|-- stage 2, then evaluation ---|
          |                         |                         |                               |
-                                                             |----- task images public ------|  + grace
+                                                             |----- task images public ------|
 
 So ``eval_starts_at`` (the default) already covers every hidden-task run: the images go
 public exactly when the first stage-2 run can be dispatched, not after stage 2.
 
 ``DOCKERHUB_VISIBILITY_PUBLIC_FROM=upload_ends_at`` moves the opening back into the idle
-stretch. That grades nothing extra - there is nothing to grade there yet - and its only
-purpose is to remove the race at the boundary: this loop reconciles on an interval
-(``DOCKERHUB_VISIBILITY_INTERVAL_SECONDS``), so at ``eval_starts_at`` the repository can
-still be private for up to one tick, and the first validations to claim a stage-2 run
-would fail to pull and retry. Opening early trades a longer exposure window for removing
-that hiccup.
+stretch. That grades nothing extra - there is nothing to grade there yet - and it only
+lengthens the exposure window, so it is not the default.
 
-It closes at ``eval_ends_at`` plus ``DOCKERHUB_VISIBILITY_GRACE_SECONDS``, so a
-validation still in flight when the competition ends can finish pulling.
+The boundary between "dispatch may begin" and "the repository is open" is handled in two
+places instead. ``DOCKERHUB_VISIBILITY_INTERVAL_SECONDS`` is a ceiling rather than a
+cadence: each tick records the next window edge and the loop wakes just after it, so the
+flip lands on ``eval_starts_at`` instead of up to one interval later. And because a tick
+can still be late or fail, both dispatch gates are told the visibility this tick
+*observed* - a run is only released once the repository it must pull from is actually
+public, so the worst case is a run waiting rather than a run failing.
+
+It closes at ``eval_ends_at`` exactly. Nothing is meant to be in flight there: a
+competition's timeframes are set with enough slack that every run has been dispatched,
+executed and graded before the evaluation window ends, so the moment the window closes
+there is nothing left that needs to pull. Closing on the boundary is what lets the next
+competition be staged straight away - the repository can only be emptied while it is
+private (see ``dockerhub_task_sync``), so every minute the window stays open past the
+end is a minute the next competition cannot be prepared in.
 
 This reconciles rather than reacting to events: every tick computes the visibility the
 current time implies and only calls Docker Hub when it disagrees. A missed tick, a
@@ -64,7 +73,7 @@ schedule, not the registry.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -82,6 +91,18 @@ logger = get_logger(__name__)
 
 PUBLIC_FROM_EVAL_START = "eval_starts_at"
 PUBLIC_FROM_UPLOAD_END = "upload_ends_at"
+
+# The next window boundary the loop should wake up on, published by each tick. Without
+# it the loop only reconciles every DOCKERHUB_VISIBILITY_INTERVAL_SECONDS, so a
+# repository stays private for up to one interval past eval_starts_at - and dispatch
+# begins at eval_starts_at exactly. The dispatch gates hold runs back through that gap
+# rather than failing them, but there is no reason to make them wait it out: the
+# boundaries are known in advance, so the flip can land on them.
+_NEXT_BOUNDARY: datetime | None = None
+
+# Never sleep less than this, so a boundary that has just passed (or a clock that moves
+# backwards) cannot turn the loop into a busy wait against the Docker Hub API.
+_MIN_SLEEP_SECONDS = 5.0
 
 # The Docker Hub client lives in dockerhub_registry, which the operator CLI shares.
 # Kept as module-level aliases so the calls below (and the tests) have one name to
@@ -106,7 +127,6 @@ def public_window_for_timeframe(
     timeframe: CompetitionTimeframe,
     *,
     public_from: str,
-    grace_seconds: float,
 ) -> tuple[datetime, datetime]:
     """The [start, end) interval in which a competition's task images are public.
 
@@ -118,8 +138,7 @@ def public_window_for_timeframe(
         start = _as_utc(timeframe.upload_ends_at)
     else:
         start = _as_utc(timeframe.eval_starts_at)
-    end = _as_utc(timeframe.eval_ends_at) + timedelta(seconds=max(0.0, grace_seconds))
-    return start, end
+    return start, _as_utc(timeframe.eval_ends_at)
 
 
 async def load_active_public_windows(db: AsyncSession) -> list[tuple[int, datetime, datetime]]:
@@ -147,7 +166,6 @@ async def load_active_public_windows(db: AsyncSession) -> list[tuple[int, dateti
     ).all()
 
     public_from = str(settings.dockerhub_visibility_public_from)
-    grace_seconds = float(settings.dockerhub_visibility_grace_seconds)
 
     windows: list[tuple[int, datetime, datetime]] = []
     for row in rows:
@@ -159,7 +177,6 @@ async def load_active_public_windows(db: AsyncSession) -> list[tuple[int, dateti
         start, end = public_window_for_timeframe(
             timeframe,
             public_from=public_from,
-            grace_seconds=grace_seconds,
         )
         windows.append((int(row.competition_fk), start, end))
     return windows
@@ -216,6 +233,31 @@ def _reconcile_repositories(repositories: list[str], *, public: bool) -> dict[st
     return outcomes
 
 
+def next_window_boundary(
+    windows: list[tuple[int, datetime, datetime]],
+    *,
+    now: datetime,
+) -> datetime | None:
+    """The earliest window edge still ahead of ``now``, opening or closing."""
+    edges = [edge for _cid, start, end in windows for edge in (start, end) if edge > now]
+    return min(edges) if edges else None
+
+
+def _observed_visibility(outcomes: dict[str, str], repository: str) -> bool | None:
+    """Whether ``repository`` ended this tick public, or ``None`` if unknown.
+
+    ``_reconcile_repositories`` reports what it saw rather than what it wanted, so a
+    request the API accepted without applying reads back as an error here - and an
+    error is "unknown", never "public".
+    """
+    outcome = outcomes.get(repository)
+    if outcome in {"public", "changed_to_public"}:
+        return True
+    if outcome in {"private", "changed_to_private"}:
+        return False
+    return None
+
+
 # ---------------------------------------------------------------------------
 # reconcile loop
 # ---------------------------------------------------------------------------
@@ -244,6 +286,8 @@ async def run_visibility_tick(now: datetime | None = None) -> dict[str, str]:
     async for db in get_db_session():
         windows = await load_active_public_windows(db)
         public, competition_id = should_be_public(windows, now=now)
+        global _NEXT_BOUNDARY
+        _NEXT_BOUNDARY = next_window_boundary(windows, now=now)
         if dockerhub_task_sync.sync_enabled():
             try:
                 await dockerhub_task_sync.run_task_sync_tick(
@@ -271,6 +315,13 @@ async def run_visibility_tick(now: datetime | None = None) -> dict[str, str]:
         outcomes = await asyncio.to_thread(
             _reconcile_repositories, repositories, public=public
         )
+    # What the reconcile *observed* for the repository dispatch depends on, so a run is
+    # only released once the repository it has to pull from is actually public. An
+    # outcome we cannot read (an error, or a target this deployment does not manage)
+    # reports None, which does not gate dispatch - see dockerhub_task_sync._PUBLIC.
+    dockerhub_task_sync.publish_visibility(
+        _observed_visibility(outcomes, dockerhub_task_sync.target_repository())
+    )
     if hf_task_sync.sync_enabled():
         try:
             outcomes[f"datasets/{hf_task_sync.repository()}"] = await asyncio.to_thread(
@@ -312,6 +363,23 @@ async def run_visibility_tick(now: datetime | None = None) -> dict[str, str]:
     return outcomes
 
 
+def _sleep_seconds(interval_seconds: float, *, now: datetime | None = None) -> float:
+    """How long to wait before the next reconcile.
+
+    The interval is the ceiling, not the cadence: when a window edge falls sooner the
+    loop wakes just after it instead, so a repository opens on eval_starts_at rather
+    than up to one interval later.
+    """
+    boundary = _NEXT_BOUNDARY
+    if boundary is None:
+        return interval_seconds
+    now = now or datetime.now(timezone.utc)
+    # A second past the edge, so the tick that runs there computes the phase the
+    # boundary implies rather than racing it.
+    until_boundary = (boundary - now).total_seconds() + 1.0
+    return max(_MIN_SLEEP_SECONDS, min(interval_seconds, until_boundary))
+
+
 async def _run_visibility_loop(interval_seconds: float) -> None:
     while True:
         try:
@@ -321,7 +389,7 @@ async def _run_visibility_loop(interval_seconds: float) -> None:
         except Exception:
             logger.exception("dockerhub_visibility_tick_failed")
         try:
-            await asyncio.sleep(interval_seconds)
+            await asyncio.sleep(_sleep_seconds(interval_seconds))
         except asyncio.CancelledError:
             raise
 
@@ -353,7 +421,6 @@ def start_dockerhub_visibility_task(app) -> None:
             "interval_seconds": interval,
             "repositories": repositories,
             "public_from": str(settings.dockerhub_visibility_public_from),
-            "grace_seconds": float(settings.dockerhub_visibility_grace_seconds),
             "task_sync_enabled": dockerhub_task_sync.sync_enabled(),
             "task_sync_source": dockerhub_task_sync.source_repository(),
             "task_sync_target": dockerhub_task_sync.target_repository(),

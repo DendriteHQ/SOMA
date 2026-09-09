@@ -53,7 +53,6 @@ def test_window_opens_at_eval_start_by_default():
     start, end = dockerhub_visibility.public_window_for_timeframe(
         _timeframe(),
         public_from=dockerhub_visibility.PUBLIC_FROM_EVAL_START,
-        grace_seconds=0.0,
     )
 
     assert start == EVAL_STARTS
@@ -70,21 +69,26 @@ def test_window_can_open_before_stage_2_instead():
     start, end = dockerhub_visibility.public_window_for_timeframe(
         _timeframe(),
         public_from=dockerhub_visibility.PUBLIC_FROM_UPLOAD_END,
-        grace_seconds=0.0,
     )
 
     assert start == UPLOAD_ENDS
     assert end == EVAL_ENDS
 
 
-def test_grace_extends_the_window_past_eval_end():
+def test_the_window_closes_exactly_on_eval_end():
+    """No grace past eval_ends_at.
+
+    A competition's timeframes carry enough slack that everything is graded before the
+    evaluation window closes, so holding the repository open past the boundary buys
+    nothing - and it costs: the repository can only be emptied while private, so the
+    next competition cannot be staged until it closes.
+    """
     _start, end = dockerhub_visibility.public_window_for_timeframe(
         _timeframe(),
         public_from=dockerhub_visibility.PUBLIC_FROM_EVAL_START,
-        grace_seconds=4 * 3600.0,
     )
 
-    assert end == EVAL_ENDS + timedelta(hours=4)
+    assert end == EVAL_ENDS
 
 
 def test_naive_timeframe_datetimes_are_read_as_utc():
@@ -100,7 +104,6 @@ def test_naive_timeframe_datetimes_are_read_as_utc():
     start, end = dockerhub_visibility.public_window_for_timeframe(
         timeframe,
         public_from=dockerhub_visibility.PUBLIC_FROM_EVAL_START,
-        grace_seconds=0.0,
     )
 
     assert start == EVAL_STARTS
@@ -251,3 +254,75 @@ def test_reconcile_errors_when_the_repository_does_not_actually_move(monkeypatch
 
     assert outcomes["ns/a"].startswith("error: visibility unchanged")
     assert "wanted public" in outcomes["ns/a"]
+
+# ── waking up on the window boundary ───────────────────────────────────────
+
+
+def test_next_boundary_is_the_earliest_edge_still_ahead():
+    now = datetime(2026, 9, 9, 8, 30, tzinfo=timezone.utc)
+    windows = [
+        (112, datetime(2026, 9, 9, 6, 0, tzinfo=timezone.utc),
+              datetime(2026, 9, 9, 12, 0, tzinfo=timezone.utc)),   # closes at 12:00
+        (113, datetime(2026, 9, 9, 9, 5, tzinfo=timezone.utc),      # opens at 09:05
+              datetime(2026, 9, 9, 17, 5, tzinfo=timezone.utc)),
+    ]
+
+    assert dockerhub_visibility.next_window_boundary(windows, now=now) == datetime(
+        2026, 9, 9, 9, 5, tzinfo=timezone.utc
+    )
+
+
+def test_no_boundary_ahead_falls_back_to_the_interval(monkeypatch):
+    monkeypatch.setattr(dockerhub_visibility, "_NEXT_BOUNDARY", None, raising=False)
+
+    assert dockerhub_visibility._sleep_seconds(300.0) == 300.0
+
+
+def test_the_loop_wakes_just_after_the_boundary_instead_of_a_full_interval(monkeypatch):
+    """The interval is a ceiling: a repository must open on eval_starts_at, not up to
+    one interval later."""
+    now = datetime(2026, 9, 9, 8, 0, tzinfo=timezone.utc)
+    boundary = datetime(2026, 9, 9, 8, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(dockerhub_visibility, "_NEXT_BOUNDARY", boundary, raising=False)
+
+    assert dockerhub_visibility._sleep_seconds(300.0, now=now) == 61.0
+
+
+def test_a_distant_boundary_does_not_stretch_the_interval(monkeypatch):
+    now = datetime(2026, 9, 9, 8, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        dockerhub_visibility,
+        "_NEXT_BOUNDARY",
+        datetime(2026, 9, 10, tzinfo=timezone.utc),
+        raising=False,
+    )
+
+    assert dockerhub_visibility._sleep_seconds(300.0, now=now) == 300.0
+
+
+def test_a_boundary_that_just_passed_does_not_become_a_busy_wait(monkeypatch):
+    now = datetime(2026, 9, 9, 8, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        dockerhub_visibility,
+        "_NEXT_BOUNDARY",
+        datetime(2026, 9, 9, 7, 59, tzinfo=timezone.utc),
+        raising=False,
+    )
+
+    assert dockerhub_visibility._sleep_seconds(300.0, now=now) == dockerhub_visibility._MIN_SLEEP_SECONDS
+
+
+# ── reading the visibility back ────────────────────────────────────────────
+
+
+def test_observed_visibility_reads_an_outcome_back():
+    assert dockerhub_visibility._observed_visibility({"ns/r": "public"}, "ns/r") is True
+    assert dockerhub_visibility._observed_visibility({"ns/r": "changed_to_public"}, "ns/r") is True
+    assert dockerhub_visibility._observed_visibility({"ns/r": "private"}, "ns/r") is False
+    assert dockerhub_visibility._observed_visibility({"ns/r": "changed_to_private"}, "ns/r") is False
+
+
+def test_an_error_or_an_unmanaged_repository_is_unknown_not_public():
+    """A request the API accepted without applying must never read back as public."""
+    assert dockerhub_visibility._observed_visibility({"ns/r": "error: boom"}, "ns/r") is None
+    assert dockerhub_visibility._observed_visibility({}, "ns/r") is None
