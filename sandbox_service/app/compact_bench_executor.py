@@ -858,7 +858,11 @@ class CompactBenchExecutor:
         self._preload_plugin_template()
         self._preload_tiktoken_cache()
         self._soma_task_cache_lock = threading.Lock()
-        self._soma_task_cache_refreshed_at = time.monotonic()
+        # None, not "now": the start-up load does not start the refresh clock. A host
+        # that booted while the dataset was still private has no rows at all, and
+        # making it wait out a refresh interval before its first look would fail every
+        # SOMA run dispatched in that window. See _ensure_soma_task_row.
+        self._soma_task_cache_refreshed_at: float | None = None
         self._soma_task_benchmarks = self._preload_soma_task_cache()
         self._ensure_copilot_shared_proxy_stack()
 
@@ -912,8 +916,11 @@ class CompactBenchExecutor:
         with self._soma_task_cache_lock:
             if instance in self._soma_task_benchmarks.get(name, frozenset()):
                 return
-            elapsed = time.monotonic() - self._soma_task_cache_refreshed_at
-            if elapsed < interval:
+            refreshed_at = self._soma_task_cache_refreshed_at
+            # The first look is always allowed; the interval only rate-limits the ones
+            # after it, so an unreachable dataset costs one download attempt per
+            # interval rather than one per dispatched run.
+            if refreshed_at is not None and time.monotonic() - refreshed_at < interval:
                 return
             logger.info(
                 "SOMA task row cache does not know benchmark=%s instance_id=%s; refreshing",

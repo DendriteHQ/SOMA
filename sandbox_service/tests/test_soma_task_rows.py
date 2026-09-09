@@ -218,13 +218,12 @@ def test_the_dataset_url_is_configurable(monkeypatch):
 class _Executor:
     """Just enough of CompactBenchExecutor to exercise _ensure_soma_task_row."""
 
-    def __init__(self, known, *, refreshed):
+    def __init__(self, known, *, refreshed, refreshed_at=None):
         import threading
-        import time
 
         self._soma_task_benchmarks = known
         self._soma_task_cache_lock = threading.Lock()
-        self._soma_task_cache_refreshed_at = time.monotonic() - 10_000
+        self._soma_task_cache_refreshed_at = refreshed_at
         self._refreshed = refreshed
 
     def _preload_soma_task_cache(self):
@@ -273,4 +272,25 @@ def test_the_refresh_interval_caps_re_fetching(monkeypatch):
     for _ in range(3):
         instance._ensure_soma_task_row(benchmark="soma-is-tasks", instance_id="absent")
 
+    assert refreshed == [True]
+
+
+def test_the_first_look_is_never_rate_limited(monkeypatch):
+    """A host that booted while the dataset was private must not have to wait.
+
+    The refresh clock starts at the first re-fetch, not at start-up: otherwise every
+    SOMA run dispatched in the first interval after a boot with no rows would fail.
+    """
+    import time
+
+    refreshed: list[bool] = []
+    monkeypatch.setenv(executor.SOMA_TASKS_DATASET_REFRESH_SECONDS_ENV, "3600")
+
+    cold = _Executor({}, refreshed=refreshed)
+    cold._ensure_soma_task_row(benchmark="soma-is-tasks", instance_id="new")
+    assert refreshed == [True]
+
+    # ... and once it has looked, the interval does apply.
+    warm = _Executor({}, refreshed=refreshed, refreshed_at=time.monotonic())
+    warm._ensure_soma_task_row(benchmark="soma-is-tasks", instance_id="new")
     assert refreshed == [True]

@@ -221,10 +221,14 @@ def test_a_task_published_after_start_up_needs_no_restart(monkeypatch, tmp_path)
 
 
 def test_the_refresh_interval_caps_re_fetching(monkeypatch, tmp_path):
-    """A miss must not turn every validation into a download."""
+    """A miss must not turn every validation into a download.
+
+    The first miss always looks (see the test above); from there the interval holds,
+    so three validations for an unknown task cost one re-fetch, not three.
+    """
     monkeypatch.setenv("SOMA_TASK_DATASET_REFRESH_SECONDS", "3600")
     downloads = _install(
-        monkeypatch, _Downloads(_jsonl(_row("first")), _jsonl(_row("second")))
+        monkeypatch, _Downloads(_jsonl(_row("first")), _jsonl(_row("first")))
     )
 
     registry = SomaTaskRegistry(tmp_path / "none.jsonl", dataset_repo=REPO)
@@ -232,7 +236,30 @@ def test_the_refresh_interval_caps_re_fetching(monkeypatch, tmp_path):
         with pytest.raises(SomaTaskNotFoundError):
             registry.get("second")
 
-    assert len(downloads.requests) == 1
+    assert len(downloads.requests) == 2  # the load on first use, plus one re-fetch
+
+
+def test_the_first_look_is_never_rate_limited(monkeypatch, tmp_path):
+    """A validator that started while the dataset was private must not have to wait.
+
+    The refresh clock starts at the first re-fetch, not at start-up: otherwise a
+    validator whose start-up load found nothing (the repository was still private)
+    would fail every validation for a whole interval before looking again.
+    """
+    monkeypatch.setenv("SOMA_TASK_DATASET_REFRESH_SECONDS", "3600")
+    monkeypatch.setenv("SOMA_TASK_DATASET_CACHE", str(tmp_path / "absent.jsonl"))
+    _install(
+        monkeypatch,
+        _Downloads(
+            urllib.error.HTTPError(REPO, 401, "Unauthorized", {}, None),  # still private
+            _jsonl(_row("published")),  # window has opened
+        ),
+    )
+
+    registry = SomaTaskRegistry(tmp_path / "none.jsonl", dataset_repo=REPO)
+    assert registry.specs() == {}
+
+    assert registry.get("published").instance_id == "published"
 
 
 def test_a_file_backed_registry_does_not_re_fetch(monkeypatch, tmp_path):

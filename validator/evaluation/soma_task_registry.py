@@ -193,7 +193,11 @@ class SomaTaskRegistry:
         self._lock = threading.Lock()
         self._specs: dict[str, SomaTaskGradingSpec] | None = None
         self._source = "none"
-        self._loaded_at = 0.0
+        # None, not 0.0: time.monotonic() counts from boot, so 0.0 would mean
+        # "never loaded" on a long-running host and "just loaded" on one that
+        # booted a minute ago. The first look for an unknown task is always
+        # allowed; the interval only rate-limits the ones after it.
+        self._loaded_at: float | None = None
 
     # -- configuration -------------------------------------------------------
 
@@ -307,22 +311,28 @@ class SomaTaskRegistry:
         logger.info("Loaded %s SOMA task grading specs from %s", len(specs), path)
         return specs, "file"
 
-    def _load_locked(self) -> dict[str, SomaTaskGradingSpec]:
+    def _load_locked(self, *, start_clock: bool) -> dict[str, SomaTaskGradingSpec]:
+        """Load the rows; ``start_clock`` marks this as a re-fetch to be rate-limited.
+
+        The load that happens on first use is not a re-fetch: nothing has been asked
+        for yet, so it must not spend the interval that the first *actual* miss needs.
+        """
         specs, source = self._load()
         self._specs = specs
         self._source = source
-        self._loaded_at = time.monotonic()
+        if start_clock:
+            self._loaded_at = time.monotonic()
         return specs
 
     def reload(self) -> None:
         with self._lock:
             self._specs = None
-            self._loaded_at = 0.0
+            self._loaded_at = None
 
     def specs(self) -> dict[str, SomaTaskGradingSpec]:
         with self._lock:
             if self._specs is None:
-                return self._load_locked()
+                return self._load_locked(start_clock=False)
             return self._specs
 
     def _refresh_if_stale(self) -> dict[str, SomaTaskGradingSpec]:
@@ -335,12 +345,17 @@ class SomaTaskRegistry:
         interval = _env_float(DATASET_REFRESH_SECONDS_ENV, DEFAULT_DATASET_REFRESH_SECONDS)
         with self._lock:
             if self._specs is None:
-                return self._load_locked()
+                return self._load_locked(start_clock=False)
             if not self.dataset_repo:
                 return self._specs
-            if interval >= 0 and time.monotonic() - self._loaded_at < interval:
+            loaded_at = self._loaded_at
+            if (
+                loaded_at is not None
+                and interval >= 0
+                and time.monotonic() - loaded_at < interval
+            ):
                 return self._specs
-            return self._load_locked()
+            return self._load_locked(start_clock=True)
 
     def get(self, instance_id: str) -> SomaTaskGradingSpec:
         instance = str(instance_id).strip()
