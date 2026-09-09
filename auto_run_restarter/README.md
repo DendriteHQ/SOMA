@@ -25,6 +25,8 @@ Current restart rules:
 - timeout-like failures only when the run has:
   - no positive token columns
   - no recorded agent steps
+- a miner run is restarted at most five times per `(competition, hotkey, task)`;
+  the persisted counter is rebuilt from restart metadata on first use
 
 Explicitly excluded:
 
@@ -45,6 +47,7 @@ AUTO_RUN_RESTARTER_INTERVAL_SECONDS=60
 AUTO_RUN_RESTARTER_MIN_RUN_AGE_SECONDS=120
 AUTO_RUN_RESTARTER_BATCH_SIZE=100
 AUTO_RUN_RESTARTER_FETCH_LIMIT=2000
+AUTO_RUN_RESTARTER_MAX_RESTARTS_PER_TASK_HOTKEY_COMPETITION=5
 AUTO_RUN_RESTARTER_DRY_RUN=false
 AUTO_RUN_RESTARTER_LOG_LEVEL=INFO
 AUTO_RUN_RESTARTER_ENV_FILE=/root/SOMA/mcp_platform/.env

@@ -19,6 +19,7 @@ logger = logging.getLogger("auto_run_restarter")
 
 
 _TERMINAL_STATUSES = ("failed", "timeout", "cancelled")
+_RESTART_COUNT_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,124 @@ class RestartCandidate:
     output_tokens: int | None
     agent_steps: int | None
     restart_reason: str
+
+
+def _restart_count_key(candidate: RestartCandidate) -> str | None:
+    """Return the persisted cap key for miner runs; baseline runs have no hotkey."""
+    if not candidate.hotkey:
+        return None
+    return "\x1f".join(
+        (str(candidate.competition_id), candidate.hotkey, candidate.task_name)
+    )
+
+
+def _restart_count_state_path(metadata_dir: Path) -> Path:
+    return metadata_dir / "restart_counts.json"
+
+
+def _save_restart_counts(metadata_dir: Path, counts: dict[str, int]) -> None:
+    state_path = _restart_count_state_path(metadata_dir)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = state_path.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(
+            {
+                "version": _RESTART_COUNT_STATE_VERSION,
+                "counts": counts,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    temp_path.replace(state_path)
+
+
+def _load_restart_counts(metadata_dir: Path) -> dict[str, int]:
+    """Load counters, rebuilding once from JSONL metadata if state is absent."""
+    state_path = _restart_count_state_path(metadata_dir)
+    try:
+        document = json.loads(state_path.read_text(encoding="utf-8"))
+        if document.get("version") == _RESTART_COUNT_STATE_VERSION:
+            raw_counts = document.get("counts")
+            if isinstance(raw_counts, dict):
+                return {
+                    str(key): int(value)
+                    for key, value in raw_counts.items()
+                    if isinstance(value, int) and value >= 0
+                }
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, json.JSONDecodeError):
+        logger.warning("restart_count_state_read_failed path=%s", state_path)
+
+    counts: dict[str, int] = {}
+    metadata_rows = 0
+    for metadata_path in metadata_dir.glob("*/*.jsonl"):
+        try:
+            with metadata_path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                        hotkey = row.get("hotkey")
+                        competition_id = row.get("competition_id")
+                        task_name = row.get("task_name")
+                        if not hotkey or competition_id is None or not task_name:
+                            continue
+                        key = "\x1f".join(
+                            (str(int(competition_id)), str(hotkey), str(task_name))
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    counts[key] = counts.get(key, 0) + 1
+                    metadata_rows += 1
+        except OSError:
+            logger.warning("restart_metadata_read_failed path=%s", metadata_path)
+
+    _save_restart_counts(metadata_dir, counts)
+    logger.info(
+        "restart_count_state_rebuilt metadata_rows=%s tracked_miner_tasks=%s",
+        metadata_rows,
+        len(counts),
+    )
+    return counts
+
+
+def _apply_restart_cap(
+    candidates: list[RestartCandidate],
+    restart_counts: dict[str, int],
+    *,
+    max_restarts: int,
+) -> tuple[list[RestartCandidate], int]:
+    """Keep candidates below the persisted per-miner-task restart cap."""
+    if max_restarts <= 0:
+        return candidates, 0
+
+    selected: list[RestartCandidate] = []
+    pending_counts: dict[str, int] = {}
+    skipped = 0
+    for candidate in candidates:
+        key = _restart_count_key(candidate)
+        if key is None:
+            selected.append(candidate)
+            continue
+
+        count = restart_counts.get(key, 0) + pending_counts.get(key, 0)
+        if count >= max_restarts:
+            skipped += 1
+            continue
+        selected.append(candidate)
+        pending_counts[key] = pending_counts.get(key, 0) + 1
+    return selected, skipped
+
+
+def _record_restart_counts(
+    restart_counts: dict[str, int],
+    candidates: list[RestartCandidate],
+) -> None:
+    for candidate in candidates:
+        key = _restart_count_key(candidate)
+        if key is not None:
+            restart_counts[key] = restart_counts.get(key, 0) + 1
 
 
 def _configure_logging(level: str) -> None:
@@ -389,13 +508,18 @@ def _append_deleted_run_metadata(
     return output_path
 
 
-async def process_once(engine: AsyncEngine, settings: Settings) -> int:
+async def process_once(
+    engine: AsyncEngine,
+    settings: Settings,
+    restart_counts: dict[str, int],
+) -> int:
     tick_started_at = time.perf_counter()
     deleted_candidates: list[RestartCandidate] = []
     delete_seconds: float | None = None
     metadata_path: Path | None = None
     summary = ""
     matched_count = 0
+    cap_skipped_count = 0
 
     async with engine.begin() as conn:
         lock_acquired = await _try_acquire_lock(conn, settings.advisory_lock_key)
@@ -405,10 +529,16 @@ async def process_once(engine: AsyncEngine, settings: Settings) -> int:
 
         try:
             candidates = await _fetch_restartable_candidates(conn, settings)
+            candidates, cap_skipped_count = _apply_restart_cap(
+                candidates,
+                restart_counts,
+                max_restarts=settings.max_restarts_per_task_hotkey_competition,
+            )
             matched_count = len(candidates)
             if not candidates:
                 logger.info(
-                    "tick_complete deleted_runs=0 matched_runs=0 tick_seconds=%.3f",
+                    "tick_complete deleted_runs=0 matched_runs=0 cap_skipped_runs=%s tick_seconds=%.3f",
+                    cap_skipped_count,
                     time.perf_counter() - tick_started_at,
                 )
                 return 0
@@ -448,10 +578,13 @@ async def process_once(engine: AsyncEngine, settings: Settings) -> int:
             deleted_candidates,
             deleted_at=deleted_at,
         )
+        _record_restart_counts(restart_counts, deleted_candidates)
+        _save_restart_counts(settings.metadata_dir, restart_counts)
     logger.info(
-        "tick_complete deleted_runs=%s matched_runs=%s delete_seconds=%.3f tick_seconds=%.3f metadata_path=%s %s",
+        "tick_complete deleted_runs=%s matched_runs=%s cap_skipped_runs=%s delete_seconds=%.3f tick_seconds=%.3f metadata_path=%s %s",
         deleted_count,
         matched_count,
+        cap_skipped_count,
         0.0 if delete_seconds is None else delete_seconds,
         time.perf_counter() - tick_started_at,
         str(metadata_path) if metadata_path is not None else "-",
@@ -469,20 +602,22 @@ async def run_service(settings: Settings) -> None:
         pool_pre_ping=True,
     )
     logger.info(
-        "service_starting interval_seconds=%s batch_size=%s fetch_limit=%s min_run_age_seconds=%s dry_run=%s env_file=%s metadata_dir=%s",
+        "service_starting interval_seconds=%s batch_size=%s fetch_limit=%s min_run_age_seconds=%s max_restarts_per_task_hotkey_competition=%s dry_run=%s env_file=%s metadata_dir=%s",
         settings.interval_seconds,
         settings.batch_size,
         settings.fetch_limit,
         settings.min_run_age_seconds,
+        settings.max_restarts_per_task_hotkey_competition,
         settings.dry_run,
         settings.env_file,
         settings.metadata_dir,
     )
+    restart_counts = _load_restart_counts(settings.metadata_dir)
     try:
         while True:
             tick_started_at = time.perf_counter()
             try:
-                await process_once(engine, settings)
+                await process_once(engine, settings, restart_counts)
             except Exception:
                 logger.exception("tick_failed")
             remaining_sleep_seconds = max(

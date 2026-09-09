@@ -75,6 +75,7 @@ class Settings:
     min_run_age_seconds: float
     batch_size: int
     fetch_limit: int
+    max_restarts_per_task_hotkey_competition: int
     advisory_lock_key: int
     dry_run: bool
 
@@ -117,6 +118,13 @@ class Settings:
             ),
             batch_size=batch_size,
             fetch_limit=fetch_limit,
+            max_restarts_per_task_hotkey_competition=max(
+                0,
+                _read_int(
+                    "AUTO_RUN_RESTARTER_MAX_RESTARTS_PER_TASK_HOTKEY_COMPETITION",
+                    5,
+                ),
+            ),
             advisory_lock_key=_read_int(
                 "AUTO_RUN_RESTARTER_ADVISORY_LOCK_KEY",
                 11426001,
