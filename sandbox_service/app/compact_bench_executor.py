@@ -9,12 +9,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
@@ -68,6 +70,34 @@ DEFAULT_PLUGIN_REPOSITORY_URL = "https://github.com/DendriteHQ/SOMA-plugin.git"
 COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_RETENTION_SECONDS"
 COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS"
 COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV = "COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS"
+SOMA_TASKS_FILE_ENV = "SOMA_TASKS_FILE"
+# The published task rows. The platform keeps this dataset private while the tasks are
+# hidden and flips it public for the evaluation window, so a sandbox host needs no
+# credentials and nothing copied onto it. Set it and the local file below becomes a
+# fallback for hosts that are still provisioned by hand.
+SOMA_TASKS_DATASET_REPO_ENV = "SOMA_TASKS_DATASET_REPO"
+SOMA_TASKS_DATASET_PATH_ENV = "SOMA_TASKS_DATASET_PATH"
+SOMA_TASKS_DATASET_REVISION_ENV = "SOMA_TASKS_DATASET_REVISION"
+SOMA_TASKS_DATASET_CACHE_ENV = "SOMA_TASKS_DATASET_CACHE"
+SOMA_TASKS_DATASET_REFRESH_SECONDS_ENV = "SOMA_TASKS_DATASET_REFRESH_SECONDS"
+SOMA_TASKS_DATASET_TIMEOUT_SECONDS_ENV = "SOMA_TASKS_DATASET_TIMEOUT_SECONDS"
+DEFAULT_SOMA_TASKS_DATASET_PATH = "tasks.jsonl"
+DEFAULT_SOMA_TASKS_DATASET_REVISION = "main"
+DEFAULT_SOMA_TASKS_DATASET_REFRESH_SECONDS = 300.0
+DEFAULT_SOMA_TASKS_DATASET_TIMEOUT_SECONDS = 60.0
+# Only needed to read the dataset while it is still private, which a host with runs to
+# execute never has to do.
+SOMA_TASKS_HF_TOKEN_ENVS = ("HUGGINGFACE_TOKEN", "HF_TOKEN")
+SOMA_TASK_DIND_PREBAKED_REPO_ENV = "SOMA_TASK_DIND_PREBAKED_REPO"
+# Docker Hub repo the pre-baked dind image of a SOMA task is pulled from. Without
+# this, SOMA-benchmark derives the repo from the task row's own env image reference,
+# which points at the build-time repo rather than the one the competition serves.
+DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO = "dendritexhq/soma-competition-tasks-dind"
+# Default location of the SOMA task rows inside the checkout, resolved from this file
+# rather than the cwd. The file is provisioned onto sandbox hosts rather than committed
+# (it carries the hidden tasks' problem statements) - see
+# docs/ops/soma-task-provisioning.md.
+DEFAULT_SOMA_TASKS_FILE = Path(__file__).resolve().parents[2] / "tasks" / "soma_tasks.jsonl"
 COMPACT_BENCH_DEFAULT_OUTPUT_RETENTION_SECONDS = 24 * 60 * 60
 COMPACT_BENCH_DEFAULT_OUTPUT_CLEANUP_INTERVAL_SECONDS = 5 * 60
 
@@ -115,6 +145,16 @@ def _coerce_positive_int(value: Any, default: int) -> int:
         return default
     try:
         parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
@@ -615,134 +655,161 @@ def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
     cache_path.write_bytes(payload)
     return cache_path
 
-_EXPLORE_RESULT_FILENAME = "explore-result.json"
-_WORKSPACE_PREFIX = "/workspace/"
+
+def _resolve_soma_tasks_file() -> Path:
+    configured = (os.getenv(SOMA_TASKS_FILE_ENV) or "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_SOMA_TASKS_FILE
 
 
-def _strip_workspace_prefix(regions_json: str) -> str:
-    """Remove /workspace/ prefix from path fields in a regions JSON array."""
+def _resolve_soma_tasks_dataset_cache() -> Path:
+    configured = (os.getenv(SOMA_TASKS_DATASET_CACHE_ENV) or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    candidate = _resolve_soma_tasks_file().parent / "soma_tasks_dataset.jsonl"
+    if candidate.parent.is_dir():
+        return candidate
+    return Path(tempfile.gettempdir()) / "soma_tasks_dataset.jsonl"
+
+
+def _soma_tasks_dataset_url() -> str:
+    repo = (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip()
+    path = (os.getenv(SOMA_TASKS_DATASET_PATH_ENV) or "").strip() or DEFAULT_SOMA_TASKS_DATASET_PATH
+    revision = (
+        os.getenv(SOMA_TASKS_DATASET_REVISION_ENV) or ""
+    ).strip() or DEFAULT_SOMA_TASKS_DATASET_REVISION
+    return f"https://huggingface.co/datasets/{repo}/resolve/{revision}/{path}"
+
+
+def _download_soma_tasks_dataset() -> str | None:
+    url = _soma_tasks_dataset_url()
+    headers: dict[str, str] = {}
+    for name in SOMA_TASKS_HF_TOKEN_ENVS:
+        token = (os.getenv(name) or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            break
+    timeout = _coerce_positive_float(
+        os.getenv(SOMA_TASKS_DATASET_TIMEOUT_SECONDS_ENV),
+        DEFAULT_SOMA_TASKS_DATASET_TIMEOUT_SECONDS,
+    )
     try:
-        regions = json.loads(regions_json)
-        if not isinstance(regions, list):
-            return regions_json
-        changed = False
-        for region in regions:
-            if isinstance(region, dict):
-                path = region.get("path", "")
-                if isinstance(path, str) and path.startswith(_WORKSPACE_PREFIX):
-                    region["path"] = path[len(_WORKSPACE_PREFIX):]
-                    changed = True
-        return json.dumps(regions, ensure_ascii=False) if changed else regions_json
-    except (json.JSONDecodeError, TypeError):
-        return regions_json
+        with urllib_request.urlopen(
+            urllib_request.Request(url, headers=headers), timeout=timeout
+        ) as response:
+            return response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        # 401/403 on a repository that is still private is the normal state before the
+        # evaluation window opens, not a misconfiguration.
+        logger.warning("SOMA task dataset %s returned HTTP %s", url, exc.code)
+    except (urllib_error.URLError, UnicodeDecodeError, OSError) as exc:
+        logger.warning("SOMA task dataset %s could not be fetched: %s", url, exc)
+    return None
 
 
-def _read_explore_result_file(tmp_run_dir: str) -> str:
-    """Read regions JSON written by the agent to /workspace/explore-result.json.
+def _resolve_soma_task_rows() -> tuple[list[dict], str]:
+    """``(rows, source)`` - the published dataset, then its cache, then a local file.
 
-    The copilot backend snapshots the workspace volume to
-    ``tmp_run_dir/patch-eval/workspace-snapshot/`` before cleanup, so the file
-    is accessible on the host at that path after the run completes.
-    Returns the raw JSON string if valid, empty string otherwise.
+    A successful download is cached on disk, so a later network failure runs from the
+    last known-good rows rather than from nothing.
     """
-    if not tmp_run_dir:
-        return ""
-    candidate = Path(tmp_run_dir) / "patch-eval" / "workspace-snapshot" / _EXPLORE_RESULT_FILENAME
-    if not candidate.is_file():
-        return ""
-    try:
-        text = candidate.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-    if not text:
-        return ""
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list):
-            return text
-    except json.JSONDecodeError:
-        pass
-    return ""
+    from soma_bench.benchmark.soma_tasks import load_task_rows
+
+    if (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip():
+        cache = _resolve_soma_tasks_dataset_cache()
+        text = _download_soma_tasks_dataset()
+        if text is not None:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(text, encoding="utf-8")
+            except OSError as exc:
+                logger.warning("Could not cache the SOMA task dataset at %s: %s", cache, exc)
+            else:
+                return load_task_rows(cache), f"dataset {_soma_tasks_dataset_url()}"
+            # The rows are usable even when they could not be cached; stage them so
+            # load_task_rows still owns the parsing.
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".jsonl", delete=False, encoding="utf-8"
+            ) as staged:
+                staged.write(text)
+            try:
+                return load_task_rows(Path(staged.name)), f"dataset {_soma_tasks_dataset_url()}"
+            finally:
+                Path(staged.name).unlink(missing_ok=True)
+
+        if cache.is_file():
+            logger.warning(
+                "Using the cached SOMA task dataset at %s: the download failed", cache
+            )
+            return load_task_rows(cache), f"cache {cache}"
+
+    tasks_file = _resolve_soma_tasks_file()
+    if not tasks_file.is_file():
+        logger.info(
+            "No SOMA task rows on this host: dataset %r is unreachable or unset and there "
+            "is no file at %s, so only Hugging Face benchmarks will resolve (%s names the "
+            "published dataset, %s overrides the file path)",
+            (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip() or None,
+            tasks_file,
+            SOMA_TASKS_DATASET_REPO_ENV,
+            SOMA_TASKS_FILE_ENV,
+        )
+        return [], "none"
+    return load_task_rows(tasks_file), f"file {tasks_file}"
 
 
-def _extract_text_from_event(event: dict) -> str:
-    """Return the human-readable text payload from a trajectory event, or ''."""
-    data = event.get("data") or {}
-    text = data.get("message") or data.get("text") or ""
-    if not text:
-        content = data.get("content")
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            text = "\n".join(parts)
-    if not text:
-        result = data.get("result")
-        if isinstance(result, dict):
-            rc = result.get("content")
-            if isinstance(rc, str):
-                text = rc
-    return text if isinstance(text, str) else ""
+def _materialize_soma_task_cache() -> dict[str, set[str]]:
+    """Make the SOMA task rows resolvable offline by `benchmark-solve --benchmark`.
 
+    A SOMA task list is not a Hugging Face *dataset* in the shape the runner's dataset
+    path expects: its rows carry their own env/test images and none of their
+    repositories appear in SWE-bench's spec maps. SOMA-benchmark handles that by
+    writing the rows into the same on-disk row cache its runner already prefers over
+    the datasets server, keyed by the benchmark name
+    (`soma_tasks.materialize_task_cache`, exposed as the `benchmark-load-tasks`
+    command). Doing it here means the platform can dispatch a SOMA benchmark name
+    without a separate provisioning step having been run on this host first.
 
-def _extract_explore_regions_json(trajectory_path: str) -> str:
-    """Fallback: extract regions JSON from trajectory JSONL by scanning events.
+    Rows are grouped by their own `benchmark_name`, so one source can serve several
+    benchmark names. No rows is not an error: a sandbox host that only ever runs
+    SWE-bench Verified has nothing to materialize.
 
-    Prefers events whose full text IS a valid JSON list. Falls back to finding
-    the last fenced or bare JSON array of objects within an event.
-    Scans both assistant.message and tool.execution_complete events.
+    Returns the instance ids materialized per benchmark name, which is what lets a run
+    for an unknown instance trigger a refresh instead of failing.
     """
-    import re as _re
-    if not trajectory_path:
-        return ""
-    path = Path(trajectory_path)
-    if not path.is_file():
-        return ""
+    from soma_bench.benchmark.soma_tasks import DEFAULT_BENCHMARK_NAME, materialize_task_cache
 
-    SCAN_TYPES = {"assistant.message", "tool.execution_complete"}
-    last_exact: str = ""
-    last_embedded: str = ""
+    rows, source = _resolve_soma_task_rows()
+    if not rows:
+        return {}
 
-    with path.open(encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") not in SCAN_TYPES:
-                continue
-            text = _extract_text_from_event(event).strip()
-            if not text:
-                continue
+    rows_by_benchmark: dict[str, list[dict]] = {}
+    for row in rows:
+        benchmark_name = str(row.get("benchmark_name") or "").strip() or DEFAULT_BENCHMARK_NAME
+        rows_by_benchmark.setdefault(benchmark_name, []).append(row)
 
-            # Best case: the entire event text is the JSON array
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, list):
-                    last_exact = text
-                    continue
-            except json.JSONDecodeError:
-                pass
+    materialized: dict[str, set[str]] = {}
+    with tempfile.TemporaryDirectory(prefix="soma-task-cache-") as staging_dir:
+        for benchmark_name, benchmark_rows in rows_by_benchmark.items():
+            # materialize_task_cache() takes a file, and each benchmark name needs its
+            # own cache entry, so each group is staged as its own single-benchmark file.
+            staged = Path(staging_dir) / f"{_slug(benchmark_name, default='benchmark')}.jsonl"
+            staged.write_text(
+                "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in benchmark_rows),
+                encoding="utf-8",
+            )
+            materialize_task_cache(tasks_path=staged, benchmark_name=benchmark_name)
+            materialized[benchmark_name] = {
+                str(row.get("instance_id") or "").strip()
+                for row in benchmark_rows
+                if str(row.get("instance_id") or "").strip()
+            }
 
-            # Second pass: find the last fenced or bare array of objects
-            for m in _re.finditer(r'```(?:json)?\s*(\[[\s\S]*?\])\s*```|(\[[\s\S]*?\])', text):
-                candidate = (m.group(1) or m.group(2) or "").strip()
-                try:
-                    parsed = json.loads(candidate)
-                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-                        last_embedded = candidate
-                except (json.JSONDecodeError, IndexError):
-                    continue
-
-    return last_exact or last_embedded
+    logger.info(
+        "Materialized SOMA task row cache from %s: %s",
+        source,
+        {name: len(ids) for name, ids in materialized.items()},
+    )
+    return materialized
 
 
 class CompactBenchExecutor:
@@ -790,7 +857,78 @@ class CompactBenchExecutor:
 
         self._preload_plugin_template()
         self._preload_tiktoken_cache()
+        self._soma_task_cache_lock = threading.Lock()
+        # None, not "now": the start-up load does not start the refresh clock. A host
+        # that booted while the dataset was still private has no rows at all, and
+        # making it wait out a refresh interval before its first look would fail every
+        # SOMA run dispatched in that window. See _ensure_soma_task_row.
+        self._soma_task_cache_refreshed_at: float | None = None
+        self._soma_task_benchmarks = self._preload_soma_task_cache()
         self._ensure_copilot_shared_proxy_stack()
+
+    def _preload_soma_task_cache(self) -> dict[str, set[str]]:
+        """Materialize the SOMA task rows once, at start, rather than per run.
+
+        A failure here must not stop the service: SWE-bench Verified runs do not
+        depend on it, and a SOMA run that finds no cached row fails on its own with a
+        clear "instance not found in benchmark" error from the runner.
+        """
+        try:
+            return _materialize_soma_task_cache()
+        except Exception:
+            logger.exception(
+                "Failed to materialize the SOMA task row cache; SOMA task runs will not "
+                "resolve on this host until it is fixed"
+            )
+            return {}
+
+    def _ensure_soma_task_row(self, *, benchmark: str, instance_id: str) -> None:
+        """Re-materialize the row cache for a SOMA task this host has never seen.
+
+        Tasks are imported and published while a competition is already running, so
+        the set materialized at start-up goes out of date. Without this the only cure
+        is restarting every sandbox host, and until then those runs fail with
+        "instance not found" for a reason the miner had no part in.
+
+        Rate-limited to one refresh per SOMA_TASKS_DATASET_REFRESH_SECONDS, and a
+        refresh that still does not know the instance is left to fail in the runner:
+        the instance may simply not be published yet.
+        """
+        from soma_bench.benchmark.swebench_images import is_swebench_benchmark
+
+        name = str(benchmark or "").strip()
+        instance = str(instance_id or "").strip()
+        if not name or not instance:
+            return
+        # SWE-bench instances resolve from a public Hugging Face dataset and are never
+        # in this cache, so a miss there means nothing. Asked of SOMA-benchmark rather
+        # than pattern-matched here, so the runner and this host cannot disagree about
+        # which benchmark a name refers to.
+        if is_swebench_benchmark(name):
+            return
+        if instance in self._soma_task_benchmarks.get(name, frozenset()):
+            return
+
+        interval = _coerce_positive_float(
+            os.getenv(SOMA_TASKS_DATASET_REFRESH_SECONDS_ENV),
+            DEFAULT_SOMA_TASKS_DATASET_REFRESH_SECONDS,
+        )
+        with self._soma_task_cache_lock:
+            if instance in self._soma_task_benchmarks.get(name, frozenset()):
+                return
+            refreshed_at = self._soma_task_cache_refreshed_at
+            # The first look is always allowed; the interval only rate-limits the ones
+            # after it, so an unreachable dataset costs one download attempt per
+            # interval rather than one per dispatched run.
+            if refreshed_at is not None and time.monotonic() - refreshed_at < interval:
+                return
+            logger.info(
+                "SOMA task row cache does not know benchmark=%s instance_id=%s; refreshing",
+                name,
+                instance,
+            )
+            self._soma_task_cache_refreshed_at = time.monotonic()
+            self._soma_task_benchmarks = self._preload_soma_task_cache()
 
     def _ensure_copilot_shared_proxy_stack(self) -> None:
         if not self._copilot_shared_proxy_enabled:
@@ -1014,6 +1152,9 @@ class CompactBenchExecutor:
         timeout_per_task: float | None,
     ) -> CompactBenchExecutionOutput:
         self._maybe_cleanup_stale_output_dirs()
+        self._ensure_soma_task_row(
+            benchmark=str(task.benchmark or ""), instance_id=str(task.instance_id or "")
+        )
         output_dir = self._output_root / _slug(batch_id, default="batch") / _slug(
             f"{task.instance_id}-{uuid.uuid4().hex[:8]}",
             default="task",
@@ -1116,6 +1257,12 @@ class CompactBenchExecutor:
             if plugin_path is not None:
                 env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
                 env["SOMA_OPENCLAW_PLUGIN_PATH"] = str(plugin_path)
+            # setdefault, so a host that configures its own repo keeps it. Pulling from
+            # it needs DOCKERHUB_USERNAME/DOCKERHUB_TOKEN in the service environment
+            # while the repo is private; both are inherited through os.environ above.
+            env.setdefault(
+                SOMA_TASK_DIND_PREBAKED_REPO_ENV, DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO
+            )
 
             started_at = time.monotonic()
             logger.info(
@@ -1216,12 +1363,7 @@ class CompactBenchExecutor:
             patch_path = patch_capture.get("patch_path") if isinstance(patch_capture, dict) else None
             patch_capture_status = False
             patch_text = ""
-            if task.benchmark_type == "swe_explorer_explore":
-                regions_json = _read_explore_result_file(tmp_run_dir) or _extract_explore_regions_json(trajectory_path)
-                if regions_json:
-                    patch_capture_status = True
-                    patch_text = _strip_workspace_prefix(regions_json)
-            elif isinstance(patch_path, str) and patch_path.strip():
+            if isinstance(patch_path, str) and patch_path.strip():
                 patch_file = Path(patch_path)
                 if patch_file.is_file():
                     patch_capture_status = True
@@ -1454,9 +1596,9 @@ class CompactBenchExecutor:
             if task.agent_name != "openclaw":
                 self._cleanup_copilot_run_resources(run_id=task.run_id, output_dir=output_dir)
             if 'tmp_run_dir' in locals() and tmp_run_dir:
-                # tmp_run_dir is the copilot backend's own run directory (holds the workspace
-                # snapshot used above to read the explore result) - it lives outside output_dir
-                # under soma-benchmark-copilot-runs and is otherwise never cleaned up.
+                # tmp_run_dir is the copilot backend's own run directory - it lives outside
+                # output_dir under soma-benchmark-copilot-runs and is otherwise never
+                # cleaned up.
                 if self._debug_preserve_outputs:
                     logger.info(
                         "Keeping copilot run directory for debug inspection: run_id=%s tmp_run_dir=%s",

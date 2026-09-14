@@ -1,98 +1,69 @@
+"""Tests for the layer/subset machinery itself, independent of what a category is.
+
+The categories fed to it are task complexities (see ``test_complexity_layers.py``);
+these tests drive the maths with plain names so that what is being checked is the
+mechanism - who wins an element, what it is worth, and what happens with no scores -
+rather than the vocabulary.
+"""
+
 from math import isclose
 
 from app.services.incentive_calculator import (
-    BENCHMARK_TYPES,
+    FALLBACK_CATEGORY,
     build_incentive_layers,
     calculate_incentive_weights,
 )
 
-
-def test_build_incentive_layers_for_three_benchmarks() -> None:
-    layers = build_incentive_layers(list(BENCHMARK_TYPES))
-
-    assert layers == (
-        (("swebench_verified", "swe_explorer_explore", "swe_explorer_edit"),),
-        (
-            ("swebench_verified", "swe_explorer_explore"),
-            ("swebench_verified", "swe_explorer_edit"),
-            ("swe_explorer_explore", "swe_explorer_edit"),
-        ),
-        (
-            ("swebench_verified",),
-            ("swe_explorer_explore",),
-            ("swe_explorer_edit",),
-        ),
-    )
+ONE_CATEGORY = (FALLBACK_CATEGORY,)
 
 
-def test_layer_and_element_weights_are_static() -> None:
+def test_build_incentive_layers_for_a_single_category() -> None:
+    layers = build_incentive_layers(list(ONE_CATEGORY))
+
+    assert layers == ((ONE_CATEGORY,),)
+
+
+def test_single_category_layer_takes_the_whole_weight() -> None:
+    """With one category the sole singles layer absorbs the full weight.
+
+    ``_layer_weights_for`` renormalizes the static per-subset-size weights over the
+    layers that actually exist, so the 0.30 the singles layer carries in a
+    three-category configuration becomes 1.0 here rather than leaving 0.70
+    unassigned. This is the shape of the unclassified-competition fallback.
+    """
     result = calculate_incentive_weights(
-        {"A": {benchmark: 1.0 for benchmark in BENCHMARK_TYPES}},
-        BENCHMARK_TYPES,
+        {"A": {FALLBACK_CATEGORY: 1.0}},
+        ONE_CATEGORY,
         burn_ratio=0.0,
     )
 
-    assert isclose(result.layers[0].layer_weight, 0.25)
-    assert isclose(result.layers[1].layer_weight, 0.45)
-    assert isclose(result.layers[2].layer_weight, 0.30)
-    assert isclose(result.layers[0].element_weight, 0.25)
-    assert isclose(result.layers[1].element_weight, 0.15)
-    assert isclose(result.layers[2].element_weight, 0.10)
-    assert isclose(sum(layer.layer_weight for layer in result.layers), 1.0)
+    assert len(result.layers) == 1
+    assert isclose(result.layers[0].layer_weight, 1.0)
+    assert isclose(result.layers[0].element_weight, 1.0)
 
 
-def test_calculate_incentive_weights_uses_benchmark_weighted_subsets() -> None:
+def test_calculate_incentive_weights_awards_the_best_scorer() -> None:
     result = calculate_incentive_weights(
         {
-            "A": {
-                "swebench_verified": 0.8,
-                "swe_explorer_explore": 0.2,
-                "swe_explorer_edit": 0.0,
-            },
-            "B": {
-                "swebench_verified": 0.4,
-                "swe_explorer_explore": 0.8,
-                "swe_explorer_edit": 0.6,
-            },
+            "A": {FALLBACK_CATEGORY: 0.8},
+            "B": {FALLBACK_CATEGORY: 0.4},
         },
-        BENCHMARK_TYPES,
+        ONE_CATEGORY,
         burn_ratio=0.5,
     )
 
-    # L0 uses S_bench = 0.50*v + 0.25*x + 0.25*e: A=0.45, B=0.55 -> B wins.
-    triple = result.layers[0].elements[0]
-    assert triple.winners == ("B",)
-    assert isclose(triple.winning_score, 0.55)
-
-    # Pairs renormalize the base weights over subset members.
-    pair_winners = {element.subset: element.winners for element in result.layers[1].elements}
-    assert pair_winners[("swebench_verified", "swe_explorer_explore")] == ("A",)
-    assert pair_winners[("swebench_verified", "swe_explorer_edit")] == ("A",)
-    assert pair_winners[("swe_explorer_explore", "swe_explorer_edit")] == ("B",)
-
-    single_winners = {element.subset: element.winners for element in result.layers[2].elements}
-    assert single_winners[("swebench_verified",)] == ("A",)
-    assert single_winners[("swe_explorer_explore",)] == ("B",)
-    assert single_winners[("swe_explorer_edit",)] == ("B",)
-
-    # A: (v,x)+(v,e)+v = 0.15+0.15+0.10; B: L0+(x,e)+x+e = 0.25+0.15+0.10+0.10.
-    assert isclose(result.raw_weights["A"], 0.40)
-    assert isclose(result.raw_weights["B"], 0.60)
-    assert isclose(sum(result.final_weights.values()), 0.5)
+    assert result.layers[0].elements[0].winners == ("A",)
+    assert isclose(result.layers[0].elements[0].winning_score, 0.8)
+    assert isclose(result.raw_weights["A"], 1.0)
+    assert "B" not in result.raw_weights
+    assert isclose(result.final_weights["A"], 0.5)
     assert isclose(result.burn_weight, 0.5)
-    assert isclose(result.final_weights["A"], 0.20)
-    assert isclose(result.final_weights["B"], 0.30)
 
 
 def test_calculate_incentive_weights_splits_ties() -> None:
-    scores = {
-        "swebench_verified": 0.5,
-        "swe_explorer_explore": 0.5,
-        "swe_explorer_edit": 0.5,
-    }
     result = calculate_incentive_weights(
-        {"A": dict(scores), "B": dict(scores)},
-        BENCHMARK_TYPES,
+        {"A": {FALLBACK_CATEGORY: 0.5}, "B": {FALLBACK_CATEGORY: 0.5}},
+        ONE_CATEGORY,
         burn_ratio=0.0,
     )
 
@@ -106,42 +77,68 @@ def test_calculate_incentive_weights_splits_ties() -> None:
 def test_calculate_incentive_weights_requires_complete_subset_scores() -> None:
     result = calculate_incentive_weights(
         {
-            "A": {
-                "swebench_verified": 0.1,
-                "swe_explorer_explore": 0.1,
-                "swe_explorer_edit": 0.1,
-            },
-            # B has no swe_explorer_edit score: it cannot compete on any
-            # subset containing that benchmark.
-            "B": {
-                "swebench_verified": 1.0,
-                "swe_explorer_explore": 1.0,
-            },
+            "A": {FALLBACK_CATEGORY: 0.1},
+            # B has no score at all: it cannot compete, even though it would have
+            # outranked A on any category it did have a score for.
+            "B": {},
         },
-        BENCHMARK_TYPES,
+        ONE_CATEGORY,
         burn_ratio=0.0,
     )
 
-    triple = result.layers[0].elements[0]
-    assert triple.winners == ("A",)
-
-    edit_elements = [
-        element
-        for layer in result.layers
-        for element in layer.elements
-        if "swe_explorer_edit" in element.subset
-    ]
-    assert all(element.winners == ("A",) for element in edit_elements)
-
-    # A: L0 + (v,e) + (x,e) + e; B: (v,x) + v + x.
-    assert isclose(result.raw_weights["A"], 0.25 + 0.15 + 0.15 + 0.10)
-    assert isclose(result.raw_weights["B"], 0.15 + 0.10 + 0.10)
+    assert result.layers[0].elements[0].winners == ("A",)
+    assert isclose(result.raw_weights["A"], 1.0)
+    assert "B" not in result.raw_weights
     assert isclose(sum(result.final_weights.values()), 1.0)
 
 
 def test_calculate_incentive_weights_burns_everything_without_scores() -> None:
-    result = calculate_incentive_weights({}, BENCHMARK_TYPES, burn_ratio=0.3)
+    result = calculate_incentive_weights({}, ONE_CATEGORY, burn_ratio=0.3)
 
     assert result.raw_weights == {}
     assert result.final_weights == {}
     assert isclose(result.burn_weight, 1.0)
+
+
+def test_subset_machinery_handles_any_number_of_categories() -> None:
+    """Two categories: pair layer plus singles, renormalized over the two.
+
+    Driven with names that are not complexities to make the point that the maths is
+    category-agnostic - the number of layers follows the number of categories a
+    competition actually contains, not a fixed configuration.
+    """
+    categories = ("alpha", "beta")
+
+    layers = build_incentive_layers(list(categories))
+    assert layers == ((("alpha", "beta"),), (("alpha",), ("beta",)))
+
+    result = calculate_incentive_weights(
+        {
+            "A": {"alpha": 0.8, "beta": 0.2},
+            "B": {"alpha": 0.4, "beta": 0.9},
+        },
+        categories,
+        burn_ratio=0.0,
+    )
+
+    # Categories weigh the same, so a subset score is the plain average:
+    # pair A=0.50, B=0.65 -> B wins. Singles split A (alpha) / B (beta).
+    assert result.layers[0].elements[0].winners == ("B",)
+    assert isclose(result.layers[0].elements[0].winning_score, 0.65)
+    single_winners = {element.subset: element.winners for element in result.layers[1].elements}
+    assert single_winners[("alpha",)] == ("A",)
+    assert single_winners[("beta",)] == ("B",)
+
+    # Layer weights: pairs 0.45 and singles 0.30 renormalized over the two layers.
+    assert isclose(result.layers[0].layer_weight, 0.45 / 0.75)
+    assert isclose(result.layers[1].layer_weight, 0.30 / 0.75)
+    assert isclose(sum(result.final_weights.values()), 1.0)
+
+
+def test_category_order_is_preserved_not_reshuffled() -> None:
+    """A layer element is identified by its subset tuple, so the caller's canonical
+    order has to survive - otherwise the same contest gets two identities."""
+    assert build_incentive_layers(["long", "short", "long"]) == (
+        (("long", "short"),),
+        (("long",), ("short",)),
+    )

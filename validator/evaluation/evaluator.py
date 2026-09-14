@@ -4,13 +4,12 @@ import asyncio
 import json
 import logging
 
-from .swebench_evaluator import SWEBenchContainerEvaluator, SWEBenchEvaluationResult
-from .swe_explorer_evaluator import (
-    SWEExplorerEvaluationError,
-    SWEExplorerEvaluationResult,
-    SWEExplorerEvaluator,
-    SWE_EXPLORER_BENCHMARK,
+from .soma_task_evaluator import (
+    SomaTaskContainerEvaluator,
+    SomaTaskEvaluationResult,
 )
+from .soma_task_registry import SomaTaskNotFoundError
+from .swebench_evaluator import SWEBenchContainerEvaluator, SWEBenchEvaluationResult
 from soma_shared.contracts.validator.v1.messages import QuestionScore, SweBenchValidationTask
 
 
@@ -31,11 +30,12 @@ class BatchScoringError(RuntimeError):
 
 class Evaluator:
     HF_RATE_LIMIT_ERROR_CODE = "validator_hf_rate_limited"
+    SOMA_TASK_UNKNOWN_ERROR_CODE = "validator_soma_task_unknown"
 
     def __init__(self, settings=None):
         self.settings = settings
         self._swebench_evaluator = SWEBenchContainerEvaluator(settings=settings)
-        self._swe_explorer_evaluator = SWEExplorerEvaluator(settings=settings)
+        self._soma_task_evaluator = SomaTaskContainerEvaluator(settings=settings)
         max_concurrent_evaluations = max(
             1,
             int(getattr(self.settings, "max_concurrent_evaluations", 1)),
@@ -43,7 +43,8 @@ class Evaluator:
         self._evaluation_sem = asyncio.Semaphore(max_concurrent_evaluations)
 
         logging.info(
-            "Evaluator initialized for SWE-Bench scoring: max_concurrent_evaluations=%s",
+            "Evaluator initialized for SWE-Bench and SOMA task scoring: "
+            "max_concurrent_evaluations=%s",
             max_concurrent_evaluations,
         )
 
@@ -65,55 +66,77 @@ class Evaluator:
             image_name=image_name,
         )
 
-    async def evaluate_swe_explorer_exploration(
+    async def evaluate_soma_task_patch(
         self,
         *,
         instance_id: str,
-        regions_json: str,
-    ) -> SWEExplorerEvaluationResult:
-        return await asyncio.to_thread(
-            self._swe_explorer_evaluator.evaluate_instance,
+        diff: str,
+        image_name: str | None = None,
+    ) -> SomaTaskEvaluationResult:
+        return await self._soma_task_evaluator.evaluate_instance_diff(
             instance_id=instance_id,
-            regions_json=regions_json,
+            diff=diff,
+            image_name=image_name,
         )
 
     def cleanup_competition_cache(self) -> dict[str, int]:
-        return self._swebench_evaluator.cleanup_competition_cache()
+        """Reclaim disk from both evaluators' pulled images after a competition.
 
-    @staticmethod
-    def _is_swe_explorer_explore_task(task: SweBenchValidationTask) -> bool:
-        return (getattr(task, "benchmark_type", "") or "") == "swe_explorer_explore"
+        Each evaluator only removes images under its own name prefix, so the two
+        results are summed into one report rather than one shadowing the other.
+        """
+        swebench_result = self._swebench_evaluator.cleanup_competition_cache()
+        soma_result = self._soma_task_evaluator.cleanup_competition_cache()
+        return {
+            key: int(swebench_result.get(key, 0)) + int(soma_result.get(key, 0))
+            for key in set(swebench_result) | set(soma_result)
+        }
 
-    @staticmethod
-    def _is_swe_explorer_edit_task(task: SweBenchValidationTask) -> bool:
-        return (getattr(task, "benchmark_type", "") or "") == "swe_explorer_edit"
+    def _is_soma_task(self, task: SweBenchValidationTask) -> bool:
+        """Whether this validation grades a SOMA task rather than a SWE-bench one.
 
-    async def _evaluate_swe_explorer_task(
+        Decided from the benchmark the platform names on the task (the dataset the
+        instance came from), because that is what determines which grading machinery
+        can score it at all: a SWE-bench instance has an eval image and harness spec,
+        a SOMA task has its own test image and graded test command.
+
+        The registry is consulted as a fallback for a task whose benchmark name is
+        unset or unrecognised, so a known SOMA instance is still graded correctly
+        rather than handed to a harness that has never heard of its repository.
+        """
+        benchmark = str(getattr(task, "benchmark", "") or "").strip().lower()
+        if benchmark:
+            if "swe-bench" in benchmark:
+                return False
+            return True
+        instance_id = str(getattr(task, "instance_id", "") or "").strip()
+        return bool(instance_id) and self._soma_task_evaluator.knows_instance(instance_id)
+
+    async def _evaluate_soma_task(
         self,
         *,
         validation_id: str,
         instance_id: str,
-        regions_json: str,
+        diff: str,
     ) -> tuple[str, QuestionScore, dict[str, object]]:
-        result = await self.evaluate_swe_explorer_exploration(
+        result = await self.evaluate_soma_task_patch(
             instance_id=instance_id,
-            regions_json=regions_json,
+            diff=diff,
         )
         question_score = QuestionScore(
             batch_challenge_id=validation_id,
             question_id=validation_id,
-            produced_answer=str(round(result.score, 6)),
+            produced_answer=str(int(result.resolved)),
             score=float(result.score),
             details={
-                "primary_metric": result.primary_metric,
-                **{k: round(v, 6) for k, v in result.metrics.items()},
+                "image_name": result.image_name,
+                "binary_resolved": int(result.resolved),
+                "missing_tests": len(result.missing_tests),
             },
         )
         return validation_id, question_score, {
-            "resolved": result.score > 0.0,
-            "metrics": result.metrics,
-            "primary_metric": result.primary_metric,
-            "logs": f"instance_id={instance_id} {result.primary_metric}={result.score:.6f}",
+            "resolved": bool(result.resolved),
+            "logs": self._format_logs(result),
         }
 
     async def _evaluate_task(
@@ -135,11 +158,11 @@ class Evaluator:
                 aliases=("diff",),
             )
 
-            if self._is_swe_explorer_explore_task(task):
-                return await self._evaluate_swe_explorer_task(
+            if self._is_soma_task(task):
+                return await self._evaluate_soma_task(
                     validation_id=validation_id,
                     instance_id=instance_id,
-                    regions_json=diff,
+                    diff=diff,
                 )
 
             arch = self._get_optional_str(
@@ -259,7 +282,7 @@ class Evaluator:
         raise ValueError(f"challenge is missing required string field: {aliases_str}")
 
     @staticmethod
-    def _format_logs(result: SWEBenchEvaluationResult) -> str:
+    def _format_logs(result: SWEBenchEvaluationResult | SomaTaskEvaluationResult) -> str:
         logs = getattr(result, "logs", None)
         if isinstance(logs, str):
             trimmed_logs = logs.strip()
@@ -292,6 +315,18 @@ class Evaluator:
             "validation_id": validation_id,
             "error": str(exc),
         }
+
+        for candidate in cls._iter_exception_chain(exc):
+            if isinstance(candidate, SomaTaskNotFoundError):
+                # The validator's task file does not know this instance. Retrying
+                # cannot help until the file is updated, so it is reported under its
+                # own code rather than as a generic scoring failure.
+                details["reason"] = "soma_task_grading_spec_missing"
+                return (
+                    cls.SOMA_TASK_UNKNOWN_ERROR_CODE,
+                    f"No SOMA task grading spec for validation_id={validation_id}: {candidate}",
+                    details,
+                )
 
         hf_rate_limit_details = cls._extract_hf_rate_limit_details(exc)
         if hf_rate_limit_details is not None:

@@ -140,3 +140,5 @@ auto_run_restarter/metadata/
 
 # Temporary competition override data
 tmp/competition_112_stage2_override/
+
+tasks/

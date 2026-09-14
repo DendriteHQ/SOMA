@@ -15,36 +15,27 @@ from soma_shared.db.models.swe_bench_run import SweBenchRun
 from soma_shared.db.models.swe_bench_run_validation import SweBenchRunValidation
 from soma_shared.db.models.swe_bench_task import SweBenchTask
 from soma_shared.db.models.swe_bench_verified_validation import SweBenchVerifiedValidation
-from soma_shared.db.models.swe_explorer_edit_validation import SweExplorerEditValidation
-from soma_shared.db.models.swe_explorer_validation import SweExplorerValidation
 from soma_shared.db.models.top_miner import TopMiner
+from app.services.complexity import COMPLEXITY_WEIGHTS, present_categories
 from app.db.interfaces.burn_weight_queries import (
     delete_unapproved_competition_top_miner_rows,
 )
 
 
-BenchmarkType = str
+# The layer machinery is generic over "category". The category is task complexity
+# (short/medium/long) - see app.services.complexity. The alias keeps the older
+# annotations readable.
+Category = str
+BenchmarkType = Category
 
-BENCHMARK_TYPES: tuple[BenchmarkType, ...] = (
-    "swebench_verified",
-    "swe_explorer_explore",
-    "swe_explorer_edit",
-)
+#: The single category used when no task in a competition is classified. Layers then
+#: degenerate to one element carrying the whole weight, which is exactly the
+#: pre-complexity behaviour - see _load_layer_category_scores.
+FALLBACK_CATEGORY: Category = "overall"
 
-# Base benchmark weighting (docs/miner/INCENTIVE_MECHANISM.md): the aggregate
-# S_bench = 0.50*S_v + 0.25*S_x + 0.25*S_e. Subset scores renormalize these
-# weights over the subset members, so the full triple reduces to S_bench and
-# singles reduce to the plain per-benchmark score.
-BENCHMARK_WEIGHTS: dict[BenchmarkType, float] = {
-    "swebench_verified": 0.50,
-    "swe_explorer_explore": 0.25,
-    "swe_explorer_edit": 0.25,
-}
-
-_COMPETITION_FINAL_SCORE_EVAL_ONLY_IDS: frozenset[int] = frozenset({112})
-
-# Static layer weights over benchmark-type subsets:
-# L0 (triple) -> 0.25, L1 (pairs) -> 0.45, L2 (singles) -> 0.30.
+# Static layer weights over benchmark-type subsets, keyed by subset size and
+# renormalized to sum to 1 over the layers that exist (_layer_weights_for). With one
+# benchmark type only the singles layer exists, so it takes the whole weight.
 LAYER_WEIGHTS_BY_SUBSET_SIZE: dict[int, float] = {3: 0.25, 2: 0.45, 1: 0.30}
 
 
@@ -76,26 +67,29 @@ class IncentiveCalculationResult:
     layers: tuple[IncentiveLayerResult, ...]
 
 
-def _normalize_benchmark_types(benchmark_types: Sequence[str]) -> tuple[BenchmarkType, ...]:
-    seen: set[BenchmarkType] = set()
-    normalized: list[BenchmarkType] = []
-    for benchmark_type in benchmark_types:
-        name = str(benchmark_type)
+def _normalize_categories(categories: Sequence[str]) -> tuple[Category, ...]:
+    """De-duplicate while preserving the caller's order.
+
+    Order matters because a layer element is identified by its subset tuple, so the
+    caller passes categories in canonical order (see
+    ``app.services.complexity.present_categories``) and this must not reshuffle it.
+    """
+    seen: set[Category] = set()
+    normalized: list[Category] = []
+    for category in categories:
+        name = str(category)
         if name in seen:
             continue
         seen.add(name)
         normalized.append(name)
-
-    if seen.issubset(set(BENCHMARK_TYPES)):
-        return tuple(benchmark for benchmark in BENCHMARK_TYPES if benchmark in seen)
     return tuple(normalized)
 
 
 def build_incentive_layers(
-    benchmark_types: Sequence[str],
-) -> tuple[tuple[tuple[BenchmarkType, ...], ...], ...]:
-    normalized = _normalize_benchmark_types(benchmark_types)
-    layers: list[tuple[tuple[BenchmarkType, ...], ...]] = []
+    categories: Sequence[str],
+) -> tuple[tuple[tuple[Category, ...], ...], ...]:
+    normalized = _normalize_categories(categories)
+    layers: list[tuple[tuple[Category, ...], ...]] = []
 
     for subset_size in range(len(normalized), 0, -1):
         layer = tuple(combinations(normalized, subset_size))
@@ -124,16 +118,25 @@ def _layer_weights_for(
     return [weight / total for weight in raw]
 
 
+def _category_weight(category: Category) -> float:
+    """Weight of one category inside a subset score.
+
+    Complexity categories are equal by design, so a complexity subset reduces to a
+    plain average. Any other name weighs 1.0 - which covers FALLBACK_CATEGORY, whose
+    subset has one member anyway.
+    """
+    return float(COMPLEXITY_WEIGHTS.get(category, 1.0))
+
+
 def _subset_weighted_score(
     miner_scores: Mapping[BenchmarkType, float],
     subset: Sequence[BenchmarkType],
 ) -> float | None:
     """Benchmark-weighted average of the miner's scores over the subset.
 
-    Weights come from BENCHMARK_WEIGHTS renormalized over the subset members
-    (unknown benchmark names fall back to weight 1.0, i.e. a plain average).
-    Returns None when any member score is missing - the miner does not
-    compete on that element.
+    Weights come from _category_weight renormalized over the subset members, which
+    for complexity makes this a plain average. Returns None when any member score is
+    missing - the miner does not compete on that element.
     """
     weighted_sum = 0.0
     weight_total = 0.0
@@ -141,7 +144,7 @@ def _subset_weighted_score(
         score = miner_scores.get(benchmark_type)
         if score is None:
             return None
-        weight = float(BENCHMARK_WEIGHTS.get(benchmark_type, 1.0))
+        weight = _category_weight(benchmark_type)
         weighted_sum += weight * float(score)
         weight_total += weight
     if weight_total <= 0.0:
@@ -155,31 +158,31 @@ def final_score_includes_screener_stage(
 ) -> bool:
     """Return whether a task stage contributes to the competition final score.
 
-    Most competitions include stage 2 and eval tasks in the final score while
-    excluding stage 1. Competition 112 is a one-off hotfix that uses eval
-    tasks only.
+    One rule for every competition: stage-2 and full-evaluation tasks count, stage-1
+    tasks do not. Stage 1 is a liveness gate with no saving threshold, so including
+    it would let a miner's score be moved by tasks it was only screened on.
+
+    ``competition_id`` is kept in the signature: this is the single place the final
+    score's task set is decided, and a per-competition exception has been needed
+    before - it belongs here rather than at the call sites.
     """
-    if competition_id in _COMPETITION_FINAL_SCORE_EVAL_ONLY_IDS:
-        return screener_stage is None
     return screener_stage != 1
 
 
 def competition_final_score_task_stage_filter(competition_id: int):
     """SQLAlchemy task-stage filter matching final_score_includes_screener_stage."""
-    if competition_id in _COMPETITION_FINAL_SCORE_EVAL_ONLY_IDS:
-        return SweBenchTask.screener_stage.is_(None)
     return SweBenchTask.screener_stage.is_distinct_from(1)
 
 
 def calculate_incentive_weights(
-    miner_benchmark_scores: Mapping[str, Mapping[BenchmarkType, float]],
-    benchmark_types: Sequence[str],
+    miner_category_scores: Mapping[str, Mapping[Category, float]],
+    categories: Sequence[str],
     *,
     burn_ratio: float,
 ) -> IncentiveCalculationResult:
-    normalized_types = _normalize_benchmark_types(benchmark_types)
+    normalized_categories = _normalize_categories(categories)
     miners_share = max(0.0, 1.0 - float(burn_ratio))
-    layers = build_incentive_layers(normalized_types)
+    layers = build_incentive_layers(normalized_categories)
     layer_weights = _layer_weights_for(layers)
     raw_weights: dict[str, float] = {}
     layer_results: list[IncentiveLayerResult] = []
@@ -191,7 +194,7 @@ def calculate_incentive_weights(
 
         for subset in layer_subsets:
             subset_scores: dict[str, float] = {}
-            for hotkey, scores in miner_benchmark_scores.items():
+            for hotkey, scores in miner_category_scores.items():
                 subset_score = _subset_weighted_score(scores, subset)
                 if subset_score is not None:
                     subset_scores[hotkey] = subset_score
@@ -252,7 +255,7 @@ def calculate_incentive_weights(
         burn_weight = 1.0
 
     return IncentiveCalculationResult(
-        categories=normalized_types,
+        categories=normalized_categories,
         burn_ratio=float(burn_ratio),
         miners_share=miners_share,
         raw_weights=dict(sorted(raw_weights.items())),
@@ -262,9 +265,16 @@ def calculate_incentive_weights(
     )
 
 
-def _swe_scores_by_hotkey(rows: Sequence[object]) -> dict[str, float]:
-    """Normalized SWE-path miner totals ([-1, 1]) grouped by hotkey."""
-    from app.api.routes.scoring import build_swe_miner_total_score, build_swe_task_groups
+def _task_groups_by_hotkey(
+    rows: Sequence[object],
+) -> dict[str, dict[int, dict[str, object]]]:
+    """Group the loaded rows into per-hotkey task groups, built once.
+
+    Both the complexity-blind total and the per-category scores are derived from the
+    same groups, so building them twice would be both wasteful and a way for the two
+    numbers to drift apart.
+    """
+    from app.api.routes.scoring import build_swe_task_groups
 
     rows_by_hotkey: dict[str, list[object]] = {}
     for row in rows:
@@ -273,9 +283,18 @@ def _swe_scores_by_hotkey(rows: Sequence[object]) -> dict[str, float]:
             continue
         rows_by_hotkey.setdefault(str(hotkey), []).append(row)
 
+    return {
+        hotkey: build_swe_task_groups(hotkey_rows)
+        for hotkey, hotkey_rows in rows_by_hotkey.items()
+    }
+
+
+def _swe_scores_by_hotkey(rows: Sequence[object]) -> dict[str, float]:
+    """Normalized SWE-path miner totals ([-1, 1]) grouped by hotkey."""
+    from app.api.routes.scoring import build_swe_miner_total_score
+
     scores: dict[str, float] = {}
-    for hotkey, hotkey_rows in rows_by_hotkey.items():
-        task_groups = build_swe_task_groups(hotkey_rows)
+    for hotkey, task_groups in _task_groups_by_hotkey(rows).items():
         total_score, _ = build_swe_miner_total_score(task_groups)
         if total_score is not None:
             scores[hotkey] = float(total_score)
@@ -291,8 +310,7 @@ async def _load_swe_benchmark_rows(
     task_stage_filter,
 ) -> Sequence[object]:
     """Rows shaped for build_swe_task_groups, with `resolved` coming from the
-    benchmark's own validation table (swe_bench_verified_validations or
-    swe_explorer_edit_validations).
+    benchmark's own validation table (swe_bench_verified_validations).
 
     ``task_stage_filter`` is a SweBenchTask filter clause that selects which
     screener tier(s) to include:
@@ -312,6 +330,7 @@ async def _load_swe_benchmark_rows(
                 SweBenchTask.id.label("task_id"),
                 SweBenchTask.instance_id.label("task_name"),
                 SweBenchTask.is_screener.label("is_screener"),
+                SweBenchTask.complexity.label("complexity"),
                 Miner.ss58.label("hotkey"),
                 baseline_runs.id.label("baseline_run_id"),
                 baseline_runs.tokens_used.label("baseline_tokens_used"),
@@ -384,220 +403,26 @@ def _to_optional_float(value: object) -> float | None:
         return None
 
 
-def _average(values: Sequence[float]) -> float | None:
-    return sum(values) / len(values) if values else None
-
-
-async def _load_explore_scores_by_hotkey(
+async def _load_stage_total_scores(
     db: AsyncSession,
     *,
     competition_id: int,
-    task_stage_filter,
+    screener_stage: int,
 ) -> dict[str, float]:
-    """Per-miner swe_explorer_explore totals via the explore-quality path."""
-    from app.api.routes.scoring import (
-        compute_explore_miner_total_score,
-        compute_explore_task_score,
-        compute_weighted_tokens,
-    )
+    """Per-hotkey total SWE score over one screener stage's tasks.
 
-    baseline_validations = aliased(SweBenchRunValidation, name="baseline_validations")
-    baseline_explore = aliased(SweExplorerValidation, name="baseline_explore_rows")
-    baseline_rows = (
-        await db.execute(
-            select(
-                SweBenchTask.id.label("task_id"),
-                SweBenchRun.input_tokens.label("input_tokens"),
-                SweBenchRun.cached_input_tokens.label("cached_input_tokens"),
-                SweBenchRun.output_tokens.label("output_tokens"),
-                baseline_explore.hit_file_rate.label("hit_file_rate"),
-                baseline_explore.noise_file_rate.label("noise_file_rate"),
-            )
-            .select_from(SweBenchTask)
-            .join(
-                SweBenchRun,
-                and_(
-                    SweBenchRun.task_fk == SweBenchTask.id,
-                    SweBenchRun.baseline_run.is_(True),
-                    SweBenchRun.benchmark_type == "swe_explorer_explore",
-                ),
-            )
-            .outerjoin(
-                baseline_validations,
-                baseline_validations.run_fk == SweBenchRun.id,
-            )
-            .outerjoin(
-                baseline_explore,
-                baseline_explore.validation_fk == baseline_validations.id,
-            )
-            .where(
-                SweBenchTask.competition_fk == competition_id,
-                task_stage_filter,
-            )
-        )
-    ).all()
-
-    baseline_qualities: dict[int, list[float]] = {}
-    baseline_weighted: dict[int, list[float]] = {}
-    for row in baseline_rows:
-        task_id = int(row.task_id)
-        hit = _to_optional_float(row.hit_file_rate)
-        noise = _to_optional_float(row.noise_file_rate)
-        if hit is not None and noise is not None:
-            baseline_qualities.setdefault(task_id, []).append(hit - noise)
-        weighted = compute_weighted_tokens(
-            input_tokens=row.input_tokens,
-            cached_input_tokens=row.cached_input_tokens,
-            output_tokens=row.output_tokens,
-        )
-        if weighted is not None:
-            baseline_weighted.setdefault(task_id, []).append(float(weighted))
-
-    baseline_quality_by_task = {
-        task_id: _average(values) for task_id, values in baseline_qualities.items()
-    }
-    baseline_weighted_by_task = {
-        task_id: _average(values) for task_id, values in baseline_weighted.items()
-    }
-
-    miner_validations = aliased(SweBenchRunValidation, name="miner_validations")
-    miner_explore = aliased(SweExplorerValidation, name="miner_explore_rows")
-    miner_rows = (
-        await db.execute(
-            select(
-                SweBenchTask.id.label("task_id"),
-                Miner.ss58.label("hotkey"),
-                SweBenchRun.input_tokens.label("input_tokens"),
-                SweBenchRun.cached_input_tokens.label("cached_input_tokens"),
-                SweBenchRun.output_tokens.label("output_tokens"),
-                miner_explore.hit_file_rate.label("hit_file_rate"),
-                miner_explore.noise_file_rate.label("noise_file_rate"),
-            )
-            .select_from(SweBenchTask)
-            .join(
-                SweBenchRun,
-                and_(
-                    SweBenchRun.task_fk == SweBenchTask.id,
-                    SweBenchRun.baseline_run.is_(False),
-                    SweBenchRun.benchmark_type == "swe_explorer_explore",
-                ),
-            )
-            .join(Miner, Miner.id == SweBenchRun.miner_fk)
-            .outerjoin(miner_validations, miner_validations.run_fk == SweBenchRun.id)
-            .outerjoin(
-                miner_explore,
-                miner_explore.validation_fk == miner_validations.id,
-            )
-            .where(
-                SweBenchTask.competition_fk == competition_id,
-                Miner.miner_banned_status.is_(False),
-                task_stage_filter,
-            )
-        )
-    ).all()
-
-    miner_qualities: dict[str, dict[int, list[float]]] = {}
-    miner_weighted: dict[str, dict[int, list[float]]] = {}
-    miner_tasks: dict[str, set[int]] = {}
-    for row in miner_rows:
-        hotkey = str(row.hotkey)
-        task_id = int(row.task_id)
-        miner_tasks.setdefault(hotkey, set()).add(task_id)
-        hit = _to_optional_float(row.hit_file_rate)
-        noise = _to_optional_float(row.noise_file_rate)
-        if hit is not None and noise is not None:
-            miner_qualities.setdefault(hotkey, {}).setdefault(task_id, []).append(hit - noise)
-        weighted = compute_weighted_tokens(
-            input_tokens=row.input_tokens,
-            cached_input_tokens=row.cached_input_tokens,
-            output_tokens=row.output_tokens,
-        )
-        if weighted is not None:
-            miner_weighted.setdefault(hotkey, {}).setdefault(task_id, []).append(float(weighted))
-
-    scores: dict[str, float] = {}
-    for hotkey, task_ids in miner_tasks.items():
-        task_scores: list[float] = []
-        task_margins: list[float] = []
-        miner_weighted_total = 0.0
-        baseline_weighted_total = 0.0
-        has_miner_weighted = False
-        has_baseline_weighted = False
-
-        for task_id in sorted(task_ids):
-            miner_quality = _average(miner_qualities.get(hotkey, {}).get(task_id, []))
-            baseline_quality = baseline_quality_by_task.get(task_id)
-            miner_weighted_avg = _average(miner_weighted.get(hotkey, {}).get(task_id, []))
-            baseline_weighted_avg = baseline_weighted_by_task.get(task_id)
-
-            task_score = compute_explore_task_score(
-                miner_quality,
-                baseline_quality,
-                miner_weighted_avg,
-                baseline_weighted_avg,
-            )
-            if task_score is not None:
-                task_scores.append(task_score)
-            if miner_quality is not None and baseline_quality is not None:
-                task_margins.append(miner_quality - baseline_quality)
-            if miner_weighted_avg is not None:
-                miner_weighted_total += miner_weighted_avg
-                has_miner_weighted = True
-            if baseline_weighted_avg is not None:
-                baseline_weighted_total += baseline_weighted_avg
-                has_baseline_weighted = True
-
-        total_score = compute_explore_miner_total_score(
-            task_scores,
-            task_margins,
-            miner_weighted_total if has_miner_weighted else None,
-            baseline_weighted_total if has_baseline_weighted else None,
-        )
-        if total_score is not None:
-            scores[hotkey] = float(total_score)
-
-    return scores
-
-
-async def _load_benchmark_scores(
-    db: AsyncSession,
-    *,
-    competition_id: int,
-    task_stage_filter,
-) -> dict[str, dict[BenchmarkType, float]]:
-    """Per-miner, per-benchmark-type scores for the tasks selected by
-    ``task_stage_filter`` (see ``_load_swe_benchmark_rows``)."""
-    verified_rows = await _load_swe_benchmark_rows(
+    Complexity-blind on purpose: this is the same quantity as a miner's own total
+    score, restricted to a stage. Complexity decides which incentive elements a
+    miner competes in, not how it is scored.
+    """
+    rows = await _load_swe_benchmark_rows(
         db,
         competition_id=competition_id,
         benchmark_type="swebench_verified",
         resolved_model=SweBenchVerifiedValidation,
-        task_stage_filter=task_stage_filter,
+        task_stage_filter=(SweBenchTask.screener_stage == screener_stage),
     )
-    edit_rows = await _load_swe_benchmark_rows(
-        db,
-        competition_id=competition_id,
-        benchmark_type="swe_explorer_edit",
-        resolved_model=SweExplorerEditValidation,
-        task_stage_filter=task_stage_filter,
-    )
-
-    scores_by_benchmark: dict[BenchmarkType, dict[str, float]] = {
-        "swebench_verified": _swe_scores_by_hotkey(verified_rows),
-        "swe_explorer_edit": _swe_scores_by_hotkey(edit_rows),
-        "swe_explorer_explore": await _load_explore_scores_by_hotkey(
-            db,
-            competition_id=competition_id,
-            task_stage_filter=task_stage_filter,
-        ),
-    }
-
-    miner_benchmark_scores: dict[str, dict[BenchmarkType, float]] = {}
-    for benchmark_type, scores in scores_by_benchmark.items():
-        for hotkey, score in scores.items():
-            miner_benchmark_scores.setdefault(hotkey, {})[benchmark_type] = score
-
-    return miner_benchmark_scores
+    return _swe_scores_by_hotkey(rows)
 
 
 async def load_stage2_miner_total_scores(
@@ -607,24 +432,13 @@ async def load_stage2_miner_total_scores(
 ) -> dict[str, float]:
     """Per-hotkey total SWE score computed from stage-2 tasks only.
 
-    Uses the exact same benchmark-weighted-average formula as the final
-    competition score (``_subset_weighted_score`` over the full
-    ``BENCHMARK_TYPES`` triple), restricted to ``screener_stage == 2``. This
-    is the ranking key for stage-2 top-N + delta selection, so stage-2
+    The ranking key for stage-2 top-N + delta selection. It is the same formula as
+    the final competition score, restricted to ``screener_stage == 2``, so stage-2
     standing predicts full-eval standing.
     """
-    miner_benchmark_scores = await _load_benchmark_scores(
-        db,
-        competition_id=competition_id,
-        task_stage_filter=(SweBenchTask.screener_stage == 2),
+    return await _load_stage_total_scores(
+        db, competition_id=competition_id, screener_stage=2
     )
-
-    scores: dict[str, float] = {}
-    for hotkey, benchmark_scores in miner_benchmark_scores.items():
-        total_score = _subset_weighted_score(benchmark_scores, BENCHMARK_TYPES)
-        if total_score is not None:
-            scores[hotkey] = total_score
-    return scores
 
 
 async def load_stage1_miner_total_scores(
@@ -634,43 +448,84 @@ async def load_stage1_miner_total_scores(
 ) -> dict[str, float]:
     """Per-hotkey total SWE score computed from stage-1 tasks only.
 
-    Uses the exact same benchmark-weighted-average formula as
-    ``load_stage2_miner_total_scores`` (``_subset_weighted_score`` over the
-    full ``BENCHMARK_TYPES`` triple), restricted to ``screener_stage == 1``.
-    Display-only: stage 1's actual pass/fail gate is
-    ``evaluate_stage1_for_script``, which only gates on
-    ``swebench_verified``/``swe_explorer_edit`` and never on
-    ``swe_explorer_explore`` — this blended score does not feed that gate,
-    it only gives the frontend a benchmark-weighted number to show.
+    Display-only: stage 1's actual pass/fail gate is ``evaluate_stage1_for_script``;
+    this score does not feed that gate, it only gives the frontend a number to show.
     """
-    miner_benchmark_scores = await _load_benchmark_scores(
-        db,
-        competition_id=competition_id,
-        task_stage_filter=(SweBenchTask.screener_stage == 1),
+    return await _load_stage_total_scores(
+        db, competition_id=competition_id, screener_stage=1
     )
 
-    scores: dict[str, float] = {}
-    for hotkey, benchmark_scores in miner_benchmark_scores.items():
-        total_score = _subset_weighted_score(benchmark_scores, BENCHMARK_TYPES)
-        if total_score is not None:
-            scores[hotkey] = total_score
-    return scores
+
+async def _load_layer_category_scores(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+    task_stage_filter,
+) -> tuple[tuple[Category, ...], dict[str, dict[Category, float]]]:
+    """The categories the incentive layers are built over, and each miner's score in
+    them.
+
+    Layers are built over task **complexity**: winners are picked per complexity
+    subset, which is what makes performing across short, medium and long tasks worth
+    more than dominating one of them. A miner's own score stays complexity-blind -
+    complexity decides which contests the miner is in, not how well it did.
+
+    Only the categories actually present in the competition are returned, so a
+    competition without medium tasks hands out no weight for a medium element.
+
+    When nothing is classified - which is the state of every competition that
+    existed before the column did - there are no complexity categories at all, and
+    the layers would carry zero weight and burn the entire emission. That case falls
+    back to a single blind category holding the miner's overall score, which
+    reproduces the pre-complexity behaviour exactly.
+    """
+    from app.api.routes.scoring import (
+        build_swe_complexity_scores,
+        build_swe_miner_total_score,
+    )
+
+    rows = await _load_swe_benchmark_rows(
+        db,
+        competition_id=competition_id,
+        benchmark_type="swebench_verified",
+        resolved_model=SweBenchVerifiedValidation,
+        task_stage_filter=task_stage_filter,
+    )
+    groups_by_hotkey = _task_groups_by_hotkey(rows)
+
+    categories = present_categories(
+        group.get("complexity")
+        for task_groups in groups_by_hotkey.values()
+        for group in task_groups.values()
+    )
+
+    if not categories:
+        blind_scores: dict[str, dict[Category, float]] = {}
+        for hotkey, task_groups in groups_by_hotkey.items():
+            total_score, _ = build_swe_miner_total_score(task_groups)
+            if total_score is not None:
+                blind_scores[hotkey] = {FALLBACK_CATEGORY: float(total_score)}
+        return (FALLBACK_CATEGORY,), blind_scores
+
+    scores: dict[str, dict[Category, float]] = {}
+    for hotkey, task_groups in groups_by_hotkey.items():
+        category_scores = build_swe_complexity_scores(task_groups)
+        if category_scores:
+            scores[hotkey] = category_scores
+    return categories, scores
 
 
 async def load_competition_incentive_inputs(
     db: AsyncSession,
     *,
     competition_id: int,
-) -> tuple[tuple[BenchmarkType, ...], dict[str, dict[BenchmarkType, float]]]:
-    # Most competitions score eval (NULL) + stage-2 tasks, excluding stage 1.
-    # Competition 112 is a hotfix exception: final scoring is eval-only.
-    miner_benchmark_scores = await _load_benchmark_scores(
+) -> tuple[tuple[Category, ...], dict[str, dict[Category, float]]]:
+    # Final scoring covers eval (NULL) + stage-2 tasks and excludes stage 1.
+    return await _load_layer_category_scores(
         db,
         competition_id=competition_id,
         task_stage_filter=competition_final_score_task_stage_filter(competition_id),
     )
-
-    return BENCHMARK_TYPES, miner_benchmark_scores
 
 
 async def calculate_competition_incentive_weights(
@@ -679,13 +534,13 @@ async def calculate_competition_incentive_weights(
     competition_id: int,
     burn_ratio: float,
 ) -> IncentiveCalculationResult:
-    benchmark_types, miner_benchmark_scores = await load_competition_incentive_inputs(
+    categories, miner_category_scores = await load_competition_incentive_inputs(
         db,
         competition_id=competition_id,
     )
     return calculate_incentive_weights(
-        miner_benchmark_scores,
-        benchmark_types,
+        miner_category_scores,
+        categories,
         burn_ratio=burn_ratio,
     )
 

@@ -8,6 +8,7 @@
 - [💻 System Requirements](#-system-requirements)
 - [📦 Installation](#-installation)
 - [⚙️ Configuration](#️-configuration)
+- [🧪 What the validator grades](#-what-the-validator-grades)
 - [▶️ Running the Validator](#️-running-the-validator)
 - [📊 Monitoring](#-monitoring)
 - [🔧 Troubleshooting](#-troubleshooting)
@@ -20,6 +21,8 @@
 
 - 🐍 **Python 3.11+** 
 - 📝 **Git**
+- 🐳 **Docker** — grading runs the task's own container. No registry login is needed:
+  every image the validator pulls is public at the time it needs it.
 - 🔑 **Bittensor wallet** with registered hotkey on the subnet
 
 ### 👤 Required Accounts
@@ -75,6 +78,39 @@ cd validator
 cp .env.example .env
 nano .env  # or use your preferred editor
 ```
+
+---
+
+## 🧪 What the validator grades
+
+Every run is scored the same way — did the agent's patch make the task's tests pass —
+but a competition draws its tasks from two places, and each has its own grading path.
+Both are built in; there is nothing to choose or configure.
+
+| Stage | Tasks from | Graded by | Images pulled from |
+|---|---|---|---|
+| Screener stage 1 | `SWE-bench/SWE-bench_Verified` | the SWE-bench harness | `ghcr.io/epoch-research/...` (public) |
+| Screener stage 2, evaluation | SOMA task lists | the task's own test image | `dendritexhq/soma-competition-tasks-dind` |
+
+The platform names the dataset on each validation task, and the validator routes on it.
+
+**SOMA tasks.** These are not a Hugging Face dataset. Each task ships a *test image*
+holding the repository at `base_commit` with the task's test patch already applied, its
+dependencies installed, and a `run_tests` entrypoint. Grading is the container
+equivalent of the harness: pull the image, start it with **no network**, copy the
+miner's patch in, apply it, run `run_tests`, and check the task's `FAIL_TO_PASS` /
+`PASS_TO_PASS` ids against the pytest JSON report it produces. Where to run and what to
+run come from the image's own `soma.*` labels.
+
+**No registry credentials needed.** Those images live in a private Docker Hub
+repository so a competition's hidden tasks are not published in advance. Rather than
+distributing a shared registry token to every validator, the platform makes the
+repository public for the evaluation window and private again once it closes.
+
+That repository holds exactly the current competition's tasks: the platform mirrors the
+images of the tasks the competition actually references into it and removes the rest, so
+a tag you can pull there is a task that is being scored right now. Tags from past
+competitions disappear once their window has closed.
 
 ---
 
@@ -163,7 +199,27 @@ INFO: No tasks available (attempt 1), backing off to 30.0s poll interval
 
 ---
 
-#### 2. 🌐 **Platform Connection Failed**
+#### 2. 🔒 **`pull access denied` for a task test image**
+
+**Problem:** The hidden-task repository is still private.
+
+> **📌 NOTE:** The platform makes the repository public when the evaluation window opens
+> and private again once it closes, and reconciles that on an interval — so a single
+> failure right at the boundary is normal, and the validation is simply retried.
+
+**What to do:**
+- ✅ Ignore an isolated occurrence in the first minutes of the evaluation window
+- ✅ If it persists, report it — the platform-side visibility flip may be failing, and
+  no validator will be able to grade that competition's tasks until it is fixed
+
+A `manifest unknown` for a single task is a different problem: the repository is
+reachable but that task's image was never copied into it. Report the instance id —
+the platform holds such tasks back from dispatch, so a run existing for one means
+something copied only partially.
+
+---
+
+#### 3. 🌐 **Platform Connection Failed**
 
 **Problem:** Can't connect to platform API
 
