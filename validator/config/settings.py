@@ -171,7 +171,7 @@ class Settings(BaseModel):
             soma_task_test_image_tag_suffix=os.getenv(
                 "SOMA_TASK_TEST_IMAGE_TAG_SUFFIX", ".test"
             ),
-            soma_task_dataset_repo=os.getenv("SOMA_TASK_DATASET_REPO", ""),
+            soma_task_dataset_repo=os.getenv("SOMA_TASK_DATASET_REPO", "soma114/soma-competition-dataset"),
             soma_task_grading_file=Path(
                 os.getenv(
                     "SOMA_TASK_GRADING_FILE",
