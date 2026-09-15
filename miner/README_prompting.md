@@ -106,6 +106,8 @@ Allowed exact strings:
 - `Same response as in [[BLOCK X]].`
 - `[[CMP]] source line N [[/CMP]]`
 - `[[Omitted]] source line N ~ source line M Omitted [[/Omitted]]`
+- `[[MACRO ¶1]]/long/file/path[[/MACRO ¶1]] ~ Read ¶1.` 
+
 
 ### 5.2 Loop Detection
 
