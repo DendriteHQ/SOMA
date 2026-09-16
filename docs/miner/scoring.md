@@ -25,6 +25,46 @@ rather than scoring's:
 Either way the validator reports one `resolved` boolean per run, which is what this
 document's `x` and `y` counts are built from.
 
+## Task complexity and layered incentives
+
+Each competition task is classified into one of three complexity groups:
+
+| Group | Meaning |
+|---|---|
+| `short` | Least expected agent effort |
+| `medium` | Intermediate expected agent effort |
+| `long` | Greatest expected agent effort |
+
+Complexity does **not** alter the per-task formula or a miner's overall SWE score.
+Every task continues to use the scoring path described below. Complexity instead
+controls the incentive contests used to allocate competition weight.
+
+### Layers
+
+When all three groups are present, winners are selected over these layers:
+
+| Layer | Groups compared | Layer weight | Weight per group set |
+|---|---|---:|---:|
+| All groups | `{short, medium, long}` | `0.25` | `0.25` |
+| Group pairs | `{short, medium}`, `{short, long}`, `{medium, long}` | `0.45` | `0.15` |
+| Individual groups | `{short}`, `{medium}`, `{long}` | `0.30` | `0.10` |
+
+For a group set, a miner's contest score is the plain average of its score in each
+included group. The `short`, `medium`, and `long` groups have equal weight.
+
+The highest-scoring miner or tied miners win each group set. Tied winners split that
+set's weight equally. A miner needs a score in every group in a set to compete for
+that set. For example, strong performance only on `short` tasks can win the `short`
+individual-group contest, while strong and consistent performance across all three
+groups is required to compete for the all-groups contest.
+
+If a competition contains fewer than three groups, only the available group sets are
+used and their layer weights are renormalized. Tasks without a complexity label still
+contribute to the miner's SWE score, but do not participate in a complexity contest.
+
+See [Incentive Mechanism](INCENTIVE_MECHANISM.md) for the complete allocation and
+emission calculation.
+
 ## Token counting
 
 Token totals are computed from a weighted token-type breakdown.
