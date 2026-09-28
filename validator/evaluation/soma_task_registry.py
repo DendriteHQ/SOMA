@@ -6,10 +6,11 @@ the working directory, the ``run_tests`` entrypoint and the pytest command - as
 the image does not carry is *which* test ids decide the outcome: the FAIL_TO_PASS ids
 the patch must make pass and the PASS_TO_PASS ids it must not break. The image's
 ``run_tests`` script runs the task's whole test selection, and only these two lists
-say which results in that report are graded.
+say which results in that report are graded. The task's ``test_patch`` is retained as
+well, so the evaluator can identify test files already baked into the image and discard
+a miner's edits to them before applying its patch.
 
-So those two lists are the only thing a validator needs beyond the image, and there are
-two ways they can reach it.
+Those task details can reach a validator in two ways.
 
 **The dataset** (preferred). The platform publishes the current competition's task rows
 to a Hugging Face dataset repository on the same schedule as the task images: private
@@ -56,7 +57,9 @@ DEFAULT_GRADING_FILE = Path(__file__).resolve().parents[2] / "tasks" / "soma_tas
 GRADING_FILE_ENV = "SOMA_TASK_GRADING_FILE"
 
 #: The published dataset. ``<repo>`` is ``namespace/name``; the file inside it is a
-#: JSONL of full task rows, of which only the graded test ids are read here.
+#: JSONL of full task rows.  Besides the graded test ids, the evaluator retains the
+#: task's test patch so it can prevent a miner from replacing tests that are already
+#: baked into the test image.
 DATASET_REPO_ENV = "SOMA_TASK_DATASET_REPO"
 DATASET_PATH_ENV = "SOMA_TASK_DATASET_PATH"
 DATASET_REVISION_ENV = "SOMA_TASK_DATASET_REVISION"
@@ -99,6 +102,9 @@ class SomaTaskGradingSpec:
     instance_id: str
     fail_to_pass: tuple[str, ...]
     pass_to_pass: tuple[str, ...]
+    #: The task's test patch.  The test image already contains this patch, and its
+    #: touched paths are protected from changes in a miner patch during grading.
+    test_patch: str | None = None
     #: Optional per-task overrides for what the image labels would otherwise supply.
     test_image: str | None = None
     workdir: str | None = None
@@ -148,6 +154,7 @@ def _spec_from_row(row: dict) -> SomaTaskGradingSpec | None:
         instance_id=instance_id,
         fail_to_pass=_normalize_test_ids(row.get("FAIL_TO_PASS") or row.get("fail_to_pass")),
         pass_to_pass=_normalize_test_ids(row.get("PASS_TO_PASS") or row.get("pass_to_pass")),
+        test_patch=_optional_str(row, "test_patch"),
         test_image=_optional_str(row, "test_image"),
         workdir=_optional_str(row, "workdir") or _optional_str(test_entry, "workdir"),
         run_tests=_optional_str(row, "run_tests") or _optional_str(test_entry, "run_tests"),
@@ -180,7 +187,7 @@ def _specs_from_jsonl(text: str, *, origin: str) -> dict[str, SomaTaskGradingSpe
 
 
 class SomaTaskRegistry:
-    """Instance id -> graded test ids, from the published dataset or a local file."""
+    """Instance id -> grading details, from the published dataset or a local file."""
 
     def __init__(
         self,

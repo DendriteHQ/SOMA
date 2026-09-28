@@ -68,6 +68,12 @@ LABEL_TEST_COMMAND = "soma.test_command"
 # behaviour a graded id asserts.
 PASSING_OUTCOME = "passed"
 
+# A unified diff starts one section for every changed file.  Test patches and miner
+# patches use git-style headers, so the target is the b/<path> side: the path that
+# would exist after applying the section.
+_DIFF_SECTION = re.compile(r"(?m)^(?=diff --git )")
+_DIFF_TARGET = re.compile(r"(?m)^diff --git a/(?:\S+) b/(\S+)")
+
 
 class SomaTaskEvaluationError(RuntimeError):
     pass
@@ -83,6 +89,7 @@ class SomaTaskEvaluationResult:
     report: dict | None = None
     logs: str | None = None
     missing_tests: tuple[str, ...] = field(default_factory=tuple)
+    dropped_test_files: tuple[str, ...] = field(default_factory=tuple)
 
 
 def _run(
@@ -125,6 +132,37 @@ def _looks_like_unified_diff(diff: str) -> bool:
     return any(line.startswith("--- ") for line in lines) and any(
         line.startswith("+++ ") for line in lines
     )
+
+
+def _test_patch_paths(test_patch: str | None) -> set[str]:
+    """Return files already changed by the task's baked-in test patch."""
+    return set(_DIFF_TARGET.findall(test_patch or ""))
+
+
+def _strip_protected_test_files(
+    patch_text: str, protected_paths: set[str]
+) -> tuple[str, tuple[str, ...]]:
+    """Remove whole-file diff sections that modify baked-in test files.
+
+    The test image already contains the task's tests.  Applying a miner edit to one
+    of those files either collides with the baked patch or permits the miner to alter
+    the test that is supposed to grade its solution.  Keep the patch byte-for-byte
+    unchanged when no protected path is present, including for non-git unified diffs.
+    """
+    if not protected_paths:
+        return patch_text, ()
+    dropped: list[str] = []
+    kept: list[str] = []
+    for section in _DIFF_SECTION.split(patch_text):
+        if not section.strip():
+            continue
+        target = _DIFF_TARGET.search(section)
+        path = target.group(1) if target else None
+        if path in protected_paths:
+            dropped.append(path)
+        else:
+            kept.append(section)
+    return "".join(kept), tuple(dropped)
 
 
 def _outcomes_from_report(report_payload: object) -> dict[str, str]:
@@ -269,6 +307,25 @@ class SomaTaskContainerEvaluator:
                 normalized_instance_id, test_image, run_id, spec, error="invalid_diff_format"
             )
 
+        graded_diff, dropped_test_files = _strip_protected_test_files(
+            normalized_diff, _test_patch_paths(spec.test_patch)
+        )
+        if dropped_test_files:
+            logger.info(
+                "Dropped miner changes to baked-in test file(s) for %s: %s",
+                normalized_instance_id,
+                ", ".join(dropped_test_files),
+            )
+        if not graded_diff.strip():
+            return self._unresolved(
+                normalized_instance_id,
+                test_image,
+                run_id,
+                spec,
+                error="empty_diff_after_dropping_test_files",
+                dropped_test_files=dropped_test_files,
+            )
+
         self._ensure_image(test_image)
         labels = self._image_labels(test_image)
         workdir = spec.workdir or labels.get(LABEL_WORKDIR) or DEFAULT_WORKDIR
@@ -288,7 +345,7 @@ class SomaTaskContainerEvaluator:
         with tempfile.TemporaryDirectory(prefix="soma-task-eval-") as work_dir:
             work_path = Path(work_dir)
             patch_path = work_path / "agent.patch"
-            patch_path.write_text(normalized_diff, encoding="utf-8")
+            patch_path.write_text(graded_diff, encoding="utf-8")
 
             container_name = (
                 f"{CONTAINER_NAME_PREFIX}{_slug(normalized_instance_id, default='instance')}"
@@ -342,6 +399,7 @@ class SomaTaskContainerEvaluator:
                         error="patch_did_not_apply",
                         logs=apply_detail,
                         patch_applied=False,
+                        dropped_test_files=dropped_test_files,
                     )
 
                 tested = _run(
@@ -390,6 +448,7 @@ class SomaTaskContainerEvaluator:
                 "patch_exists": True,
                 "patch_successfully_applied": True,
                 "reported_test_count": len(outcomes),
+                "dropped_test_files": list(dropped_test_files),
                 "missing_tests": list(missing),
                 "tests_status": {
                     "FAIL_TO_PASS": fail_bucket,
@@ -405,6 +464,8 @@ class SomaTaskContainerEvaluator:
         )
         if missing:
             logs += f" missing_tests={len(missing)}"
+        if dropped_test_files:
+            logs += f" dropped_test_files={','.join(dropped_test_files)}"
 
         return SomaTaskEvaluationResult(
             instance_id=normalized_instance_id,
@@ -415,6 +476,7 @@ class SomaTaskContainerEvaluator:
             report=report,
             logs=logs,
             missing_tests=missing,
+            dropped_test_files=dropped_test_files,
         )
 
     def _apply_patch(self, *, container_id: str, workdir: str) -> tuple[bool, str]:
@@ -456,6 +518,7 @@ class SomaTaskContainerEvaluator:
         error: str,
         logs: str | None = None,
         patch_applied: bool = False,
+        dropped_test_files: tuple[str, ...] = (),
     ) -> SomaTaskEvaluationResult:
         fail_bucket, _ = _bucket(spec.fail_to_pass, {})
         pass_bucket, _ = _bucket(spec.pass_to_pass, {})
@@ -471,6 +534,7 @@ class SomaTaskContainerEvaluator:
                     "error": error,
                     "patch_exists": error != "empty_diff",
                     "patch_successfully_applied": patch_applied,
+                    "dropped_test_files": list(dropped_test_files),
                     "tests_status": {
                         "FAIL_TO_PASS": fail_bucket,
                         "PASS_TO_PASS": pass_bucket,
@@ -478,6 +542,7 @@ class SomaTaskContainerEvaluator:
                 }
             },
             logs=logs or f"instance_id={instance_id} resolved=0 error={error}",
+            dropped_test_files=dropped_test_files,
         )
 
     # -- image resolution ----------------------------------------------------

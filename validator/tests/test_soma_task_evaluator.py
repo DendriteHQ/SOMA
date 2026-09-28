@@ -52,6 +52,16 @@ VALID_DIFF = """diff --git a/src/x.py b/src/x.py
 +new
 """
 
+TEST_PATCH = """diff --git a/tests/test_document.py b/tests/test_document.py
+--- a/tests/test_document.py
++++ b/tests/test_document.py
+@@ -1 +1 @@
+-old test
++new test
+"""
+
+MIXED_DIFF = VALID_DIFF + TEST_PATCH
+
 
 def _write_grading_file(tmp_path: Path, rows: list[dict]) -> Path:
     path = tmp_path / "soma_tasks_grading.jsonl"
@@ -75,6 +85,18 @@ def _default_grading_file(tmp_path: Path) -> Path:
     )
 
 
+def _grading_file_with_test_patch(tmp_path: Path) -> Path:
+    return _write_grading_file(
+        tmp_path,
+        [{
+            "instance_id": INSTANCE_ID,
+            "FAIL_TO_PASS": FAIL_TO_PASS,
+            "PASS_TO_PASS": PASS_TO_PASS,
+            "test_patch": TEST_PATCH,
+        }],
+    )
+
+
 class _FakeDocker:
     """Records docker invocations and answers them from a scripted report."""
 
@@ -82,10 +104,14 @@ class _FakeDocker:
         self.report = report
         self.calls: list[list[str]] = []
         self.overrides = outcomes_by_step or {}
+        self.copied_agent_patch: str | None = None
 
     def __call__(self, args, *, timeout=None):
         self.calls.append(list(args))
         joined = " ".join(args)
+
+        if args[:2] == ["docker", "cp"] and args[2].endswith("agent.patch"):
+            self.copied_agent_patch = Path(args[2]).read_text(encoding="utf-8")
 
         for needle, result in self.overrides.items():
             if needle in joined:
@@ -214,6 +240,48 @@ def test_patch_that_does_not_apply_scores_zero(tmp_path, monkeypatch):
     assert result.report[INSTANCE_ID]["patch_successfully_applied"] is False
     # The container is still torn down on the way out.
     assert any(call[:3] == ["docker", "rm", "-f"] for call in fake.calls)
+
+
+def test_drops_baked_test_file_changes_before_copying_the_agent_patch(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    from validator.evaluation import soma_task_evaluator
+
+    monkeypatch.setattr(soma_task_evaluator, "_run", fake)
+    monkeypatch.setattr(
+        SomaTaskContainerEvaluator, "_image_labels", staticmethod(lambda _image: dict(IMAGE_LABELS))
+    )
+    evaluator = SomaTaskContainerEvaluator(
+        settings=SimpleNamespace(
+            soma_task_test_image_repository="example/soma-tasks",
+            soma_task_eval_remove_image_after_run=False,
+        ),
+        registry=SomaTaskRegistry(_grading_file_with_test_patch(tmp_path)),
+    )
+
+    result = evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=MIXED_DIFF)
+
+    assert fake.copied_agent_patch == VALID_DIFF
+    assert result.dropped_test_files == ("tests/test_document.py",)
+    assert result.report[INSTANCE_ID]["dropped_test_files"] == ["tests/test_document.py"]
+
+
+def test_test_only_patch_scores_zero_without_starting_docker(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=None)
+    from validator.evaluation import soma_task_evaluator
+
+    monkeypatch.setattr(soma_task_evaluator, "_run", fake)
+    evaluator = SomaTaskContainerEvaluator(
+        settings=SimpleNamespace(soma_task_test_image_repository="example/soma-tasks"),
+        registry=SomaTaskRegistry(_grading_file_with_test_patch(tmp_path)),
+    )
+
+    result = evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=TEST_PATCH)
+
+    assert result.resolved is False
+    assert result.report[INSTANCE_ID]["error"] == "empty_diff_after_dropping_test_files"
+    assert result.dropped_test_files == ("tests/test_document.py",)
+    # Resolving the image name does not contact Docker; stripping happens before pull.
+    assert fake.calls == []
 
 
 def test_missing_report_raises_rather_than_scoring_zero(tmp_path, monkeypatch):
@@ -371,6 +439,12 @@ def test_registry_reads_graded_ids_and_normalizes_them(tmp_path):
 
     assert spec.fail_to_pass == ("a.py::test_a", "b.py::test_b")
     assert spec.pass_to_pass == ("c.py::test_c",)
+
+
+def test_registry_retains_the_task_test_patch(tmp_path):
+    spec = SomaTaskRegistry(_grading_file_with_test_patch(tmp_path)).get(INSTANCE_ID)
+
+    assert spec.test_patch == TEST_PATCH.strip()
 
 
 def test_registry_reads_the_nested_images_block(tmp_path):
