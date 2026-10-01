@@ -509,6 +509,11 @@ def _select_passthrough_response_headers(headers: httpx.Headers) -> dict[str, st
     return out
 
 
+def _is_systemone_path(path: str) -> bool:
+    """OpenRouter's System One endpoint (Jev, the TypeSafe decision model)."""
+    return path.strip("/").split("?", 1)[0].endswith("systemone")
+
+
 def _build_upstream_url(path: str, query_string: str) -> str:
     base = _resolve_upstream_url(path)
     if query_string:
@@ -603,6 +608,11 @@ async def proxy_openai_compatible(
 
     force_provider = (os.getenv("GATEWAY_FORCE_PROVIDER") or "").strip()
     provider_was_forced = False
+    # The pin is for the agent's LLM. A compressor-service call - Jev on OpenRouter's
+    # System One API, made by the benchmark proxy for the miner's compressor - must
+    # reach its own provider (TypeSafe), so it is never pinned.
+    if _is_systemone_path(path):
+        force_provider = ""
     if force_provider and isinstance(parsed, dict) and method in ("POST", "PUT", "PATCH"):
         if "provider" not in parsed:
             parsed["provider"] = {"order": [force_provider], "allow_fallbacks": False}
