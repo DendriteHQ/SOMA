@@ -460,12 +460,14 @@ def _screening_validation_columns() -> tuple:
     input_tokens_col = _model_attr(SweBenchRun, "input_tokens")
     cached_input_tokens_col = _model_attr(SweBenchRun, "cached_input_tokens")
     output_tokens_col = _model_attr(SweBenchRun, "output_tokens")
+    jev_input_tokens_col = _model_attr(SweBenchRun, "jev_input_tokens")
     return (
         SweBenchVerifiedValidation.resolved.label("verified_resolved"),
         SweBenchRun.tokens_used,
         (input_tokens_col if input_tokens_col is not None else literal(None)).label("input_tokens"),
         (cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)).label("cached_input_tokens"),
         (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
+        (jev_input_tokens_col if jev_input_tokens_col is not None else literal(None)).label("jev_input_tokens"),
     )
 
 
@@ -572,6 +574,7 @@ async def _load_screening_miner_run_states(
             input_tokens=_coerce_optional_int(row["input_tokens"]),
             cached_input_tokens=_coerce_optional_int(row["cached_input_tokens"]),
             output_tokens=_coerce_optional_int(row["output_tokens"]),
+            jev_input_tokens=_coerce_optional_int(row["jev_input_tokens"]),
         )
         by_script.setdefault((script_fk, miner_fk), {})[
             (int(row["task_fk"]), int(row["attempt_no"]), benchmark_type)

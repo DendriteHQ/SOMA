@@ -207,6 +207,7 @@ async def load_screening_miner_states_for_scripts(
     input_tokens_col = _model_attr(SweBenchRun, "input_tokens")
     cached_input_tokens_col = _model_attr(SweBenchRun, "cached_input_tokens")
     output_tokens_col = _model_attr(SweBenchRun, "output_tokens")
+    jev_input_tokens_col = _model_attr(SweBenchRun, "jev_input_tokens")
 
     script_ids = [int(script.script_id) for script in scripts]
     miner_ids = [int(script.miner_fk) for script in scripts]
@@ -227,6 +228,9 @@ async def load_screening_miner_states_for_scripts(
                     cached_input_tokens_col if cached_input_tokens_col is not None else literal(None)
                 ).label("cached_input_tokens"),
                 (output_tokens_col if output_tokens_col is not None else literal(None)).label("output_tokens"),
+                (
+                    jev_input_tokens_col if jev_input_tokens_col is not None else literal(None)
+                ).label("jev_input_tokens"),
             )
             .join(SweBenchRunValidation, SweBenchRunValidation.run_fk == SweBenchRun.id)
             .outerjoin(
@@ -261,6 +265,7 @@ async def load_screening_miner_states_for_scripts(
                 input_tokens=_coerce_optional_int(row[8]),
                 cached_input_tokens=_coerce_optional_int(row[9]),
                 output_tokens=_coerce_optional_int(row[10]),
+                jev_input_tokens=_coerce_optional_int(row[11]),
             ),
         )
     return by_script
@@ -514,13 +519,27 @@ def screening_token_weights() -> tuple[float, float, float]:
     )
 
 
+def screening_jev_input_tokens_weight() -> float:
+    return float(getattr(settings, "swebench_screening_jev_input_tokens_weight", 0.3))
+
+
 def weighted_tokens_for_screening(
     *,
     total_tokens: int | None,
     input_tokens: int | None,
     cached_input_tokens: int | None,
     output_tokens: int | None,
+    jev_input_tokens: int | None = None,
 ) -> float | None:
+    """Weighted tokens of one run for the screening gates.
+
+    ``jev_input_tokens`` is the run's compressor spend on Jev (compressor services),
+    passed for miner runs only - a baseline has no compressor. It is added to the
+    agent's total, never used in place of it.
+    """
+    jev = 0.0
+    if jev_input_tokens is not None and int(jev_input_tokens) > 0:
+        jev = screening_jev_input_tokens_weight() * float(jev_input_tokens)
     if input_tokens is not None and cached_input_tokens is not None and output_tokens is not None:
         input_value = int(input_tokens)
         cached_value = int(cached_input_tokens)
@@ -532,11 +551,12 @@ def weighted_tokens_for_screening(
             (input_weight * float(input_value))
             + (cached_input_weight * float(cached_value))
             + (output_weight * float(output_value))
+            + jev
         )
 
     if total_tokens is None or int(total_tokens) < 0:
         return None
-    return float(total_tokens)
+    return float(total_tokens) + jev
 
 
 def compute_weighted_token_savings_ratio(

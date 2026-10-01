@@ -52,6 +52,7 @@ from app.api.routes.scoring import (
     compute_weighted_tokens,
     _summarize_baseline_pass,
     _scoring_token_weights,
+    _jev_input_tokens_weight,
 )
 from app.services import swebench_screening as screening_shared
 from app.services.complexity import COMPLEXITY_VALUES, normalize_complexity
@@ -336,6 +337,7 @@ _TOKEN_TOTAL_COMPONENT_FIELDS = (
     "miner_input_tokens",
     "miner_cached_input_tokens",
     "miner_output_tokens",
+    "miner_jev_input_tokens",
 )
 
 
@@ -352,6 +354,7 @@ def _recompute_miner_token_totals_across_benchmarks(payload: dict[str, Any]) -> 
     `*_weighted_tokens_total` and the three components of a side sum to it.
     """
     input_weight, cached_weight, output_weight = _scoring_token_weights()
+    jev_weight = _jev_input_tokens_weight()
     component_weight_by_field = {
         "baseline_input_tokens": input_weight,
         "baseline_cached_input_tokens": cached_weight,
@@ -359,6 +362,9 @@ def _recompute_miner_token_totals_across_benchmarks(payload: dict[str, Any]) -> 
         "miner_input_tokens": input_weight,
         "miner_cached_input_tokens": cached_weight,
         "miner_output_tokens": output_weight,
+        # Compressor services (Jev): miner side only, so the miner's components still
+        # sum to its weighted total and the baseline's to its own.
+        "miner_jev_input_tokens": jev_weight,
     }
     for miner_dict in payload.get("miners", []):
         tasks = miner_dict.get("tasks")
@@ -790,6 +796,7 @@ def _finalize_swe_task_groups(
                 input_tokens=run["input_tokens_with_compression"],
                 cached_input_tokens=run["cached_input_tokens_with_compression"],
                 output_tokens=run["output_tokens_with_compression"],
+                jev_input_tokens=run.get("jev_input_tokens_with_compression"),
             )
             finalized_runs.append(run)
         group["runs"] = finalized_runs
@@ -880,6 +887,9 @@ def _build_swe_task_groups_by_hotkey_from_facts(
                 ),
                 "output_tokens_with_compression": _to_optional_int(
                     row.get("run_output_tokens")
+                ),
+                "jev_input_tokens_with_compression": _to_optional_int(
+                    row.get("run_jev_input_tokens")
                 ),
                 "time_taken_seconds": _to_optional_float(row.get("time_taken_seconds")),
                 "agent_steps": _to_optional_int(row.get("agent_steps")),
@@ -979,6 +989,7 @@ async def _fetch_swe_task_groups_by_hotkey_live(
             mr.input_tokens AS run_input_tokens,
             mr.cached_input_tokens AS run_cached_input_tokens,
             mr.output_tokens AS run_output_tokens,
+            mr.jev_input_tokens AS run_jev_input_tokens,
             mr.time_taken_seconds AS time_taken_seconds,
             mr.agent_steps AS agent_steps,
             mvc.resolved AS run_resolved
@@ -1265,12 +1276,14 @@ def _weighted_tokens_for_screening(
     input_tokens: object,
     cached_input_tokens: object,
     output_tokens: object,
+    jev_input_tokens: object = None,
 ) -> float | None:
     return screening_shared.weighted_tokens_for_screening(
         total_tokens=_to_optional_int(total_tokens),
         input_tokens=_to_optional_int(input_tokens),
         cached_input_tokens=_to_optional_int(cached_input_tokens),
         output_tokens=_to_optional_int(output_tokens),
+        jev_input_tokens=_to_optional_int(jev_input_tokens),
     )
 
 
@@ -1307,6 +1320,7 @@ def _group_weighted_token_totals(
                 input_tokens=run.get("input_tokens_with_compression"),
                 cached_input_tokens=run.get("cached_input_tokens_with_compression"),
                 output_tokens=run.get("output_tokens_with_compression"),
+                jev_input_tokens=run.get("jev_input_tokens_with_compression"),
             )
             if weighted is None:
                 continue
@@ -1399,12 +1413,25 @@ def _group_miner_token_component_totals(
     )
 
 
+def _group_miner_jev_input_tokens_total(group: dict[str, object]) -> int | None:
+    """Raw Jev input tokens over a group's miner runs (compressor services)."""
+    runs = group.get("runs")
+    values = [
+        value
+        for run in (runs if isinstance(runs, list) else [])
+        if isinstance(run, dict)
+        and (value := _to_optional_int(run.get("jev_input_tokens_with_compression"))) is not None
+    ]
+    return sum(values) if values else None
+
+
 def _weighted_tokens_for_run_item(run: dict[str, object]) -> float | None:
     return _weighted_tokens_for_screening(
         total_tokens=run.get("tokens_with_compression"),
         input_tokens=run.get("input_tokens_with_compression"),
         cached_input_tokens=run.get("cached_input_tokens_with_compression"),
         output_tokens=run.get("output_tokens_with_compression"),
+        jev_input_tokens=run.get("jev_input_tokens_with_compression"),
     )
 
 
@@ -1892,6 +1919,8 @@ async def _get_competition_aggregate_impl(
         miner_has_cached_input = False
         miner_output_total = 0
         miner_has_output = False
+        miner_jev_input_total = 0
+        miner_has_jev_input = False
         for group in sorted(task_groups.values(), key=lambda group: int(group["task_id"])):
             task_item = build_swe_task_result_item(group).model_copy(
                 update={
@@ -1957,6 +1986,7 @@ async def _get_competition_aggregate_impl(
                 miner_cached_input_tokens,
                 miner_output_tokens,
             ) = _group_miner_token_component_totals(group)
+            miner_jev_input_tokens = _group_miner_jev_input_tokens_total(group)
             task_item = task_item.model_copy(
                 update={
                     "tokens_without_compression": baseline_task_tokens,
@@ -1978,6 +2008,11 @@ async def _get_competition_aggregate_impl(
                     "output_tokens_with_compression": (
                         float(miner_output_tokens)
                         if miner_output_tokens is not None
+                        else None
+                    ),
+                    "jev_input_tokens_with_compression": (
+                        float(miner_jev_input_tokens)
+                        if miner_jev_input_tokens is not None
                         else None
                     ),
                 }
@@ -2006,6 +2041,9 @@ async def _get_competition_aggregate_impl(
             if miner_output_tokens is not None:
                 miner_output_total += miner_output_tokens
                 miner_has_output = True
+            if miner_jev_input_tokens is not None:
+                miner_jev_input_total += miner_jev_input_tokens
+                miner_has_jev_input = True
             run_items = [
                 SweMinerTaskRunItem(
                     run_id=int(run["run_id"] or 0),
@@ -2021,6 +2059,9 @@ async def _get_competition_aggregate_impl(
                     output_tokens_with_compression=run[
                         "output_tokens_with_compression"
                     ],
+                    jev_input_tokens_with_compression=run.get(
+                        "jev_input_tokens_with_compression"
+                    ),
                     weighted_tokens_with_compression=_round_optional_1dp(
                         _weighted_tokens_for_run_item(run)
                     ),
@@ -2052,6 +2093,7 @@ async def _get_competition_aggregate_impl(
                     miner_input_tokens=miner_input_tokens,
                     miner_cached_input_tokens=miner_cached_input_tokens,
                     miner_output_tokens=miner_output_tokens,
+                    miner_jev_input_tokens=miner_jev_input_tokens,
                 )
             )
 
@@ -2098,6 +2140,9 @@ async def _get_competition_aggregate_impl(
                 ),
                 miner_output_tokens_total=(
                     miner_output_total if miner_has_output else None
+                ),
+                miner_jev_input_tokens_total=(
+                    miner_jev_input_total if miner_has_jev_input else None
                 ),
             )
         )
