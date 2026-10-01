@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import importlib.util
 import json
 import logging
 import os
 import shlex
+import signal
 import shutil
 import subprocess
 import sys
@@ -828,6 +830,14 @@ class CompactBenchExecutor:
         self._llm_proxy_lock = threading.Lock()
         self._output_cleanup_lock = threading.Lock()
         self._last_output_cleanup_monotonic = 0.0
+        self._last_copilot_cleanup_monotonic = 0.0
+        run_root = os.getenv("SOMA_COPILOT_RUN_ROOT") or os.getenv("SOMA_COPILOT_TMP_ROOT")
+        self._copilot_run_root = Path(run_root.strip() if run_root and run_root.strip() else
+                                      Path(tempfile.gettempdir()) / "soma-benchmark-copilot-runs").expanduser().resolve()
+        # Keep locks outside the bounded run tmpfs, which may already be full.
+        root_key = hashlib.sha256(str(self._copilot_run_root).encode()).hexdigest()[:16]
+        self._copilot_lock_root = Path(tempfile.gettempdir()) / "soma-copilot-run-locks" / root_key
+        self._copilot_lock_root.mkdir(parents=True, exist_ok=True)
         self._benchmark_package_spec = _resolve_benchmark_package_spec()
         self._plugin_repository_url = _resolve_plugin_repository_url()
         self._copilot_shared_proxy_enabled = _resolve_copilot_shared_proxy_enabled()
@@ -1144,7 +1154,94 @@ class CompactBenchExecutor:
                 retention_seconds,
             )
 
+    @staticmethod
+    def _run_benchmark_command(
+        command: list[str], *, env: dict[str, str], timeout: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        # Kill descendants too: git/compose helpers must stop writing before cleanup.
+        with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, start_new_session=True) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except BaseException:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+                raise
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    @staticmethod
+    def _remove_run_directory(path: Path) -> None:
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Could not remove Copilot run directory: path=%s", path, exc_info=True)
+
+    def _copilot_run_lock_path(self, name: str) -> Path:
+        # A fixed set of lock files avoids accumulating one inode per historical run.
+        bucket = int(hashlib.sha256(name.encode()).hexdigest()[:8], 16) % 4096
+        return self._copilot_lock_root / str(bucket)
+
+    def _maybe_cleanup_stale_copilot_dirs(self) -> None:
+        if self._debug_preserve_outputs:
+            return
+        interval = _coerce_positive_int(
+            os.getenv(COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS_ENV),
+            COMPACT_BENCH_DEFAULT_OUTPUT_CLEANUP_INTERVAL_SECONDS,
+        )
+        with self._output_cleanup_lock:
+            now = time.monotonic()
+            if now - self._last_copilot_cleanup_monotonic < interval:
+                return
+            self._last_copilot_cleanup_monotonic = now
+        retention = _coerce_positive_int(
+            os.getenv(COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV),
+            COMPACT_BENCH_DEFAULT_OUTPUT_RETENTION_SECONDS,
+        )
+        cutoff = time.time() - retention
+        if not self._copilot_run_root.is_dir():
+            return
+        for candidate in self._copilot_run_root.iterdir():
+            if not candidate.name.startswith("run-") or candidate.is_symlink() or not candidate.is_dir():
+                continue
+            try:
+                # Never unlink lock files: all workers must lock the same inode.
+                with self._copilot_run_lock_path(candidate.name).open("a") as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    if candidate.stat().st_mtime < cutoff:
+                        self._remove_run_directory(candidate)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logger.warning("Could not sweep Copilot run directory: path=%s", candidate, exc_info=True)
+
     def execute_task(
+        self,
+        *,
+        batch_id: str,
+        task: CompactBenchRunTaskRequest,
+        timeout_per_task: float | None,
+    ) -> CompactBenchExecutionOutput:
+        if task.agent_name == "openclaw":
+            return self._execute_task(batch_id=batch_id, task=task, timeout_per_task=timeout_per_task)
+        run_dir = self._copilot_run_root / f"run-{task.run_id}"
+        with self._copilot_run_lock_path(run_dir.name).open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                self._maybe_cleanup_stale_copilot_dirs()
+                return self._execute_task(batch_id=batch_id, task=task, timeout_per_task=timeout_per_task)
+            finally:
+                if not self._debug_preserve_outputs:
+                    self._remove_run_directory(run_dir)
+
+    def _execute_task(
         self,
         *,
         batch_id: str,
@@ -1209,6 +1306,11 @@ class CompactBenchExecutor:
                 openclaw_agent_timeout_seconds=openclaw_agent_timeout_seconds,
             )
             env = os.environ.copy()
+            if task.agent_name != "openclaw":
+                env["SOMA_COPILOT_RUN_ID"] = str(task.run_id)
+                env["SOMA_COPILOT_RUN_ROOT"] = str(self._copilot_run_root)
+                # The host owns directory cleanup and checks active-run locks.
+                env["SOMA_COPILOT_PRESERVE_RUN_DIRS"] = "true"
             if agent_timeout is not None and task.agent_name != "openclaw":
                 env["SOMA_COPILOT_AGENT_TIMEOUT_SECONDS"] = str(int(agent_timeout))
             copilot_compression_handle: CopilotCompressionHandle | None = None
@@ -1272,14 +1374,7 @@ class CompactBenchExecutor:
                 shlex.join(command),
             )
             try:
-                process = subprocess.run(
-                    command,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                )
+                process = self._run_benchmark_command(command, env=env, timeout=timeout)
             except subprocess.TimeoutExpired as exc:
                 duration = time.monotonic() - started_at
                 logger.error(
@@ -1595,18 +1690,6 @@ class CompactBenchExecutor:
                 self._stop_copilot_run_compression_service(copilot_compression_handle)
             if task.agent_name != "openclaw":
                 self._cleanup_copilot_run_resources(run_id=task.run_id, output_dir=output_dir)
-            if 'tmp_run_dir' in locals() and tmp_run_dir:
-                # tmp_run_dir is the copilot backend's own run directory - it lives outside
-                # output_dir under soma-benchmark-copilot-runs and is otherwise never
-                # cleaned up.
-                if self._debug_preserve_outputs:
-                    logger.info(
-                        "Keeping copilot run directory for debug inspection: run_id=%s tmp_run_dir=%s",
-                        task.run_id,
-                        tmp_run_dir,
-                    )
-                else:
-                    shutil.rmtree(Path(tmp_run_dir).parent, ignore_errors=True)
             if self._debug_preserve_outputs:
                 logger.info(
                     "Keeping benchmark output directory for debug inspection: run_id=%s output_dir=%s",
