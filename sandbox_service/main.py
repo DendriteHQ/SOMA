@@ -192,6 +192,10 @@ def _volume_janitor_loop(stop_event: threading.Event) -> None:
             volume_janitor.sweep()
         except Exception:
             logger.exception("Volume janitor sweep failed")
+        try:
+            get_compact_bench_executor()._maybe_cleanup_stale_copilot_dirs()
+        except Exception:
+            logger.exception("Copilot run directory sweep failed")
         stop_event.wait(volume_janitor.SWEEP_INTERVAL_SECONDS)
     logger.info("Volume janitor thread stopped")
 
