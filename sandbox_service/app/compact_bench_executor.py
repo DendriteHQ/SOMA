@@ -128,6 +128,22 @@ def _first_token_count(*candidates: Any) -> int | None:
     return None
 
 
+def _jev_usage(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Jev usage of the run's compressor, from the benchmark's `metadata.service_usage`
+    (SOMA-benchmark compressor services: the proxy calls Jev for the compressor and
+    totals it per run). Kept out of the agent's token counts. Empty when absent."""
+    usage = metadata.get("service_usage") if isinstance(metadata, dict) else None
+    jev = usage.get("jev") if isinstance(usage, dict) else None
+    if not isinstance(jev, dict):
+        return {}
+    cost = jev.get("cost")
+    return {
+        "jev_calls": _token_count(jev.get("calls")),
+        "jev_input_tokens": _token_count(jev.get("input_tokens")),
+        "jev_cost_usd": float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0 else None,
+    }
+
+
 def _step_count(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -1436,6 +1452,7 @@ class CompactBenchExecutor:
                     cached_input_tokens=cached_input_tokens,
                     output_tokens=output_tokens,
                     agent_steps=agent_steps,
+                    **_jev_usage(row_metadata),
                     patch_capture_status=False,
                     patch_diff=None,
                     metadata=metadata,
@@ -1678,6 +1695,7 @@ class CompactBenchExecutor:
                 cached_input_tokens=cached_input_tokens,
                 output_tokens=output_tokens,
                 agent_steps=agent_steps,
+                **_jev_usage(row_metadata),
                 trajectory_upload_status=trajectory_upload_status,
                 compression_logs_upload_status=compression_logs_upload_status,
                 patch_capture_status=patch_capture_status,
