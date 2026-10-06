@@ -99,6 +99,22 @@ def _request_client_host(request: Request) -> str | None:
     return getattr(client, "host", None)
 
 
+def _jev_usage_from_report(payload: CompactBenchReportRequest) -> dict[str, object]:
+    calls = _coerce_optional_non_negative_int(getattr(payload, "jev_calls", None))
+    input_tokens = _coerce_optional_non_negative_int(getattr(payload, "jev_input_tokens", None))
+    cost = getattr(payload, "jev_cost_usd", None)
+    if calls is None and input_tokens is None and cost is None:
+        metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
+        usage = metadata.get("service_usage") if isinstance(metadata.get("service_usage"), dict) else {}
+        jev = usage.get("jev") if isinstance(usage.get("jev"), dict) else {}
+        calls = _coerce_optional_non_negative_int(jev.get("calls"))
+        input_tokens = _coerce_optional_non_negative_int(jev.get("input_tokens"))
+        cost = jev.get("cost")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
+        cost = None
+    return {"jev_calls": calls, "jev_input_tokens": input_tokens, "jev_cost_usd": cost}
+
+
 async def _persist_compact_bench_report(
     db: AsyncSession,
     *,
@@ -164,6 +180,14 @@ async def _persist_compact_bench_report(
         ("cached_input_tokens", cached_input_tokens),
         ("output_tokens", output_tokens),
     ):
+        if _model_attr(SweBenchRun, field_name) is not None:
+            setattr(run, field_name, value)
+    # Compressor services (Jev): what the run's compressor spent through the proxy.
+    # Never part of tokens_used / the agent's split tokens above. Top-level fields
+    # from the sandbox, or the benchmark's own metadata.service_usage when the
+    # sandbox predates them.
+    jev = _jev_usage_from_report(payload)
+    for field_name, value in jev.items():
         if _model_attr(SweBenchRun, field_name) is not None:
             setattr(run, field_name, value)
     run.time_taken_seconds = payload.execution_time_seconds

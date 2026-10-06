@@ -344,6 +344,7 @@ async def _load_swe_benchmark_rows(
                 miner_runs.input_tokens.label("run_input_tokens"),
                 miner_runs.cached_input_tokens.label("run_cached_input_tokens"),
                 miner_runs.output_tokens.label("run_output_tokens"),
+                miner_runs.jev_input_tokens.label("run_jev_input_tokens"),
                 miner_runs.time_taken_seconds.label("time_taken_seconds"),
                 miner_runs.agent_steps.label("agent_steps"),
                 miner_resolved.resolved.label("run_resolved"),

@@ -73,10 +73,11 @@ Let:
 
 - `T_i` be non-cached input tokens,
 - `T_c` be cached input tokens,
-- `T_o` be output tokens.
+- `T_o` be output tokens,
+- `T_j` be Jev input tokens spent by the miner's compressor (see below).
 
 ```math
-T = w_i T_i + w_c T_c + w_o T_o
+T = w_i T_i + w_c T_c + w_o T_o + w_j T_j
 ```
 
 Default weights:
@@ -86,10 +87,24 @@ Default weights:
 | Input, non-cached | `1.0` |
 | Cached input | `0.1` |
 | Output | `3.0` |
+| Jev input (compressor services) | `0.3` |
+
+### Compressor services (Jev)
+
+A compressor may call Jev, the TypeSafe decision model, through the benchmark proxy
+(the compressor itself has no network access). What those calls cost is recorded per
+run apart from the agent's tokens - `T_i`, `T_c` and `T_o` never include it - and
+enters the run's weighted total as `T_j`. Jev bills input only.
+
+Only miner runs have `T_j`: a baseline run uses no compressor, so its weighted total is
+the agent's tokens alone. A compressor that calls Jev therefore has to save more agent
+tokens than its Jev calls cost. The same total is used by the screening gates and the
+score.
 
 Current behavior of `compute_weighted_tokens`:
 
-- `input_tokens` and `output_tokens` are required.
+- `input_tokens` and `output_tokens` are required; Jev input tokens are added on
+  top and never stand in for them.
 - Missing `cached_input_tokens` is treated as `0`.
 - The function returns `None` if a required value is missing or any supplied
   token count is negative.

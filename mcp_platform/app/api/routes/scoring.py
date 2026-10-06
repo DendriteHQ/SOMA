@@ -36,16 +36,26 @@ def _scoring_token_weights() -> tuple[float, float, float]:
     )
 
 
+def _jev_input_tokens_weight() -> float:
+    return float(getattr(settings, "swebench_screening_jev_input_tokens_weight", 0.3))
+
+
 def compute_weighted_tokens(
     *,
     input_tokens: int | None,
     cached_input_tokens: int | None,
     output_tokens: int | None,
+    jev_input_tokens: int | None = None,
 ) -> float | None:
     """Return a weighted token count using per-type weights from settings.
 
     By default this requires split columns. One compatibility exception applies:
     when only ``cached_input_tokens`` is missing, it is treated as ``0``.
+
+    ``jev_input_tokens`` is what the run's compressor spent on Jev (compressor
+    services) and is only ever passed for miner runs: a baseline has no compressor.
+    It adds to the run's weighted total but never stands in for the agent's tokens
+    - a run with no agent tokens still has no weighted total.
 
     Returns ``None`` when token inputs are missing/invalid.
     """
@@ -58,11 +68,14 @@ def compute_weighted_tokens(
     if input_tokens < 0 or cached_input_tokens < 0 or output_tokens < 0:
         return None
     input_weight, cached_weight, output_weight = _scoring_token_weights()
-    return (
+    weighted = (
         (input_weight * float(input_tokens))
         + (cached_weight * float(cached_input_tokens))
         + (output_weight * float(output_tokens))
     )
+    if jev_input_tokens is not None and jev_input_tokens > 0:
+        weighted += _jev_input_tokens_weight() * float(jev_input_tokens)
+    return weighted
 
 
 def _normalize_to_unit_interval(
@@ -202,6 +215,9 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
                 "output_tokens_with_compression": _to_optional_int(
                     getattr(row, "run_output_tokens", None)
                 ),
+                "jev_input_tokens_with_compression": _to_optional_int(
+                    getattr(row, "run_jev_input_tokens", None)
+                ),
                 "time_taken_seconds": _to_optional_float(row.time_taken_seconds),
                 "agent_steps": _to_optional_int(row.agent_steps),
             },
@@ -225,6 +241,7 @@ def build_swe_task_groups(rows: list[Any]) -> dict[int, dict[str, object]]:
                 input_tokens=run["input_tokens_with_compression"],
                 cached_input_tokens=run["cached_input_tokens_with_compression"],
                 output_tokens=run["output_tokens_with_compression"],
+                jev_input_tokens=run["jev_input_tokens_with_compression"],
             )
         group.pop("runs_by_id")
 
@@ -587,6 +604,11 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         for run in runs
         if run["output_tokens_with_compression"] is not None
     ]
+    jev_input_tokens_with_compression = [
+        int(run["jev_input_tokens_with_compression"])
+        for run in runs
+        if run.get("jev_input_tokens_with_compression") is not None
+    ]
     passed_with_compression_values = [
     run["pass_with_compression"] for run in runs
     if run["pass_with_compression"] is not None
@@ -635,6 +657,11 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
         output_tokens_with_compression=(
             sum(output_tokens_with_compression) / len(output_tokens_with_compression)
             if output_tokens_with_compression
+            else None
+        ),
+        jev_input_tokens_with_compression=(
+            sum(jev_input_tokens_with_compression) / len(jev_input_tokens_with_compression)
+            if jev_input_tokens_with_compression
             else None
         ),
         platform_score=task_score,
