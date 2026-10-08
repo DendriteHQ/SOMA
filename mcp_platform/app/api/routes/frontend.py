@@ -890,7 +890,7 @@ def _build_swe_task_groups_by_hotkey_from_facts(
                 ),
                 "jev_input_tokens_with_compression": _to_optional_int(
                     row.get("run_jev_input_tokens")
-                ),
+                ) or 0,
                 "time_taken_seconds": _to_optional_float(row.get("time_taken_seconds")),
                 "agent_steps": _to_optional_int(row.get("agent_steps")),
             },
