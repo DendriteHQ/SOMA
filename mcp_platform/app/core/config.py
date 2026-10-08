@@ -434,7 +434,7 @@ class Settings(BaseSettings):
     # Jev input tokens spent by a miner's compressor (compressor services). Miner
     # side only: a baseline run has no compressor and no Jev cost.
     swebench_screening_jev_input_tokens_weight: float = Field(
-        default=0.3,
+        default=0.2,
         alias="SWEBENCH_SCREENING_JEV_INPUT_TOKENS_WEIGHT",
     )
     swebench_dynamic_screener_task_count: int = Field(

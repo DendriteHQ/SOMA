@@ -87,7 +87,7 @@ Default weights:
 | Input, non-cached | `1.0` |
 | Cached input | `0.1` |
 | Output | `3.0` |
-| Jev input (compressor services) | `0.3` |
+| Jev input (compressor services) | `0.2` |
 
 ### Compressor services (Jev)
 
