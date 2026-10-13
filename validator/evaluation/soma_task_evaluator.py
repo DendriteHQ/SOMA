@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -55,6 +56,29 @@ DEFAULT_REPORT_PATH = "/tmp/report.json"
 DEFAULT_EVAL_TIMEOUT_SECONDS = 1800
 DEFAULT_EVAL_NETWORK = "none"
 DEFAULT_REMOVE_IMAGE_AFTER_RUN = True
+DEFAULT_EVAL_CPUS = 4
+DEFAULT_EVAL_MEMORY = "4g"
+DEFAULT_EVAL_PIDS_LIMIT = 1024
+DEFAULT_EVAL_NOFILE = 65536
+
+# A task's tests size their parallelism from the CPU count they see: pytest-xdist
+# `-n auto|logical` (psutil), multiprocessing pools (os.cpu_count()) and native thread
+# pools (OpenBLAS, polars/rayon, tokio, V8). Both Python counts read this file, which
+# Docker does not virtualize - so `--cpus` alone leaves a 96-vCPU host's container
+# spawning 96 workers into its memory and pids limits. The graded container gets a
+# bind-mounted copy listing only the CPUs it may use, plus explicit thread-count env.
+CPU_ONLINE_SYSFS_PATH = "/sys/devices/system/cpu/online"
+THREAD_COUNT_ENV_VARS = (
+    "PYTEST_XDIST_AUTO_NUM_WORKERS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_MAX_THREADS",
+    "POLARS_MAX_THREADS",
+    "RAYON_NUM_THREADS",
+    "TOKIO_WORKER_THREADS",
+)
+_MEMORY_LIMIT = re.compile(r"^[1-9][0-9]*[bkmg]?$", re.IGNORECASE)
 
 CONTAINER_NAME_PREFIX = "soma-task-eval-"
 CONTAINER_PATCH_PATH = "/tmp/soma-agent.patch"
@@ -116,6 +140,23 @@ def _run(
 
 def _command_output(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout or "").strip()
+
+
+def _host_cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0)) or 1
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def _positive_or(raw_value: object, default: int, *, allow_zero: bool = False) -> int:
+    try:
+        value = int(raw_value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if value > 0 or (allow_zero and value == 0):
+        return value
+    return default
 
 
 def _slug(value: str, *, default: str) -> str:
@@ -359,6 +400,7 @@ class SomaTaskContainerEvaluator:
                     "docker", "run", "-d",
                     "--name", container_name,
                     "--network", network,
+                    *self._container_limit_args(work_path),
                     "--entrypoint", "sh",
                     test_image,
                     "-lc", f"sleep {timeout + 120}",
@@ -623,6 +665,33 @@ class SomaTaskContainerEvaluator:
         test_command = labels.get(LABEL_TEST_COMMAND, "")
         match = re.search(r"--json-report-file[=\s]+(\S+)", test_command)
         return match.group(1) if match else DEFAULT_REPORT_PATH
+
+    def _container_limit_args(self, work_path: Path) -> list[str]:
+        """`docker run` flags bounding the graded container; empty when CPUs is 0."""
+        cpus = _positive_or(self._get_setting("soma_task_eval_cpus", DEFAULT_EVAL_CPUS), DEFAULT_EVAL_CPUS, allow_zero=True)
+        if cpus == 0:
+            return []
+        # Never advertise more CPUs than this host actually has.
+        cpus = min(cpus, _host_cpu_count())
+        memory = str(self._get_setting("soma_task_eval_memory", DEFAULT_EVAL_MEMORY) or "").strip()
+        if not _MEMORY_LIMIT.match(memory):
+            memory = DEFAULT_EVAL_MEMORY
+        pids_limit = _positive_or(self._get_setting("soma_task_eval_pids_limit", DEFAULT_EVAL_PIDS_LIMIT), DEFAULT_EVAL_PIDS_LIMIT)
+        nofile = _positive_or(self._get_setting("soma_task_eval_nofile", DEFAULT_EVAL_NOFILE), DEFAULT_EVAL_NOFILE)
+
+        cpu_online = work_path / "cpu-online"
+        cpu_online.write_text("0\n" if cpus == 1 else f"0-{cpus - 1}\n", encoding="utf-8")
+        args = [
+            "--cpus", str(cpus),
+            "--memory", memory,
+            "--memory-swap", memory,
+            "--pids-limit", str(pids_limit),
+            "--ulimit", f"nofile={nofile}:{nofile}",
+            "-v", f"{cpu_online}:{CPU_ONLINE_SYSFS_PATH}:ro",
+        ]
+        for name in THREAD_COUNT_ENV_VARS:
+            args.extend(["-e", f"{name}={cpus}"])
+        return args
 
     def _get_setting(self, name: str, default):
         if self.settings is None:
