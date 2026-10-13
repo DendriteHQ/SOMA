@@ -56,6 +56,12 @@ class Settings(BaseModel):
     soma_task_eval_timeout_seconds: int
     soma_task_eval_network: str
     soma_task_eval_remove_image_after_run: bool
+    # What the graded container may use, and how many CPUs it is shown - the task's
+    # tests size their worker pools from that (see soma_task_evaluator). CPUs 0 = off.
+    soma_task_eval_cpus: int = 4
+    soma_task_eval_memory: str = "4g"
+    soma_task_eval_pids_limit: int = 1024
+    soma_task_eval_nofile: int = 65536
      
     @classmethod
     def from_env(cls) -> "Settings":
@@ -189,6 +195,10 @@ class Settings(BaseModel):
                 "SOMA_TASK_EVAL_REMOVE_IMAGE_AFTER_RUN",
                 True,
             ),
+            soma_task_eval_cpus=cls._get_int("SOMA_TASK_CPUS", 4),
+            soma_task_eval_memory=os.getenv("SOMA_TASK_MEMORY", "4g"),
+            soma_task_eval_pids_limit=cls._get_int("SOMA_TASK_PIDS_LIMIT", 1024),
+            soma_task_eval_nofile=cls._get_int("SOMA_TASK_NOFILE", 65536),
         )
         return settings
 

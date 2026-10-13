@@ -509,3 +509,88 @@ def test_registry_reports_an_empty_set_when_the_file_is_absent(tmp_path):
     assert registry.specs() == {}
     with pytest.raises(SomaTaskNotFoundError):
         registry.get(INSTANCE_ID)
+
+
+class _CpuOnlineRecordingDocker(_FakeDocker):
+    """Also reads the bind-mounted CPU list while it still exists (it lives in a tempdir)."""
+
+    cpu_online: str | None = None
+
+    def __call__(self, args, *, timeout=None):
+        if args[:2] == ["docker", "run"] and "-v" in args:
+            source = args[args.index("-v") + 1].split(":", 1)[0]
+            self.cpu_online = Path(source).read_text(encoding="utf-8")
+        return super().__call__(args, timeout=timeout)
+
+
+def _env_flags(run_call: list[str]) -> dict[str, str]:
+    return dict(run_call[i + 1].split("=", 1) for i, arg in enumerate(run_call) if arg == "-e")
+
+
+def test_graded_container_is_bounded_and_shown_only_its_cpus(tmp_path, monkeypatch):
+    from validator.evaluation import soma_task_evaluator
+
+    monkeypatch.setattr(soma_task_evaluator, "_host_cpu_count", lambda: 96)
+    fake = _CpuOnlineRecordingDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    evaluator = _evaluator(tmp_path, monkeypatch, fake)
+
+    evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
+
+    run_call = next(call for call in fake.calls if call[:2] == ["docker", "run"])
+    assert run_call[run_call.index("--cpus") + 1] == "4"
+    assert run_call[run_call.index("--memory") + 1] == "4g"
+    assert run_call[run_call.index("--memory-swap") + 1] == "4g"
+    assert run_call[run_call.index("--pids-limit") + 1] == "1024"
+    assert run_call[run_call.index("--ulimit") + 1] == "nofile=65536:65536"
+    assert run_call[run_call.index("-v") + 1].endswith(":/sys/devices/system/cpu/online:ro")
+    assert fake.cpu_online == "0-3\n"
+    env = _env_flags(run_call)
+    assert env["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "4"
+    assert env["OPENBLAS_NUM_THREADS"] == "4"
+    assert env["POLARS_MAX_THREADS"] == "4"
+    # Limits are docker-run options: they must precede the image, not become its arguments.
+    assert run_call.index("--cpus") < run_call.index("--entrypoint")
+
+
+def test_graded_container_limits_come_from_settings(tmp_path, monkeypatch):
+    from validator.evaluation import soma_task_evaluator
+
+    monkeypatch.setattr(soma_task_evaluator, "_host_cpu_count", lambda: 96)
+    fake = _CpuOnlineRecordingDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    evaluator = _evaluator(
+        tmp_path, monkeypatch, fake,
+        soma_task_eval_cpus=1, soma_task_eval_memory="2048m", soma_task_eval_pids_limit=256,
+    )
+
+    evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
+
+    run_call = next(call for call in fake.calls if call[:2] == ["docker", "run"])
+    assert run_call[run_call.index("--cpus") + 1] == "1"
+    assert run_call[run_call.index("--memory") + 1] == "2048m"
+    assert run_call[run_call.index("--pids-limit") + 1] == "256"
+    assert fake.cpu_online == "0\n"
+
+
+def test_graded_container_never_advertises_more_cpus_than_the_host_has(tmp_path, monkeypatch):
+    from validator.evaluation import soma_task_evaluator
+
+    monkeypatch.setattr(soma_task_evaluator, "_host_cpu_count", lambda: 2)
+    fake = _CpuOnlineRecordingDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    evaluator = _evaluator(tmp_path, monkeypatch, fake, soma_task_eval_cpus=8)
+
+    evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
+
+    run_call = next(call for call in fake.calls if call[:2] == ["docker", "run"])
+    assert run_call[run_call.index("--cpus") + 1] == "2"
+    assert fake.cpu_online == "0-1\n"
+
+
+def test_zero_cpus_disables_the_graded_container_limits(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    evaluator = _evaluator(tmp_path, monkeypatch, fake, soma_task_eval_cpus=0)
+
+    evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
+
+    run_call = next(call for call in fake.calls if call[:2] == ["docker", "run"])
+    assert "--cpus" not in run_call
+    assert "-v" not in run_call
