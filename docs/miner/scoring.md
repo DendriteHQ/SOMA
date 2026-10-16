@@ -117,9 +117,12 @@ For each task:
 
 - `x` is the number of resolved baseline runs. Only resolved baselines count.
 - `y` is the number of resolved miner runs.
-- `T_B` is the average weighted token count across resolved baseline runs.
-- `T_A` is the average weighted token count across miner runs with valid
+- `T_B` is the average weighted token count across baseline runs with valid
   weighted token counts.
+- `T_A` is the average weighted token count across miner runs with valid,
+  positive weighted token counts.
+- `n` is the total run count for the task: the larger of the baseline run count
+  and the miner run count (and never less than `x`, `y` or `1`).
 
 ### Compression ratio
 
@@ -136,21 +139,58 @@ If the token inputs are invalid:
 r = 0
 ```
 
-### Penalty threshold
+### Quality threshold
+
+The threshold is the smallest resolved-run count that reaches 80% of baseline
+quality:
 
 ```math
-t = \left\lfloor 0.8x \right\rfloor
+t = \left\lceil 0.8x \right\rceil
 ```
 
 ### Per-task score
 
-The per-task score is calculated by `compute_swe_task_score`.
+The per-task score is calculated by `compute_swe_task_score`. Every per-task
+score lies in `[-2, 2]`.
 
 | Constant | Value |
 |---|---:|
-| Bonus cap | `3.0` |
-| Penalty floor | `-4.0` |
-| Penalty ceiling | `-2.0` |
+| Score range | `[-2, 2]` |
+| Penalty-only quality ratio | `0.5` |
+| Full token-score quality ratio | `0.8` |
+| Bonus maximum | `0.1` |
+| Bonus minimum extra resolved runs | `2` |
+
+### Bonus component
+
+The bonus is a small, capped tie-break reward for clearly beating the baseline's
+quality. It is zero unless the miner resolves at least two more runs than the
+baseline:
+
+```math
+b = 0 \quad \text{if } y - x < 2
+```
+
+Otherwise, progress is measured against the remaining headroom above the
+baseline, with a headroom of at least `2`:
+
+```math
+p = \frac{y-x}{\max(2,\,n-x)}
+```
+
+The bonus only starts once the miner clears half of that headroom, and grows
+quadratically up to `0.1`:
+
+```math
+b =
+\begin{cases}
+0 & p \le 0.5 \\
+0.1\left(\dfrac{p-0.5}{0.5}\right)^2 & p > 0.5
+\end{cases}
+```
+
+A task is reported in the `bonus` zone only when `b > 0`; otherwise it is
+reported as `maintain`.
 
 ### Hard tasks
 
@@ -178,11 +218,8 @@ s = r
 All other non-excluded hard tasks use:
 
 ```math
-s = \max\left(-2,\min\left(r+\frac{y-x}{n-x},3\right)\right)
+s = \max\left(-2,\min\left(r+b,2\right)\right)
 ```
-
-Where `n` is the total run count for the task (typically the task's planned
-repeat count).
 
 Hard tasks are assigned to `pool=hard_boost`.
 
@@ -198,17 +235,35 @@ Only the positive part of the hard-task score contributes to the boost.
 
 A task is standard when `x >= 2`.
 
-#### Penalty zone
-
-If `y < t`:
+When `y <= x`, the score blends a quality penalty with the compression ratio
+according to the quality ratio:
 
 ```math
-s = \max\left(-4,\min\left(-2-2\left(1-\frac{y}{t}\right),-2\right)\right)
+q = \frac{y}{x}
 ```
+
+#### Penalty zone
+
+If `q <= 0.5`, only the quality penalty applies. The score rises linearly from
+`-2` at zero resolved runs to `-1` at 50% of baseline quality:
+
+```math
+s = -2 + 2q
+```
+
+If `0.5 < q < 0.8` (equivalently `y < t`), the score moves linearly from `-1`
+toward the compression ratio:
+
+```math
+\beta = \frac{q-0.5}{0.8-0.5}, \qquad s = (1-\beta)(-1) + \beta r
+```
+
+Both cases are reported as `zone=penalty`.
 
 #### Maintain zone
 
-If `t <= y <= x`:
+If `t <= y <= x` (80% of baseline quality or better), quality contributes no
+penalty and the compression ratio applies in full:
 
 ```math
 s = r
@@ -219,11 +274,8 @@ s = r
 If `y > x`:
 
 ```math
-s = \max\left(-2,\min\left(r+\frac{y-x}{n-x},3\right)\right)
+s = \max\left(-2,\min\left(r+b,2\right)\right)
 ```
-
-Where `n` is the total run count for the task (typically the task's planned
-repeat count).
 
 Standard tasks are assigned to `pool=main`.
 
@@ -282,22 +334,22 @@ S_R = S_M + B_H
 
 Final normalization is performed by `build_swe_miner_total_score`.
 
-First, the raw total is clamped to `[-4, 3]`:
+First, the raw total is clamped to `[-2, 2]`:
 
 ```math
-S_C = \max\left(-4,\min\left(S_R,3\right)\right)
+S_C = \max\left(-2,\min\left(S_R,2\right)\right)
 ```
 
-The clamped value is then linearly normalized from `[-4, 3]` to `[-1, 1]`:
+The clamped value is then linearly normalized from `[-2, 2]` to `[-1, 1]`:
 
 ```math
-S_N = 2\left(\frac{S_C+4}{7}\right)-1
+S_N = 2\left(\frac{S_C+2}{4}\right)-1
 ```
 
 Equivalently:
 
 ```math
-S_N = \frac{2S_C+1}{7}
+S_N = \frac{S_C}{2}
 ```
 
 This normalized value is consumed by downstream category and leaderboard
