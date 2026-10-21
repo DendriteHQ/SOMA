@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import random
+from datetime import UTC, datetime
+from pathlib import Path
 
 from typing import Any
 
@@ -21,6 +26,32 @@ from app.services.sandbox.base import (
 
 logger = get_logger(__name__)
 _SWEBENCH_OPENCLAW_TIMEOUT_FALLBACK_SECONDS = 1800
+_CAPACITY_ERROR = (
+    "Platform is at capacity. The compact-bench service is currently handling the maximum "
+    "number of concurrent requests. Please try again later."
+)
+_DISPATCH_METADATA_DIR = (
+    Path(__file__).resolve().parents[3] / "metadata" / "sandbox_dispatches"
+)
+
+
+def _append_dispatch_metadata(record: dict[str, Any]) -> Path:
+    """Atomically append one useful sandbox-dispatch event without retaining payloads."""
+    timestamp = datetime.now(UTC)
+    output_dir = _DISPATCH_METADATA_DIR / timestamp.date().isoformat()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "dispatches.jsonl"
+    data = json.dumps(
+        {"timestamp": timestamp.isoformat(), **record},
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8") + b"\n"
+    fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    return output_path
 
 
 class RemoteCompactBenchManager:
@@ -71,6 +102,41 @@ class RemoteCompactBenchManager:
 
     def _pick_sandbox_url(self) -> str:
         return self._pick_sandbox_urls()[0]
+
+    async def _record_dispatch_attempt(
+        self,
+        *,
+        run_id: int,
+        instance_id: str,
+        benchmark_type: str,
+        sandbox_url: str,
+        attempt_index: int,
+        candidate_count: int,
+        outcome: str,
+        http_status: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                _append_dispatch_metadata,
+                {
+                    "run_id": run_id,
+                    "instance_id": instance_id,
+                    "benchmark_type": benchmark_type,
+                    "sandbox_url": sandbox_url,
+                    "attempt_index": attempt_index,
+                    "candidate_count": candidate_count,
+                    "outcome": outcome,
+                    "http_status": http_status,
+                    "error": error,
+                },
+            )
+        except OSError:
+            # Metadata must never prevent the run itself from being dispatched.
+            logger.exception(
+                "compact_bench_dispatch_metadata_write_failed",
+                extra={"run_id": run_id, "sandbox_url": sandbox_url},
+            )
 
     async def execute_task(
         self,
@@ -240,6 +306,29 @@ class RemoteCompactBenchManager:
                     timeout=timeout,
                 )
                 response.raise_for_status()
+                dispatch_response = CompactBenchRunTaskResponse.model_validate(response.json())
+                if dispatch_response.success:
+                    await self._record_dispatch_attempt(
+                        run_id=run_id,
+                        instance_id=payload.instance_id,
+                        benchmark_type=payload.benchmark_type,
+                        sandbox_url=sandbox_url,
+                        attempt_index=index + 1,
+                        candidate_count=len(candidate_urls),
+                        outcome="accepted",
+                        http_status=response.status_code,
+                    )
+                else:
+                    await self._record_dispatch_attempt(
+                        run_id=run_id,
+                        instance_id=payload.instance_id,
+                        benchmark_type=payload.benchmark_type,
+                        sandbox_url=sandbox_url,
+                        attempt_index=index + 1,
+                        candidate_count=len(candidate_urls),
+                        outcome="rejected",
+                        http_status=response.status_code,
+                    )
                 logger.debug(
                     "compact_bench_dispatch_accepted",
                     extra={
@@ -251,11 +340,24 @@ class RemoteCompactBenchManager:
                         "candidate_count": len(candidate_urls),
                     },
                 )
-                return CompactBenchRunTaskResponse.model_validate(response.json())
+                return dispatch_response
             except Exception as exc:
                 last_exc = exc
                 error, retryable = self._format_dispatch_error(exc)
                 has_fallback = index < len(candidate_urls) - 1
+                if error != _CAPACITY_ERROR:
+                    response = getattr(exc, "response", None)
+                    await self._record_dispatch_attempt(
+                        run_id=run_id,
+                        instance_id=payload.instance_id,
+                        benchmark_type=payload.benchmark_type,
+                        sandbox_url=sandbox_url,
+                        attempt_index=index + 1,
+                        candidate_count=len(candidate_urls),
+                        outcome="error",
+                        http_status=getattr(response, "status_code", None),
+                        error=error,
+                    )
                 log_fn = logger.debug if retryable else logger.warning
                 log_fn(
                     "compact_bench_dispatch_attempt_failed",
@@ -284,10 +386,7 @@ class RemoteCompactBenchManager:
             return "Compact-bench service acknowledgement timed out", True
         if isinstance(exc, httpx.HTTPStatusError):
             if exc.response.status_code == 429:
-                return (
-                    "Platform is at capacity. The compact-bench service is currently handling the maximum "
-                    "number of concurrent requests. Please try again later."
-                ), True
+                return _CAPACITY_ERROR, True
             if exc.response.status_code >= 500:
                 return f"Compact-bench service returned HTTP {exc.response.status_code}", True
             return f"Compact-bench service returned HTTP {exc.response.status_code}", False

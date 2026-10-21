@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
@@ -46,8 +47,6 @@ class Settings(BaseSettings):
     db_max_overflow: int = Field(default=20, alias="DB_MAX_OVERFLOW")
     db_echo: bool = Field(default=False, alias="DB_ECHO")
     rds_secret_id: str | None = Field(default=None, alias="RDS_SECRET_ID")
-    rds_writer_host: str | None = Field(default=None, alias="RDS_WRITER_HOST")
-    rds_reader_host: str | None = Field(default=None, alias="RDS_READER_HOST")
     rds_port: int | None = Field(default=None, alias="RDS_PORT")
     rds_db_name: str | None = Field(default=None, alias="RDS_DB_NAME")
     rds_use_reader: bool = Field(default=False, alias="RDS_USE_READER")
@@ -250,6 +249,15 @@ class Settings(BaseSettings):
         default="eval_starts_at",
         alias="DOCKERHUB_VISIBILITY_PUBLIC_FROM",
     )
+    # Optional cutover to append-only public task archives. Before this timestamp the
+    # release targets follow the regular private/public competition window. At and
+    # after it, Docker Hub and Hugging Face stay public and only receive tasks whose
+    # evaluation window is open. A cutover outside an evaluation window is safe only
+    # after the release targets have been audited empty.
+    task_artifact_archive_starts_at: datetime | None = Field(
+        default=None,
+        alias="TASK_ARTIFACT_ARCHIVE_STARTS_AT",
+    )
     dockerhub_api_timeout_seconds: float = Field(
         default=30.0,
         alias="DOCKERHUB_API_TIMEOUT_SECONDS",
@@ -370,6 +378,10 @@ class Settings(BaseSettings):
     swebench_dispatch_strict_fifo: bool = Field(
         default=False,
         alias="SWEBENCH_DISPATCH_STRICT_FIFO",
+    )
+    swebench_full_eval_enabled: bool = Field(
+        default=False,
+        alias="SWEBENCH_FULL_EVAL_ENABLED",
     )
     swebench_dispatch_window_seconds: float = Field(
         default=60.0,
@@ -894,12 +906,23 @@ class Settings(BaseSettings):
         except json.JSONDecodeError as exc:
             raise RuntimeError("RDS secret is not valid JSON") from exc
 
-    def _resolve_rds_host(self, secret: dict[str, Any]) -> str | None:
-        if self.rds_use_reader and self.rds_reader_host:
-            return self.rds_reader_host
-        if self.rds_writer_host:
-            return self.rds_writer_host
-        return secret.get("host") or secret.get("hostname")
+    @staticmethod
+    def _rds_writer_host_from_secret(secret: dict[str, Any]) -> str:
+        host = str(secret.get("host") or secret.get("hostname") or "").strip()
+        if not host:
+            raise RuntimeError("RDS secret is missing writer host information")
+        return host
+
+    @staticmethod
+    def _rds_reader_host_from_writer(writer_host: str) -> str:
+        if ".cluster-ro-" in writer_host:
+            return writer_host
+        if ".cluster-" not in writer_host:
+            raise RuntimeError(
+                "Cannot derive an Aurora reader host from RDS secret host "
+                f"{writer_host!r}; expected an endpoint containing '.cluster-'"
+            )
+        return writer_host.replace(".cluster-", ".cluster-ro-", 1)
 
     def _build_postgres_dsn_for_host(self, secret: dict[str, Any], host: str) -> str:
         user = secret.get("username")
@@ -929,9 +952,12 @@ class Settings(BaseSettings):
         if not self.rds_secret_id:
             return None
         secret = self._read_rds_secret()
-        host = self._resolve_rds_host(secret)
-        if not host:
-            raise RuntimeError("RDS secret is missing host information")
+        writer_host = self._rds_writer_host_from_secret(secret)
+        host = (
+            self._rds_reader_host_from_writer(writer_host)
+            if self.rds_use_reader
+            else writer_host
+        )
         return self._build_postgres_dsn_for_host(secret, host)
 
     def get_postgres_writer_dsn(self) -> str | None:
@@ -940,10 +966,9 @@ class Settings(BaseSettings):
         if not self.rds_secret_id:
             return None
         secret = self._read_rds_secret()
-        host = self.rds_writer_host or secret.get("host") or secret.get("hostname")
-        if not host:
-            raise RuntimeError("RDS writer host is missing")
-        return self._build_postgres_dsn_for_host(secret, str(host))
+        return self._build_postgres_dsn_for_host(
+            secret, self._rds_writer_host_from_secret(secret)
+        )
 
     def get_postgres_reader_dsn(self) -> str | None:
         if self.postgres_dsn:
@@ -951,10 +976,10 @@ class Settings(BaseSettings):
         if not self.rds_secret_id:
             return None
         secret = self._read_rds_secret()
-        host = self.rds_reader_host
-        if not host:
-            return None
-        return self._build_postgres_dsn_for_host(secret, host)
+        writer_host = self._rds_writer_host_from_secret(secret)
+        return self._build_postgres_dsn_for_host(
+            secret, self._rds_reader_host_from_writer(writer_host)
+        )
 
 
 settings = Settings()

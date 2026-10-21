@@ -5,9 +5,10 @@ SOMA task images are built into a long-lived source repository
 repository can never be published: it holds the tasks of future competitions too.
 
 So the competition repository (``DOCKERHUB_TASK_TARGET_REPOSITORY``) is derived from
-``swe_bench_tasks`` instead - it contains exactly the images of the SOMA tasks the
-current competitions actually reference, and nothing else. Publishing it during the
-evaluation window (``dockerhub_visibility``) then exposes precisely those tasks.
+``swe_bench_tasks`` instead. Until the public-archive cutover it contains exactly the
+tasks of the current competition; after ``TASK_ARTIFACT_ARCHIVE_STARTS_AT`` it retains
+all previously released tasks and only receives tasks when their own evaluation window
+opens.
 
 The sync is a reconcile, not a reaction to events: each tick computes the tag set the
 database implies and moves the repository towards it. Nothing has to be persisted, a
@@ -193,7 +194,8 @@ def source_repository() -> str:
 
 
 def task_tags(instance_id: str) -> tuple[str, str]:
-    instance = str(instance_id or "").strip()
+    # Docker tags are canonicalized to lowercase when task images are built.
+    instance = str(instance_id or "").strip().lower()
     return instance, f"{instance}{TEST_TAG_SUFFIX}"
 
 

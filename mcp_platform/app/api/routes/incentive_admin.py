@@ -108,12 +108,6 @@ async def _resolve_top_miner_window(
             detail="Competition timeframe not found",
         )
 
-    normalized_eval_ends_at = _normalize_utc_datetime(timeframe_row.eval_ends_at)
-    if current_now < normalized_eval_ends_at:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Competition evaluation has not ended yet",
-        )
 
     if starts_at is not None and ends_at is not None:
         normalized_starts_at = _normalize_utc_datetime(starts_at)

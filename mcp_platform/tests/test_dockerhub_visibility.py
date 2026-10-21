@@ -139,6 +139,38 @@ def test_no_active_competition_means_private():
     assert competition_id is None
 
 
+def test_archive_mode_starts_only_at_its_configured_time(monkeypatch):
+    monkeypatch.setattr(
+        dockerhub_visibility.settings,
+        "task_artifact_archive_starts_at",
+        EVAL_STARTS,
+        raising=False,
+    )
+
+    assert dockerhub_visibility.archive_mode_is_active(
+        now=EVAL_STARTS - timedelta(seconds=1)
+    ) is False
+    assert dockerhub_visibility.archive_mode_is_active(now=EVAL_STARTS) is True
+    assert dockerhub_visibility.archive_mode_is_active(
+        now=EVAL_ENDS + timedelta(days=30)
+    ) is True
+
+
+def test_next_reconcile_boundary_wakes_for_the_archive_cutover(monkeypatch):
+    cutover = EVAL_STARTS + timedelta(hours=2)
+    monkeypatch.setattr(
+        dockerhub_visibility.settings,
+        "task_artifact_archive_starts_at",
+        cutover,
+        raising=False,
+    )
+    windows = [(7, EVAL_STARTS + timedelta(days=1), EVAL_ENDS + timedelta(days=1))]
+
+    assert dockerhub_visibility.next_reconcile_boundary(
+        windows, now=EVAL_STARTS
+    ) == cutover
+
+
 def test_any_overlapping_competition_keeps_it_public():
     """Competitions overlap at a handover, and the later one still needs the images."""
     windows = [

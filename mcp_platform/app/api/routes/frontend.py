@@ -654,7 +654,6 @@ async def _refresh_latest_competition_aggregate_once(app) -> None:
     try:
         async for db in get_db_read_session():
             latest_competition_id = await _get_latest_competition_id(db)
-            cache.competition_id = latest_competition_id
             if latest_competition_id is None:
                 cache.last_error = "No competitions exist yet"
                 return
@@ -2277,24 +2276,11 @@ async def get_competition_aggregate(
         )
 
     if int(competition_id) != int(latest_competition_id):
-        snapshot_payload = await _load_aggregate_snapshot_from_local(competition_id)
-        if snapshot_payload is None:
-            snapshot_payload = await _load_aggregate_snapshot_from_s3(
-                request,
-                competition_id,
-            )
-            if snapshot_payload is not None:
-                await _save_aggregate_snapshot_to_local(competition_id, snapshot_payload)
-
-        if snapshot_payload is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Competition aggregate is only served live for the latest competition "
-                    f"(latest_competition_id={int(latest_competition_id)}); "
-                    "no cached snapshot is available for the requested competition"
-                ),
-            )
+        snapshot_payload = await _get_competition_aggregate_payload(
+            request=request,
+            db=db,
+            competition_id=competition_id,
+        )
 
         payload_bytes = _json_payload_bytes(snapshot_payload)
         if not gzip_enabled:

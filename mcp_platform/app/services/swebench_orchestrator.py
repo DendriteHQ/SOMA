@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy import and_, func, literal, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,8 +56,9 @@ _LAST_IDLE_DISPATCH_LOG_AT: float | None = None
 _DISPATCH_IDLE_LOG_INTERVAL_SECONDS = 30.0
 _DISPATCH_FETCH_LOOKAHEAD_MULTIPLIER = 10000
 _DISPATCH_FETCH_LIMIT_CAP = 100000
-_DISPATCH_FETCH_GROUP_LIMIT = 40
+_DISPATCH_FETCH_GROUP_LIMIT = 60
 _DISPATCH_FETCH_ROWS_PER_GROUP_LIMIT = 40
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 @dataclass(frozen=True)
 class _ScriptRef:
@@ -780,6 +782,58 @@ async def _classify_stage2_scripts(
     return True, advancers
 
 
+async def load_qualified_hotkeys_for_competition(
+    db: AsyncSession,
+    *,
+    competition_id: int,
+) -> list[str]:
+    """Hotkeys whose frontend status is qualifying, qualified or scored:
+    stage-1 passers while the stage-2 cohort is still being scored, and the
+    stage-2 advancers once it is complete."""
+    task_rows = (
+        await db.execute(
+            select(
+                SweBenchTask.id,
+                SweBenchTask.screener_stage,
+                SweBenchTask.planned_repeats,
+            ).where(SweBenchTask.competition_fk == competition_id)
+        )
+    ).all()
+
+    task_repeats: dict[int, int] = {}
+    stage1_ids: list[int] = []
+    stage2_ids: list[int] = []
+    for task_row in task_rows:
+        task_id = int(task_row.id)
+        task_repeats[task_id] = max(1, int(task_row.planned_repeats or 1))
+        if task_row.screener_stage == _STAGE1:
+            stage1_ids.append(task_id)
+        elif task_row.screener_stage == _STAGE2:
+            stage2_ids.append(task_id)
+
+    scripts = await _load_latest_scripts_for_competition(db, competition_id)
+    if not scripts:
+        return []
+
+    stage1_results = await _classify_stage1_scripts(
+        db, scripts=scripts, stage1_ids=stage1_ids, task_repeats=task_repeats
+    )
+    stage1_passers = [
+        script
+        for script in scripts
+        if stage1_results.get((script.script_id, script.miner_fk)) == (True, True)
+    ]
+    cohort_complete, advancers = await _classify_stage2_scripts(
+        db,
+        competition_id=competition_id,
+        stage1_passers=stage1_passers,
+        stage2_ids=stage2_ids,
+        task_repeats=task_repeats,
+    )
+    qualified = advancers if cohort_complete else stage1_passers
+    return sorted({str(script.ss58) for script in qualified if script.ss58})
+
+
 async def _seed_runs_for_competition(
     db: AsyncSession,
     *,
@@ -903,7 +957,7 @@ async def _seed_runs_for_competition(
         return created
 
     # ── Full evaluation: baseline(eval) + full matrix for advancers only ─────
-    if advancers and eval_task_ids:
+    if advancers and eval_task_ids and settings.swebench_full_eval_enabled:
         created += await _seed_baseline_runs(
             db,
             tasks=eval_tasks,
@@ -1465,6 +1519,9 @@ async def _dispatch_due_runs(
     )
     active_timeframe_sql = _competition_within_active_timeframe_sql("t.competition_fk")
     baseline_scored_sql = _screener_stage_baseline_scored_sql(task_expr="t", run_expr="r")
+    full_eval_dispatch_sql = (
+        "TRUE" if settings.swebench_full_eval_enabled else "t.screener_stage IS NOT NULL"
+    )
 
     async for db in get_db_session():
         banned_pending_result = await db.execute(
@@ -1540,6 +1597,7 @@ async def _dispatch_due_runs(
                         WHERE r.status = 'pending'
                           AND ({active_timeframe_sql})
                           AND ({baseline_scored_sql})
+                          AND ({full_eval_dispatch_sql})
                           AND (
                               r.baseline_run = TRUE
                               OR ({eligibility_sql})
@@ -1630,6 +1688,7 @@ async def _dispatch_due_runs(
                         eligibility_sql=eligibility_sql,
                         active_timeframe_sql=active_timeframe_sql,
                         baseline_scored_sql=baseline_scored_sql,
+                        full_eval_dispatch_sql=full_eval_dispatch_sql,
                     )
                 ),
                 {

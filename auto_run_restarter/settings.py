@@ -66,7 +66,6 @@ class Settings:
     log_level: str
     postgres_dsn: str | None
     rds_secret_id: str | None
-    rds_writer_host: str | None
     rds_port: int | None
     rds_db_name: str | None
     db_pool_size: int
@@ -103,7 +102,6 @@ class Settings:
             log_level=(os.getenv("AUTO_RUN_RESTARTER_LOG_LEVEL") or "INFO").upper(),
             postgres_dsn=os.getenv("POSTGRES_DSN"),
             rds_secret_id=os.getenv("RDS_SECRET_ID"),
-            rds_writer_host=os.getenv("RDS_WRITER_HOST"),
             rds_port=_read_int("RDS_PORT", 5432) if os.getenv("RDS_PORT") else None,
             rds_db_name=os.getenv("RDS_DB_NAME"),
             db_pool_size=max(1, _read_int("AUTO_RUN_RESTARTER_DB_POOL_SIZE", 2)),
@@ -162,9 +160,7 @@ class Settings:
             return self.postgres_dsn
 
         secret = self._read_rds_secret()
-        host = self.rds_writer_host or str(
-            secret.get("host") or secret.get("hostname") or ""
-        ).strip()
+        host = str(secret.get("host") or secret.get("hostname") or "").strip()
         if not host:
             raise RuntimeError("RDS writer host is missing")
 

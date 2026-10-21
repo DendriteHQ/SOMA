@@ -271,6 +271,12 @@ def _classify_restart_reason(
         return "proxy_connection_closed_early"
     if "Cannot connect to the Docker daemon" in error:
         return "docker_daemon_unavailable"
+    if "No space left on device" in error:
+        return "sandbox_disk_full"
+    if "Isolated Docker daemon (dind) did not become ready" in error:
+        return "dind_not_ready"
+    if "Failed to start Copilot SWE sandbox inside the isolated Docker daemon" in error:
+        return "dind_sandbox_start_failure"
     if (
         "unable to apply cgroup configuration" in error
         and "Message recipient disconnected from message bus" in error
@@ -353,6 +359,9 @@ _FETCH_CANDIDATE_ROWS_SQL = sa.text(
               AND r.last_error LIKE '%http://proxy:8080/chat/completions%'
           )
           OR r.last_error LIKE '%Cannot connect to the Docker daemon%'
+          OR r.last_error LIKE '%No space left on device%'
+          OR r.last_error LIKE '%Isolated Docker daemon (dind) did not become ready%'
+          OR r.last_error LIKE '%Failed to start Copilot SWE sandbox inside the isolated Docker daemon%'
           OR (
               r.last_error LIKE '%unable to apply cgroup configuration%'
               AND r.last_error LIKE '%Message recipient disconnected from message bus%'
@@ -447,7 +456,7 @@ async def _fetch_restartable_candidates(
                 restart_reason=reason,
             )
         )
-    return candidates[: settings.batch_size]
+    return candidates
 
 
 def _summarize_candidates(candidates: list[RestartCandidate]) -> str:
@@ -534,6 +543,7 @@ async def process_once(
                 restart_counts,
                 max_restarts=settings.max_restarts_per_task_hotkey_competition,
             )
+            candidates = candidates[: settings.batch_size]
             matched_count = len(candidates)
             if not candidates:
                 logger.info(

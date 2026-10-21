@@ -294,9 +294,12 @@ def manifest_exists(repository: str, reference: str, *, token: str) -> bool:
             headers={"Accept": ", ".join(MANIFEST_MEDIA_TYPES)},
         )
     except urllib.error.HTTPError as exc:
-        if exc.code in (404, 401):
+        if exc.code == 404:
             return False
-        raise
+        detail = exc.read().decode(errors="replace")
+        raise DockerHubError(
+            f"manifest HEAD {repository}:{reference} failed ({exc.code}): {detail}"
+        ) from exc
     with response:
         return True
 

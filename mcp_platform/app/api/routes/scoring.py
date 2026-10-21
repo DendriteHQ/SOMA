@@ -100,6 +100,11 @@ def _normalize_to_unit_interval(
     return ((clamped - score_min) / span) * 2.0 - 1.0
 
 
+def normalize_swe_task_score(score: float | None) -> float | None:
+    """Convert a raw SWE task score from ``[-2, 2]`` to ``[-1, 1]``."""
+    return _normalize_to_unit_interval(score, SWE_SCORE_MIN, SWE_SCORE_MAX)
+
+
 def _summarize_baseline_pass(baseline_runs: dict[int, dict[str, object]]) -> bool | None:
     if not baseline_runs:
         return None
@@ -664,6 +669,6 @@ def build_swe_task_result_item(group: dict[str, object]) -> SweMinerTaskResultIt
             if jev_input_tokens_with_compression
             else None
         ),
-        platform_score=task_score,
+        platform_score=normalize_swe_task_score(task_score),
         run_count=len(runs),
     )

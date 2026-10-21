@@ -417,3 +417,12 @@ def test_task_inputs_average_baseline_tokens_across_all_attempts():
     assert tok_a is None
     assert task_run_count == 2
 
+
+
+def test_normalize_swe_task_score_uses_unit_interval():
+    scoring = _load_scoring_module()
+
+    assert scoring.normalize_swe_task_score(-2.0) == -1.0
+    assert scoring.normalize_swe_task_score(0.0) == 0.0
+    assert scoring.normalize_swe_task_score(2.0) == 1.0
+    assert scoring.normalize_swe_task_score(None) is None

@@ -49,6 +49,13 @@ competition be staged straight away - the repository can only be emptied while i
 private (see ``dockerhub_task_sync``), so every minute the window stays open past the
 end is a minute the next competition cannot be prepared in.
 
+``TASK_ARTIFACT_ARCHIVE_STARTS_AT`` switches to a permanent public archive. Before that
+cutover the schedule above is unchanged. At and after it, the Docker release repository
+and the Hugging Face dataset remain public and append-only; the sync only adds tasks
+whose own evaluation window is open, so later competitions' hidden tasks are never
+copied in early. A cutover outside an evaluation window is only safe after an operator
+has audited both release targets as empty.
+
 This reconciles rather than reacting to events: every tick computes the visibility the
 current time implies and only calls Docker Hub when it disagrees. A missed tick, a
 restart, or a manual change in the Docker Hub UI therefore self-corrects, and no state
@@ -199,6 +206,18 @@ def should_be_public(
     return False, None
 
 
+def archive_starts_at() -> datetime | None:
+    """Configured permanent-public cutover, normalized to UTC."""
+    value = settings.task_artifact_archive_starts_at
+    return _as_utc(value) if value is not None else None
+
+
+def archive_mode_is_active(*, now: datetime) -> bool:
+    """Whether the release targets are permanent public archives."""
+    starts_at = archive_starts_at()
+    return starts_at is not None and now >= starts_at
+
+
 # ---------------------------------------------------------------------------
 # reconcile
 # ---------------------------------------------------------------------------
@@ -241,6 +260,20 @@ def next_window_boundary(
     """The earliest window edge still ahead of ``now``, opening or closing."""
     edges = [edge for _cid, start, end in windows for edge in (start, end) if edge > now]
     return min(edges) if edges else None
+
+
+def next_reconcile_boundary(
+    windows: list[tuple[int, datetime, datetime]],
+    *,
+    now: datetime,
+) -> datetime | None:
+    """Next evaluation edge or public-archive cutover, whichever is sooner."""
+    boundaries = [
+        boundary
+        for boundary in (next_window_boundary(windows, now=now), archive_starts_at())
+        if boundary is not None and boundary > now
+    ]
+    return min(boundaries) if boundaries else None
 
 
 def _observed_visibility(outcomes: dict[str, str], repository: str) -> bool | None:
@@ -286,8 +319,10 @@ async def run_visibility_tick(now: datetime | None = None) -> dict[str, str]:
     async for db in get_db_session():
         windows = await load_active_public_windows(db)
         public, competition_id = should_be_public(windows, now=now)
+        if archive_mode_is_active(now=now):
+            public = True
         global _NEXT_BOUNDARY
-        _NEXT_BOUNDARY = next_window_boundary(windows, now=now)
+        _NEXT_BOUNDARY = next_reconcile_boundary(windows, now=now)
         if dockerhub_task_sync.sync_enabled():
             try:
                 await dockerhub_task_sync.run_task_sync_tick(
@@ -421,6 +456,9 @@ def start_dockerhub_visibility_task(app) -> None:
             "interval_seconds": interval,
             "repositories": repositories,
             "public_from": str(settings.dockerhub_visibility_public_from),
+            "task_artifact_archive_starts_at": (
+                archive_starts_at().isoformat() if archive_starts_at() else None
+            ),
             "task_sync_enabled": dockerhub_task_sync.sync_enabled(),
             "task_sync_source": dockerhub_task_sync.source_repository(),
             "task_sync_target": dockerhub_task_sync.target_repository(),

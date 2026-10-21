@@ -6,10 +6,11 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,8 +61,8 @@ from app.db.interfaces.validator_identity_queries import (
 )
 from app.services.blob.patch_artifact_storage import PatchArtifactStorage
 from app.services.blob.s3 import S3BlobStorage
-from app.services.swebench_screening import (
-    load_screening_passed_hotkeys_for_competition,
+from app.services.swebench_orchestrator import (
+    load_qualified_hotkeys_for_competition,
 )
 
 
@@ -72,6 +73,8 @@ _VALIDATION_PREFETCH_BATCH_SIZE = 400
 _VALIDATION_PREFETCH_REFILL_THRESHOLD = 100
 _VALIDATION_PREFETCH_CACHE_TTL_SECONDS = 30.0
 _VALIDATION_FETCH_MAX_ATTEMPTS = 50
+_VALIDATION_STAGE_PRIORITY: tuple[int | None, ...] = (1, 2, None)
+_ANY_STAGE = object()
 
 
 @dataclass(slots=True)
@@ -105,15 +108,22 @@ class _ValidationPrefetchCache:
         completed_condition,
         request_id: str | None,
     ) -> None:
-        query = _build_validation_candidate_query(
-            now=now,
-            claim_ttl_seconds=claim_ttl_seconds,
-            completed_condition=completed_condition,
-            select_columns=(SweBenchRunValidation.id,),
-            limit=_VALIDATION_PREFETCH_BATCH_SIZE,
-            lock_rows=False,
-        )
-        rows = (await db.execute(query)).all()
+        query_started_at = time.perf_counter()
+        rows = []
+        for stage in _VALIDATION_STAGE_PRIORITY:
+            query = _build_validation_candidate_query(
+                now=now,
+                claim_ttl_seconds=claim_ttl_seconds,
+                completed_condition=completed_condition,
+                select_columns=(SweBenchRunValidation.id,),
+                limit=_VALIDATION_PREFETCH_BATCH_SIZE,
+                screener_stage=stage,
+                lock_rows=False,
+            )
+            rows = (await db.execute(query)).all()
+            if rows:
+                break
+        query_seconds = time.perf_counter() - query_started_at
         added = 0
         for row in rows:
             validation_id = int(row[0])
@@ -131,6 +141,7 @@ class _ValidationPrefetchCache:
                     "fetched_rows": len(rows),
                     "added_rows": added,
                     "queue_size": len(self._queue),
+                    "query_seconds": round(query_seconds, 4),
                 },
             )
 
@@ -226,17 +237,23 @@ def _completed_run_condition():
     return or_(*predicates)
 
 
-def _active_validation_timeframe_exists(*, now: datetime):
-    return exists(
-        select(1)
-        .select_from(CompetitionConfig)
+def _active_validation_competitions(*, now: datetime):
+    """Competition IDs eligible to provide validation work right now.
+
+    Keeping this as a joined subquery lets PostgreSQL discard inactive competition
+    tasks before it joins their runs and validations. The older correlated EXISTS
+    form encouraged a scan across all completed runs before that filter applied.
+    """
+    return (
+        select(CompetitionConfig.competition_fk.label("competition_id"))
         .join(
             CompetitionTimeframe,
             CompetitionTimeframe.competition_config_fk == CompetitionConfig.id,
         )
-        .where(CompetitionConfig.competition_fk == SweBenchTask.competition_fk)
         .where(CompetitionConfig.is_active.is_(True))
         .where(CompetitionTimeframe.eval_ends_at >= now)
+        .distinct()
+        .subquery()
     )
 
 
@@ -334,15 +351,20 @@ def _build_validation_candidate_query(
     select_columns,
     limit: int,
     validation_id: int | None = None,
+    screener_stage: int | None | object = _ANY_STAGE,
     lock_rows: bool,
 ):
+    active_competitions = _active_validation_competitions(now=now)
     query = (
         select(*select_columns)
         .select_from(SweBenchRunValidation)
         .join(SweBenchRun, SweBenchRun.id == SweBenchRunValidation.run_fk)
         .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
+        .join(
+            active_competitions,
+            active_competitions.c.competition_id == SweBenchTask.competition_fk,
+        )
         .where(SweBenchRunValidation.scored_at.is_(None))
-        .where(_active_validation_timeframe_exists(now=now))
     )
     if completed_condition is not None:
         query = query.where(completed_condition)
@@ -354,7 +376,15 @@ def _build_validation_candidate_query(
         query = query.where(reclaim_condition)
     if validation_id is not None:
         query = query.where(SweBenchRunValidation.id == validation_id)
-    query = query.order_by(SweBenchRunValidation.id.asc()).limit(limit)
+    if screener_stage is not _ANY_STAGE:
+        if screener_stage is None:
+            query = query.where(SweBenchTask.screener_stage.is_(None))
+        else:
+            query = query.where(SweBenchTask.screener_stage == screener_stage)
+    # A global ID ordering makes PostgreSQL scan historical scored validations
+    # before it can find current work. Claiming is transactional, so candidate
+    # order is not needed for correctness and omitting it keeps refills bounded.
+    query = query.limit(limit)
     if lock_rows:
         query = query.with_for_update(skip_locked=True)
     return query
@@ -519,7 +549,7 @@ async def _load_top_screener_uids_for_competition(
     source: str,
     hotkey_to_uid: dict[str, int],
 ) -> list[int]:
-    top_hotkeys = await load_screening_passed_hotkeys_for_competition(
+    top_hotkeys = await load_qualified_hotkeys_for_competition(
         db,
         competition_id=competition_id,
     )
@@ -536,7 +566,7 @@ async def _load_top_screener_uids_for_competition(
             "request_id": request_id,
             "competition_id": competition_id,
             "source": source,
-            "screening_passed_count": len(top_hotkeys),
+            "qualified_count": len(top_hotkeys),
             "selected_count": len(selected_uids),
             "selected_uids": selected_uids,
         },
@@ -1087,6 +1117,11 @@ async def get_swebench_validation(
         )
     ),
 ) -> SignedEnvelope[GetSweBenchValidationResponse]:
+    request_started_at = time.perf_counter()
+    prefetch_seconds = 0.0
+    claim_seconds = 0.0
+    diff_load_seconds = 0.0
+    attempts = 0
     request_id = getattr(request.state, "request_id", None)
     validator = await _get_validator(db, ss58=_req.sig.signer_ss58)
     validator_id = int(validator.id)
@@ -1107,8 +1142,10 @@ async def get_swebench_validation(
     task_payload: SweBenchValidationTask | None = None
     output_storage = _get_output_storage(request)
     for _ in range(_VALIDATION_FETCH_MAX_ATTEMPTS):
+        attempts += 1
         now = datetime.now(timezone.utc)
         claim_expires_at = now + timedelta(seconds=claim_ttl_seconds)
+        prefetch_started_at = time.perf_counter()
         prefetched = await _validation_prefetch_cache.pop(
             db,
             now=now,
@@ -1116,8 +1153,10 @@ async def get_swebench_validation(
             completed_condition=completed_condition,
             request_id=request_id,
         )
+        prefetch_seconds += time.perf_counter() - prefetch_started_at
         if prefetched is None:
             break
+        claim_started_at = time.perf_counter()
         candidate_row = await _claim_validation_candidate(
             db,
             validation_id=prefetched.validation_id,
@@ -1125,6 +1164,7 @@ async def get_swebench_validation(
             claim_ttl_seconds=claim_ttl_seconds,
             completed_condition=completed_condition,
         )
+        claim_seconds += time.perf_counter() - claim_started_at
         if candidate_row is None:
             continue
 
@@ -1137,7 +1177,9 @@ async def get_swebench_validation(
             validation_row.claimed_at = now
         if claim_expires_col is not None:
             validation_row.claim_expires_at = claim_expires_at
+        claim_started_at = time.perf_counter()
         await db.commit()
+        claim_seconds += time.perf_counter() - claim_started_at
 
         run_status = str(getattr(run_row, "status", "") or "").lower()
         if run_status == "failed":
@@ -1163,9 +1205,11 @@ async def get_swebench_validation(
             )
             continue
 
+        diff_load_started_at = time.perf_counter()
         try:
             diff_text = await output_storage.get_single(run_row.diff_storage_uuid)
         except Exception as exc:
+            diff_load_seconds += time.perf_counter() - diff_load_started_at
             logger.warning(
                 "get_swebench_validation_diff_load_failed",
                 extra={
@@ -1205,6 +1249,7 @@ async def get_swebench_validation(
                 },
             )
             continue
+        diff_load_seconds += time.perf_counter() - diff_load_started_at
 
         task_payload = SweBenchValidationTask(
             validation_id=int(validation_row.id),
@@ -1216,10 +1261,13 @@ async def get_swebench_validation(
         break
 
     response_payload = GetSweBenchValidationResponse(task=task_payload)
+    signing_started_at = time.perf_counter()
     response_nonce = generate_nonce()
     response_sig = sign_payload_model(response_payload, nonce=response_nonce, wallet=settings.wallet)
+    signing_seconds = time.perf_counter() - signing_started_at
     response = SignedEnvelope(payload=response_payload, sig=response_sig)
 
+    response_log_started_at = time.perf_counter()
     await log_validator_message(
         db,
         direction="response",
@@ -1230,6 +1278,22 @@ async def get_swebench_validation(
         request_id=request_id,
         payload=response_payload.model_dump(mode="json"),
         status_code=status.HTTP_200_OK,
+    )
+    response_log_seconds = time.perf_counter() - response_log_started_at
+    logger.info(
+        "get_swebench_validation_timing",
+        extra={
+            "request_id": request_id,
+            "validation_id": int(task_payload.validation_id) if task_payload else None,
+            "has_task": task_payload is not None,
+            "attempts": attempts,
+            "prefetch_seconds": round(prefetch_seconds, 4),
+            "claim_seconds": round(claim_seconds, 4),
+            "diff_load_seconds": round(diff_load_seconds, 4),
+            "signing_seconds": round(signing_seconds, 4),
+            "response_log_seconds": round(response_log_seconds, 4),
+            "total_seconds": round(time.perf_counter() - request_started_at, 4),
+        },
     )
 
     return response

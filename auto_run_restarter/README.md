@@ -22,6 +22,8 @@ Current restart rules:
 - git clone / fetch / checkout failures for benchmark repos
 - missing copilot container `.env`
 - proxy `ECONNREFUSED`
+- sandbox disk full (`No space left on device`)
+- isolated Docker daemon (dind) not ready or failing to start the Copilot SWE sandbox
 - timeout-like failures only when the run has:
   - no positive token columns
   - no recorded agent steps

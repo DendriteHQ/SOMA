@@ -33,6 +33,24 @@ app = FastAPI(
 )
 
 
+def _rds_writer_host_from_secret(secret: dict[str, object]) -> str:
+    host = str(secret.get("host") or secret.get("hostname") or "").strip()
+    if not host:
+        raise RuntimeError("RDS secret is missing writer host information")
+    return host
+
+
+def _rds_reader_host_from_writer(writer_host: str) -> str:
+    if ".cluster-ro-" in writer_host:
+        return writer_host
+    if ".cluster-" not in writer_host:
+        raise RuntimeError(
+            "Cannot derive an Aurora reader host from RDS secret host "
+            f"{writer_host!r}; expected an endpoint containing '.cluster-'"
+        )
+    return writer_host.replace(".cluster-", ".cluster-ro-", 1)
+
+
 def _resolve_postgres_dsn() -> str:
     dsn = os.getenv("POSTGRES_DSN")
     if dsn:
@@ -81,13 +99,8 @@ def _resolve_postgres_dsn() -> str:
         "yes",
         "on",
     }
-    writer_host = (os.getenv("RDS_WRITER_HOST") or "").strip()
-    reader_host = (os.getenv("RDS_READER_HOST") or "").strip()
-    host = reader_host if use_reader and reader_host else writer_host
-    if not host:
-        host = str(secret.get("host") or secret.get("hostname") or "").strip()
-    if not host:
-        raise RuntimeError("RDS host is missing (RDS_WRITER_HOST/RDS_READER_HOST or secret host)")
+    writer_host = _rds_writer_host_from_secret(secret)
+    host = _rds_reader_host_from_writer(writer_host) if use_reader else writer_host
 
     user = str(secret.get("username") or "").strip()
     password = str(secret.get("password") or "").strip()
@@ -255,6 +268,43 @@ def _provider_retry_jitter_seconds() -> float:
     except ValueError:
         value = 0.35
     return max(0.0, value)
+
+
+def _find_invalid_assistant_message_index(payload: object) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+
+    for idx, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "assistant":
+            continue
+
+        content = message.get("content")
+        tool_calls = message.get("tool_calls")
+        if content is None and not tool_calls:
+            return idx
+
+    return None
+
+
+def _invalid_assistant_message_response(index: int) -> bytes:
+    payload = {
+        "error": {
+            "message": (
+                "Gateway rejected request before provider call: "
+                f"messages[{index}] is an assistant message with null content "
+                "and no tool_calls."
+            ),
+            "type": "gateway_invalid_request_error",
+            "code": "gateway_invalid_assistant_message",
+        }
+    }
+    return json.dumps(payload).encode("utf-8")
 
 
 def _extract_response_error_message(body: bytes) -> str:
@@ -606,6 +656,15 @@ async def proxy_openai_compatible(
         except Exception:
             parsed = None
 
+    if isinstance(parsed, dict) and method in ("POST", "PUT", "PATCH"):
+        requested_model = parsed.get("model")
+        logger.info(
+            "gateway_request_model run_id=%s model=%s model_present=%s",
+            run_id,
+            requested_model if requested_model else "missing",
+            bool(requested_model),
+        )
+
     force_provider = (os.getenv("GATEWAY_FORCE_PROVIDER") or "").strip()
     provider_was_forced = False
     # The pin is for the agent's LLM. A compressor-service call - Jev on OpenRouter's
@@ -631,6 +690,39 @@ async def proxy_openai_compatible(
                 force_provider,
                 parsed.get("provider"),
             )
+
+    invalid_assistant_message_index = _find_invalid_assistant_message_index(parsed)
+    if invalid_assistant_message_index is not None:
+        error_body = _invalid_assistant_message_response(invalid_assistant_message_index)
+        logger.warning(
+            "gateway_request_rejected_invalid_assistant_message run_id=%s miner_hotkey=%s method=%s path=/v1/%s message_index=%s",
+            run_id,
+            miner_hotkey,
+            method,
+            path,
+            invalid_assistant_message_index,
+        )
+        await _dump_failed_call(
+            run_id=run_id,
+            miner_hotkey=miner_hotkey,
+            method=method,
+            path=path,
+            url=_build_upstream_url(path, request.url.query),
+            stream=bool(isinstance(parsed, dict) and parsed.get("stream")),
+            request_body=body_bytes,
+            response_status_code=460,
+            response_headers={"content-type": "application/json"},
+            response_body=error_body,
+            attempts_used=0,
+            retry_reason="gateway_invalid_assistant_message",
+            forced_provider=force_provider if provider_was_forced else None,
+            actual_provider=None,
+        )
+        return Response(
+            content=error_body,
+            status_code=460,
+            media_type="application/json",
+        )
 
     url = _build_upstream_url(path, request.url.query)
     timeout = httpx.Timeout(float(os.getenv("GATEWAY_UPSTREAM_TIMEOUT_SECONDS", "180")))
