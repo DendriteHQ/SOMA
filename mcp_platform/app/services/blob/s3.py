@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import aioboto3
+from botocore.exceptions import ClientError
 from typing import Literal, overload
 #from ...core.config import settings
 from .base import BlobStorage
@@ -31,6 +32,21 @@ class S3BlobStorage(BlobStorage):
             resp = await s3.get_object(Bucket=self._bucket, Key=key)
             body = resp["Body"]
             return await body.read()
+
+    async def get_tail_bytes(self, key: str, max_bytes: int) -> tuple[bytes, int]:
+        async with self._session.client("s3", **self._client_kwargs) as s3:
+            try:
+                resp = await s3.get_object(Bucket=self._bucket, Key=key, Range=f"bytes=-{max_bytes}")
+            except ClientError as exc:
+                # A suffix range is unsatisfiable only for an empty object.
+                if (exc.response.get("Error") or {}).get("Code") == "InvalidRange":
+                    return b"", 0
+                raise
+            data = await resp["Body"].read()
+        # "bytes <start>-<end>/<total>"; absent when S3 ignored the range.
+        content_range = resp.get("ContentRange") or ""
+        total = content_range.rpartition("/")[2]
+        return data, int(total) if total.isdigit() else len(data)
 
     async def delete(self, key: str) -> None:
         async with self._session.client("s3", **self._client_kwargs) as s3:

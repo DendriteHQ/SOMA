@@ -54,6 +54,19 @@ class Settings(BaseSettings):
     miner_max_solution_size_bytes: int = Field(
         default=10 * 1024 * 1024, alias="MINER_MAX_SOLUTION_SIZE_BYTES"
     )
+    # Per-hotkey limit on /miner/run-logs (sliding window); 0 disables it.
+    miner_run_logs_rate_limit_requests: int = Field(
+        default=5, alias="MINER_RUN_LOGS_RATE_LIMIT_REQUESTS"
+    )
+    miner_run_logs_rate_limit_window_secs: int = Field(
+        default=60, alias="MINER_RUN_LOGS_RATE_LIMIT_WINDOW_SECS"
+    )
+    # Bytes of a run's compressor log returned by /miner/run-logs, newest kept. The
+    # sandbox caps the log at 1 MiB, but the newest entry is kept even when larger and
+    # the miner's code runs in the process that writes it, so it is not trusted.
+    miner_run_logs_max_bytes: int = Field(
+        default=2 * 1024 * 1024, alias="MINER_RUN_LOGS_MAX_BYTES"
+    )
     # S3
     s3_bucket: str | None = Field(default=None, alias="S3_BUCKET")
 
