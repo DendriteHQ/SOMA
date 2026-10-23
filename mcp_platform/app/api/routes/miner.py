@@ -5,7 +5,6 @@ import hashlib
 import asyncio
 import json
 import math
-from collections.abc import Collection
 from datetime import datetime, timezone
 
 from botocore.exceptions import ClientError
@@ -415,8 +414,6 @@ async def _signed_miner_response(
     db: AsyncSession,
     signer_ss58: str,
     response_payload,
-    *,
-    omit_payload_fields: Collection[str] | None = None,
 ) -> SignedEnvelope:
     response_nonce = generate_nonce()
     response_sig = sign_payload_model(
@@ -434,9 +431,8 @@ async def _signed_miner_response(
         nonce=response_sig.nonce,
         signer_ss58=signer_ss58,
         request_id=getattr(request.state, "request_id", None),
-        payload=response_payload.model_dump(mode="json"),
+        payload=response_payload,
         status_code=status.HTTP_200_OK,
-        omit_payload_fields=omit_payload_fields,
     )
     return response
 
@@ -1030,6 +1026,4 @@ async def get_run_logs(
         db,
         _req.sig.signer_ss58,
         response_payload,
-        # Up to the sandbox's log cap of miner stdout/stderr: never persist it in `requests`.
-        omit_payload_fields={"entries"},
     )
