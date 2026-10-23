@@ -22,6 +22,7 @@ from soma_shared.db.session import (
     get_db_session,
     init_db,
 )
+from soma_shared.utils.log_redaction import loggable_validation_errors
 from app.db.mock_data import seed_debug_data
 from soma_shared.db.models.validator import Validator
 from soma_shared.db.models.validator_registration import ValidatorRegistration
@@ -143,18 +144,12 @@ def create_app() -> FastAPI:
         exc: RequestValidationError,
     ) -> JSONResponse:
         request_id = getattr(request.state, "request_id", None)
-        try:
-            body_bytes = await request.body()
-            body_text = body_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            body_text = "<unavailable>"
         logger.warning(
             "request_validation_error",
             extra={
                 "request_id": request_id,
                 "endpoint": request.url.path,
-                "errors": exc.errors(),
-                "body": body_text[:2000],
+                "errors": loggable_validation_errors(exc.errors()),
             },
         )
         return JSONResponse(

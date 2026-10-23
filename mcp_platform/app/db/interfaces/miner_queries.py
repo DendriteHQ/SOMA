@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.interfaces.query_registry import db_query_interface
@@ -10,6 +10,8 @@ from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.models.miner import Miner
 from soma_shared.db.models.miner_upload import MinerUpload
 from soma_shared.db.models.script import Script
+from soma_shared.db.models.swe_bench_run import SweBenchRun
+from soma_shared.db.models.swe_bench_task import SweBenchTask
 
 
 @db_query_interface(sample_kwargs={"miner_hotkey": "sample-hotkey"})
@@ -115,3 +117,47 @@ async def acquire_miner_upload_advisory_lock(
         text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
         {"lock_key": lock_key},
     )
+
+
+@db_query_interface(
+    sample_kwargs={"miner_hotkey": "sample-hotkey", "instance_id": "sample-instance", "attempt_no": 1}
+)
+async def get_latest_miner_run_for_task_attempt(
+    db: AsyncSession,
+    *,
+    miner_hotkey: str,
+    instance_id: str,
+    attempt_no: int,
+    competition_name: str | None = None,
+):
+    """Latest non-baseline run of the miner for (instance_id, attempt_no).
+
+    The same instance can be benchmarked in several competitions: ``competition_name``
+    (matched ignoring case and surrounding whitespace) picks one, otherwise the newest
+    run wins.
+    """
+    query = (
+        select(
+            SweBenchRun.id.label("run_id"),
+            SweBenchRun.status,
+            SweBenchRun.compression_logs_uuid,
+            SweBenchTask.competition_fk,
+            Competition.competition_name,
+        )
+        .join(SweBenchTask, SweBenchTask.id == SweBenchRun.task_fk)
+        .join(Competition, Competition.id == SweBenchTask.competition_fk)
+        .join(Miner, Miner.id == SweBenchRun.miner_fk)
+        .where(Miner.ss58 == miner_hotkey)
+        .where(SweBenchTask.instance_id == instance_id)
+        .where(SweBenchRun.attempt_no == attempt_no)
+        .where(SweBenchRun.baseline_run.is_(False))
+    )
+    if competition_name is not None:
+        # Same expression as uq_competitions_competition_name_normalized, so it uses the index.
+        query = query.where(
+            func.lower(func.btrim(Competition.competition_name)) == competition_name.strip().lower()
+        )
+    result = await db.execute(
+        query.order_by(SweBenchRun.created_at.desc(), SweBenchRun.id.desc()).limit(1)
+    )
+    return result.first()

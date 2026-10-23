@@ -3,15 +3,19 @@ from __future__ import annotations
 import logging
 import hashlib
 import asyncio
+import json
+import math
 from datetime import datetime, timezone
 
+from botocore.exceptions import ClientError
+from pydantic import ValidationError
 from sqlalchemy import select, text
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_script_storage, verify_miner_request_dep_tz
+from app.api.deps import get_blob_storage, get_script_storage, verify_miner_request_dep_tz
 from soma_shared.contracts.common.signatures import SignedEnvelope
 from soma_shared.contracts.miner.v1.messages import (
     UploadSolutionRequest,
@@ -22,6 +26,9 @@ from soma_shared.contracts.miner.v1.messages import (
     UpdateOpenRouterApiKeyResponse,
     DeleteOpenRouterApiKeyRequest,
     DeleteOpenRouterApiKeyResponse,
+    CompressorExecLogEntry,
+    GetRunLogsRequest,
+    GetRunLogsResponse,
 )
 from soma_shared.db.session import get_db_session
 from soma_shared.db.miner_log import log_miner_message
@@ -30,16 +37,20 @@ from app.db.interfaces.miner_queries import (
     acquire_miner_upload_advisory_lock,
     get_latest_active_competition_and_timeframe,
     get_latest_active_competition_timeframe,
+    get_latest_miner_run_for_task_attempt,
     get_latest_miner_upload_created_at,
     get_miner_banned_status_by_hotkey,
     get_miner_upload_id_for_competition,
 )
+from app.services.blob.base import BlobStorage
+from app.services.blob.compression_log_artifact_storage import CompressionLogArtifactStorage
 from app.services.blob.script_storage import ScriptStorage
 from app.services.script_store import (
     BannedMinerUploadError,
     DuplicateMinerUploadError,
     store_hot_script,
 )
+from app.services.rate_limiter import SlidingWindowRateLimiter
 from app.services.ssm.client import get_ssm_client
 from soma_shared.utils.signer import generate_nonce, sign_payload_model
 from app.core.config import settings
@@ -59,6 +70,16 @@ def _sanitized_miner_error_detail(request: Request, exc: HTTPException) -> str:
             "OpenRouter key not found for miner. "
             "Add it first via /miner/openrouter-key/add."
         )
+    if (
+        exc.status_code == status.HTTP_404_NOT_FOUND
+        and request.url.path.endswith("/miner/run-logs")
+    ):
+        return "Run not found for miner, competition, instance_id and attempt_no."
+    if (
+        exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+        and request.url.path.endswith("/miner/run-logs")
+    ):
+        return "Too many run log requests for miner. Retry after the Retry-After header."
     return ""
 
 
@@ -410,7 +431,7 @@ async def _signed_miner_response(
         nonce=response_sig.nonce,
         signer_ss58=signer_ss58,
         request_id=getattr(request.state, "request_id", None),
-        payload=response_payload.model_dump(mode="json"),
+        payload=response_payload,
         status_code=status.HTTP_200_OK,
     )
     return response
@@ -853,4 +874,156 @@ async def delete_openrouter_api_key(
         db,
         _req.sig.signer_ss58,
         DeleteOpenRouterApiKeyResponse(ok=True),
+    )
+
+
+_RUN_TERMINAL_STATUSES = frozenset({"completed", "failed"})
+
+_run_logs_rate_limiter = SlidingWindowRateLimiter(
+    max_requests=settings.miner_run_logs_rate_limit_requests,
+    window_seconds=settings.miner_run_logs_rate_limit_window_secs,
+)
+
+
+def _parse_compressor_exec_log(
+    raw: str,
+    *,
+    cut: bool,
+    run_id: int,
+) -> tuple[list[CompressorExecLogEntry], bool, int]:
+    """Parse the run's compressor JSONL log into entries plus the truncation notice.
+
+    The miner's compressor runs in the process that writes this log and can forge
+    lines, so any line that does not fit the contract is skipped, never raised on.
+    ``cut`` means the log was read from the middle (only its tail fits the limit).
+    """
+    lines = raw.splitlines()
+    if cut and lines:
+        # The tail starts mid-line: the first line is a fragment of an older entry.
+        lines = lines[1:]
+    entries: list[CompressorExecLogEntry] = []
+    log_truncated = cut
+    dropped_oldest_entries = 0
+    malformed_lines = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            malformed_lines += 1
+            continue
+        if not isinstance(item, dict):
+            malformed_lines += 1
+            continue
+        if item.get("log_truncated") is True:
+            log_truncated = True
+            try:
+                dropped_oldest_entries = max(0, int(item.get("dropped_oldest_entries") or 0))
+            except (TypeError, ValueError, OverflowError):
+                malformed_lines += 1
+            continue
+        try:
+            entries.append(CompressorExecLogEntry.model_validate(item))
+        except ValidationError:
+            malformed_lines += 1
+    if malformed_lines:
+        logger.warning(
+            "miner_run_logs_malformed_lines",
+            extra={"run_id": run_id, "malformed_lines": malformed_lines},
+        )
+    return entries, log_truncated, dropped_oldest_entries
+
+
+@router.post(
+    "/miner/run-logs",
+    response_model=SignedEnvelope[GetRunLogsResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def get_run_logs(
+    request: Request,
+    _req: SignedEnvelope[GetRunLogsRequest] = Depends(
+        verify_miner_request_dep_tz(GetRunLogsRequest)
+    ),
+    db: AsyncSession = Depends(get_db_session),
+    blob_storage: BlobStorage = Depends(get_blob_storage),
+) -> SignedEnvelope[GetRunLogsResponse]:
+    payload = _req.payload
+    if payload.miner_hotkey != _req.sig.signer_ss58:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Miner hotkey does not match signature")
+
+    retry_after = _run_logs_rate_limiter.hit(_req.sig.signer_ss58)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many run log requests",
+            headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
+        )
+
+    # Filtering by the signer's hotkey means another miner's run is
+    # indistinguishable from a missing one.
+    run = await get_latest_miner_run_for_task_attempt(
+        db,
+        miner_hotkey=payload.miner_hotkey,
+        instance_id=payload.instance_id,
+        attempt_no=payload.attempt_no,
+        competition_name=payload.competition_name,
+    )
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+
+    response_payload = GetRunLogsResponse(
+        ok=False,
+        run_id=int(run.run_id),
+        competition_id=int(run.competition_fk),
+        competition_name=run.competition_name,
+        instance_id=payload.instance_id,
+        attempt_no=payload.attempt_no,
+        status=run.status,
+    )
+    if run.status not in _RUN_TERMINAL_STATUSES:
+        response_payload.error_msg = "Run has not finished yet"
+    elif not run.compression_logs_uuid:
+        # Cleared on report when the sandbox did not confirm the upload.
+        response_payload.error_msg = "No compressor logs were captured for this run"
+    else:
+        try:
+            raw, cut = await CompressionLogArtifactStorage(blob_storage).get_single_tail(
+                str(run.compression_logs_uuid),
+                settings.miner_run_logs_max_bytes,
+            )
+        except ClientError as exc:
+            error_code = str((exc.response.get("Error") or {}).get("Code") or "")
+            if error_code not in {"NoSuchKey", "404"}:
+                logger.exception(
+                    "miner_run_logs_fetch_failed",
+                    extra={"run_id": run.run_id, "miner_hotkey": payload.miner_hotkey},
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Failed to fetch run logs",
+                ) from exc
+            # A run failed by the orchestrator (no sandbox report) keeps its UUID
+            # although nothing was uploaded.
+            response_payload.error_msg = "No compressor logs were captured for this run"
+        else:
+            if cut:
+                logger.warning(
+                    "miner_run_logs_cut_to_limit",
+                    extra={"run_id": run.run_id, "max_bytes": settings.miner_run_logs_max_bytes},
+                )
+            entries, log_truncated, dropped_oldest_entries = _parse_compressor_exec_log(
+                raw, cut=cut, run_id=int(run.run_id)
+            )
+            response_payload.ok = True
+            response_payload.entries = entries
+            response_payload.log_truncated = log_truncated
+            response_payload.dropped_oldest_entries = dropped_oldest_entries
+
+    return await _signed_miner_response(
+        request,
+        db,
+        _req.sig.signer_ss58,
+        response_payload,
     )

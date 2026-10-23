@@ -32,6 +32,13 @@ class TextArtifactStorage:
         data = await self._storage.get_bytes(key)
         return data.decode("utf-8")
 
+    async def get_single_tail(self, storage_uuid: str, max_bytes: int) -> tuple[str, bool]:
+        """Return the last ``max_bytes`` of the artifact and whether anything before them was cut."""
+        key = self.build_key(storage_uuid)
+        data, total_size = await self._storage.get_tail_bytes(key, max_bytes)
+        # The cut can split a multi-byte character at the start.
+        return data.decode("utf-8", errors="replace"), total_size > len(data)
+
     async def delete_single(self, storage_uuid: str) -> None:
         key = self.build_key(storage_uuid)
         await self._storage.delete(key)
