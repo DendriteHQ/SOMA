@@ -10,6 +10,7 @@
 - [⚙️ Configuration](#️-configuration)
 - [🧪 What the validator grades](#-what-the-validator-grades)
 - [▶️ Running the Validator](#️-running-the-validator)
+  - [🐳 Using Docker](#-using-docker-recommended)
 - [📊 Monitoring](#-monitoring)
 - [🔧 Troubleshooting](#-troubleshooting)
 
@@ -55,15 +56,15 @@
 python3.11 -m venv .venv
 source .venv/bin/activate
 
-# Install subnet dependencies
+# Install dependencies (from the repository root)
 pip install --upgrade pip
-pip install -e .
-
-# Install validator-specific dependencies
-pip install -r reqs_tmp.txt
+pip install -r requirements.txt
 
 cd validator
 ```
+
+> **💡 TIP:** Running in Docker needs no Python setup at all — see
+> [🐳 Using Docker](#-using-docker-recommended).
 
 ---
 
@@ -116,7 +117,40 @@ competitions disappear once their window has closed.
 
 ## ▶️ Running the Validator
 
-### 🔄 Using PM2 (Recommended)
+### 🐳 Using Docker (Recommended)
+
+Requires only Docker with the Compose plugin and your wallet's hotkey on the host.
+
+```bash
+cd /path/to/SOMA/validator
+cp .env.example .env
+nano .env   # WALLET_NAME, WALLET_HOTKEY, VALIDATOR_HOST (your public IP)
+
+docker compose up -d        # start (also restarts on reboot)
+docker compose logs -f      # live logs
+docker compose ps           # status and health
+docker compose down         # stop
+```
+
+**Updating:** `docker compose pull && docker compose up -d`. A release is an image tag;
+nothing is fetched or installed inside a running container. To pin a release, set
+`VALIDATOR_IMAGE=dendritexhq/soma-validator:<tag>` in `.env`. To build from your
+checkout instead: `docker compose up -d --build`.
+
+What the compose file sets up:
+
+| Mount | Why |
+|---|---|
+| `/var/run/docker.sock` | Graded task containers run as siblings on the host's Docker daemon. **This socket is root-equivalent on the host** — run the validator on a machine dedicated to it. |
+| `BT_WALLET_PATH` (default `~/.bittensor/wallets`), read-only | Only the hotkey is used, for signing and setting weights. Keep the coldkey off this host; `coldkeypub.txt` and `hotkeys/<name>` are enough. |
+| volumes `state`, `tasks`, `logs`, `hf-cache` | Last set weights, current competition, the cached task dataset, harness logs and the Hugging Face cache survive restarts and upgrades. |
+
+The container listens on `VALIDATOR_PORT` and publishes the same port, because that is
+the port advertised to the platform — keep it reachable from the internet. Grading
+containers left behind by a stop, restart or crash are removed when the validator next
+starts. The heartbeat reports the image's version rather than a git commit.
+
+### 🔄 Using PM2
 
 > **💡 TIP:** PM2 is a production-ready process manager for Node.js applications
 
@@ -125,7 +159,7 @@ competitions disappear once their window has closed.
 npm install -g pm2
 
 # 🚀 Start validator with auto-update watcher
-cd /path/to/MCP-subnet/validator
+cd /path/to/SOMA/validator
 pm2 start run_validator.sh --name mcp-validator-watch --interpreter bash -- 60
 
 # 🔄 Auto-restart on system reboot
@@ -149,6 +183,8 @@ pm2 restart mcp-validator-watch
 ## 📊 Monitoring
 
 ### 📜 Check Validator Logs
+
+With Docker: `docker compose logs -f validator`. With PM2:
 
 ```bash
 # 📖 View live logs
