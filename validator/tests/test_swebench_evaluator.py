@@ -13,14 +13,11 @@ from huggingface_hub.errors import HfHubHTTPError
 
 TESTS_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../.."))
-MCP_PLATFORM_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../../mcp_platform"))
 FIXTURES_DIR = Path(TESTS_DIR) / "fixtures"
 os.environ.setdefault("VALIDATOR_DISABLE_APP_INIT", "1")
 
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
-if MCP_PLATFORM_DIR not in sys.path:
-    sys.path.insert(0, MCP_PLATFORM_DIR)
 
 from validator.evaluation.evaluator import BatchScoringError, Evaluator
 from validator.evaluation.swebench_evaluator import SWEBenchContainerEvaluator, SWEBenchEvaluationError
