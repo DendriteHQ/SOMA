@@ -1,0 +1,51 @@
+# Run from validator/ after filling in .env (cp .env.example .env):
+#   docker compose up -d
+# Update to a newer image:
+#   docker compose pull && docker compose up -d
+name: soma-validator
+
+services:
+  validator:
+    image: ${VALIDATOR_IMAGE:-dendritexhq/soma-validator:latest}
+    build:
+      context: ..
+      dockerfile: validator/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    # Reaps the docker CLI subprocesses and forwards SIGTERM to uvicorn.
+    init: true
+    # Grading containers are cleaned up on the next start, so a stop does not need
+    # to wait for in-flight grading; this only lets uvicorn shut down cleanly.
+    stop_grace_period: 30s
+    ports:
+      # The platform calls back on the advertised VALIDATOR_HOST:VALIDATOR_PORT.
+      - "${VALIDATOR_PORT:-8000}:${VALIDATOR_PORT:-8000}"
+    volumes:
+      # Graded task containers run as siblings on the host's Docker daemon. Access to
+      # this socket is root-equivalent on the host.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Only the hotkey is used (signing and set_weights); the coldkey need not be
+      # on this host at all.
+      - ${BT_WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets:ro
+      - state:/app/validator/.runtime
+      - tasks:/app/tasks
+      - logs:/app/logs
+      - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      # The port only opens once the validator has initialised.
+      test: ["CMD", "python", "-c", "import os, socket; socket.create_connection(('127.0.0.1', int(os.getenv('VALIDATOR_PORT', '8000'))), 3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+
+volumes:
+  state:
+  tasks:
+  logs:
+  hf-cache:
