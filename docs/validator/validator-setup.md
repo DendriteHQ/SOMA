@@ -126,16 +126,19 @@ cd /path/to/SOMA/validator
 cp .env.example .env
 nano .env   # WALLET_NAME, WALLET_HOTKEY, VALIDATOR_HOST (your public IP)
 
-docker compose up -d        # start (also restarts on reboot)
+VALIDATOR_VERSION=$(git describe --tags --always) docker compose up -d   # build and start
 docker compose logs -f      # live logs
 docker compose ps           # status and health
 docker compose down         # stop
 ```
 
-**Updating:** `docker compose pull && docker compose up -d`. A release is an image tag;
-nothing is fetched or installed inside a running container. To pin a release, set
-`VALIDATOR_IMAGE=dendritexhq/soma-validator:<tag>` in `.env`. To build from your
-checkout instead: `docker compose up -d --build`.
+The image is built locally from your checkout; `up` rebuilds it (cached layers make
+that quick when nothing changed). Prefix `up` with
+`VALIDATOR_VERSION=$(git describe --tags --always)` so the heartbeat reports the commit
+you run — otherwise it reports `unknown`.
+
+**Updating:** `git pull`, then the same `up` command. Nothing is fetched or installed
+inside a running container, and there is no automatic update as with the PM2 watcher.
 
 What the compose file sets up:
 

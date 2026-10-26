@@ -1,6 +1,6 @@
 # Validator-only dependencies, used by validator/Dockerfile. Versions match the
 # repository-wide requirements.txt; the git dependencies are pinned to a commit so an
-# image tag always means the same code. Bump them together with a new image release.
+# image built from a given commit always contains the same code.
 bittensor==9.0.0
 # bittensor 9.0.0 does not cap these; newer async-substrate-interface pulls cyscale,
 # which refuses to import next to bittensor's scalecodec.
