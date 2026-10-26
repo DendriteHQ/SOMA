@@ -152,6 +152,8 @@ def test_sync_runner_uses_explicit_image_and_returns_binary_success(monkeypatch)
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
         "pids_limit": 512,
+        "mem_limit": "5g",
+        "memswap_limit": "5g",
     }
 
 
@@ -210,6 +212,8 @@ def test_sync_runner_can_disable_image_cleanup(monkeypatch):
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
         "pids_limit": 512,
+        "mem_limit": "5g",
+        "memswap_limit": "5g",
     }
 
 
