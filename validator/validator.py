@@ -1031,6 +1031,9 @@ def get_heartbeat_dependency():
     return _dependency
 
 def is_code_changed():
+    # A container image has no .git; its code is whatever VALIDATOR_VERSION was built from.
+    if os.getenv("VALIDATOR_VERSION"):
+        return False
     try:
         result = subprocess.run(['git', 'status', '--porcelain'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return result.returncode == 0 and bool(result.stdout.strip())
@@ -1039,6 +1042,8 @@ def is_code_changed():
         return False
 
 def version_check():
+    if os.getenv("VALIDATOR_VERSION"):
+        return os.getenv("VALIDATOR_VERSION")
     try:
         result = subprocess.run(['git', 'describe', '--tags', '--always'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return result.stdout.strip()
