@@ -1,6 +1,6 @@
 # The image is always built locally from this checkout. Run from validator/ after
 # filling in .env (cp .env.example .env), and again after every git pull:
-#   VALIDATOR_VERSION=$(git describe --tags --always) docker compose up -d
+#   docker compose up -d
 name: soma-validator
 
 services:
@@ -10,9 +10,6 @@ services:
     build:
       context: ..
       dockerfile: validator/Dockerfile
-      args:
-        # Reported in the heartbeat; the image has no .git to read it from.
-        VALIDATOR_VERSION: ${VALIDATOR_VERSION:-unknown}
     env_file: .env
     restart: unless-stopped
     # Reaps the docker CLI subprocesses and forwards SIGTERM to uvicorn.

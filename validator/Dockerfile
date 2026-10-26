@@ -1,5 +1,5 @@
 # Build from the repository root:
-#   docker build -f validator/Dockerfile --build-arg VALIDATOR_VERSION=$(git describe --tags --always) -t soma-validator .
+#   docker build -f validator/Dockerfile -t soma-validator .
 FROM python:3.12-slim AS build
 
 RUN apt-get update \
@@ -10,6 +10,12 @@ RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 COPY validator/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# The version reported in the heartbeat is the commit the image is built from. Only
+# the result leaves this stage; .git itself never reaches the final image.
+COPY .git /tmp/repo/.git
+RUN git -C /tmp/repo describe --tags --always > /tmp/VERSION 2>/dev/null \
+    || echo unknown > /tmp/VERSION
 
 
 FROM python:3.12-slim
@@ -27,11 +33,8 @@ ENV PATH=/opt/venv/bin:$PATH \
 # (validator/.runtime, logs/, tasks/), so the root is the working directory.
 WORKDIR /app
 COPY validator ./validator
-
-ARG VALIDATOR_VERSION=unknown
-ENV VALIDATOR_VERSION=$VALIDATOR_VERSION
-LABEL org.opencontainers.image.version=$VALIDATOR_VERSION
+COPY --from=build /tmp/VERSION ./VERSION
 
 # The port is the one advertised to the platform, so it is read from VALIDATOR_PORT
 # rather than fixed. Configuration comes from the environment (compose env_file).
-CMD ["sh", "-c", "exec uvicorn validator.validator:app --host 0.0.0.0 --port ${VALIDATOR_PORT:-8000}"]
+CMD ["sh", "-c", "export VALIDATOR_VERSION=$(cat VERSION); exec uvicorn validator.validator:app --host 0.0.0.0 --port ${VALIDATOR_PORT:-8000}"]

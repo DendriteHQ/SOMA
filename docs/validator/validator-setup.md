@@ -126,16 +126,15 @@ cd /path/to/SOMA/validator
 cp .env.example .env
 nano .env   # WALLET_NAME, WALLET_HOTKEY, VALIDATOR_HOST (your public IP)
 
-VALIDATOR_VERSION=$(git describe --tags --always) docker compose up -d   # build and start
+docker compose up -d        # build and start (also restarts on reboot)
 docker compose logs -f      # live logs
 docker compose ps           # status and health
 docker compose down         # stop
 ```
 
 The image is built locally from your checkout; `up` rebuilds it (cached layers make
-that quick when nothing changed). Prefix `up` with
-`VALIDATOR_VERSION=$(git describe --tags --always)` so the heartbeat reports the commit
-you run — otherwise it reports `unknown`.
+that quick when nothing changed). The heartbeat reports the commit the image was built
+from.
 
 **Updating:** `git pull`, then the same `up` command. Nothing is fetched or installed
 inside a running container, and there is no automatic update as with the PM2 watcher.
