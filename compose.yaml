@@ -1,0 +1,157 @@
+name: soma
+
+x-platform-build: &platform-build
+  context: .
+  additional_contexts:
+    soma_shared: ${SOMA_SHARED_CONTEXT:-../SOMA-shared}
+
+x-platform-env: &platform-env
+  DB_INITIALIZE_SCHEMA: "false"
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+  DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+  DEBUG_CLEAR_DB: "false"
+  INJECT_MOCK: "false"
+  WALLET_PATH: /run/wallets
+  LOG_DIR: /var/lib/soma/logs
+  TRUSTED_PROXY_CIDRS: '["172.30.114.10/32"]'
+  FRONTEND_AGGREGATE_SNAPSHOT_DIR: /var/lib/soma/aggregates
+  BEST_MINERS_CACHE_PATH: /var/lib/soma/best_miners_cache.json
+  AUTO_RUN_RESTARTER_METADATA_DIR: /var/lib/soma/restarts
+
+x-python-service: &python-service
+  restart: unless-stopped
+  init: true
+  env_file: ${SOMA_ENV_FILE:-.env}
+  stop_grace_period: 60s
+  networks: [backend]
+  extra_hosts: ["host.docker.internal:host-gateway"]
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+services:
+  metagraph:
+    <<: *python-service
+    build:
+      <<: *platform-build
+      dockerfile: mcp_platform_services/metagraph/Dockerfile
+    environment:
+      <<: *platform-env
+      SOMA_SERVICE_ROLE: metagraph
+    volumes:
+      - metagraph-state:/var/lib/soma
+
+  platform-api:
+    <<: *python-service
+    build:
+      <<: *platform-build
+      dockerfile: mcp_platform_services/platform-api/Dockerfile
+    environment:
+      <<: *platform-env
+      SOMA_SERVICE_ROLE: api
+    volumes:
+      - api-state:/var/lib/soma
+      - ${SOMA_WALLETS_DIR:-./secrets/wallets}:/run/wallets:ro
+    depends_on:
+      metagraph: {condition: service_healthy}
+
+  run-coordinator:
+    <<: *python-service
+    build:
+      <<: *platform-build
+      dockerfile: mcp_platform_services/run-coordinator/Dockerfile
+    environment:
+      <<: *platform-env
+      SOMA_SERVICE_ROLE: coordinator
+      # Restarts run in the dedicated worker below, never in this API process.
+      COORDINATOR_RESTARTER_ENABLED: "false"
+    volumes:
+      - coordinator-state:/var/lib/soma
+      - ${SOMA_TASKS_DIR:-./tasks}:/data/tasks:ro
+
+  auto-run-restarter:
+    <<: *python-service
+    build:
+      <<: *platform-build
+      dockerfile: mcp_platform_services/auto-run-restarter/Dockerfile
+    environment:
+      <<: *platform-env
+    volumes:
+      - restarter-state:/var/lib/soma
+    depends_on:
+      run-coordinator: {condition: service_healthy}
+
+  results:
+    <<: *python-service
+    build:
+      <<: *platform-build
+      dockerfile: mcp_platform_services/results/Dockerfile
+    environment:
+      <<: *platform-env
+      SOMA_SERVICE_ROLE: results
+    volumes:
+      - results-state:/var/lib/soma
+    depends_on:
+      metagraph: {condition: service_healthy}
+
+  gateway-1:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: mcp_platform_services/gateway/Dockerfile
+    environment:
+      GATEWAY_FAILED_CALLS_DIR: /var/lib/soma/failed_calls
+      GATEWAY_INSTANCE_ID: gateway-1
+    volumes:
+      - gateway-1-state:/var/lib/soma
+    stop_grace_period: ${GATEWAY_STOP_GRACE_PERIOD:-30m}
+
+  gateway-2:
+    <<: *python-service
+    build:
+      context: .
+      dockerfile: mcp_platform_services/gateway/Dockerfile
+    environment:
+      GATEWAY_FAILED_CALLS_DIR: /var/lib/soma/failed_calls
+      GATEWAY_INSTANCE_ID: gateway-2
+    volumes:
+      - gateway-2-state:/var/lib/soma
+    stop_grace_period: ${GATEWAY_STOP_GRACE_PERIOD:-30m}
+
+  ingress:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: mcp_platform_services/ingress/Dockerfile
+    ports:
+      - ${SOMA_BIND_ADDRESS:-0.0.0.0}:${SOMA_API_PORT:-8000}:8000
+      - ${SOMA_BIND_ADDRESS:-0.0.0.0}:${SOMA_GATEWAY_PORT:-8050}:8050
+    depends_on:
+      platform-api: {condition: service_healthy}
+      run-coordinator: {condition: service_healthy}
+      results: {condition: service_healthy}
+      gateway-1: {condition: service_healthy}
+      gateway-2: {condition: service_healthy}
+    networks:
+      backend:
+        ipv4_address: 172.30.114.10
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: 172.30.114.0/24
+
+volumes:
+  metagraph-state:
+  api-state:
+  coordinator-state:
+  restarter-state:
+  results-state:
+  gateway-1-state:
+  gateway-2-state:

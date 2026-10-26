@@ -1,0 +1,26 @@
+# Local platform HTTP services only; benchmark executor dependencies are external.
+fastapi==0.110.3
+uvicorn==0.40.0
+pydantic==2.12.5
+pydantic-settings==2.12.0
+SQLAlchemy==2.0.45
+asyncpg==0.31.0
+aioboto3==15.5.0
+aiocache==0.12.3
+httpx==0.28.1
+bittensor==10.3.0
+# The platform only uses the Python Bittensor client. Do not install
+# bittensor-cli here: its 9.x aiohttp pin conflicts with Bittensor 10.x and no
+# containerized platform service invokes the CLI.
+bittensor-wallet==4.0.1
+bittensor-commit-reveal==0.4.0
+bittensor-drand==1.3.0
+# Match the Bittensor runtime used by the current PM2 deployment. This stack is
+# required by the test-chain runtime API; the previous Bittensor 9 substrate
+# encoder cannot serialize the configured netuid.
+async-substrate-interface==2.0.2
+cyscale==0.8.0
+python-dotenv==1.2.1
+python-json-logger==4.0.0
+rich==14.2.0
+tiktoken==0.12.0
