@@ -835,7 +835,13 @@ class Validator(AbstractValidator):
     async def run(self) -> None:
         # Initialize async resources in the correct event loop
         await self.async_init()
-        
+        try:
+            removed = await asyncio.to_thread(self.evaluator.remove_orphaned_containers)
+            if removed:
+                logging.info("Removed %s orphaned grading containers", removed)
+        except Exception:
+            logging.warning("Failed to remove orphaned grading containers", exc_info=True)
+
         base_poll_interval = self.settings.task_poll_interval_seconds
         max_backoff_interval = self.settings.max_backoff_interval_seconds
         backoff_multiplier = self.settings.backoff_multiplier

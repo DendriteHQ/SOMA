@@ -92,6 +92,18 @@ class Evaluator:
             for key in set(swebench_result) | set(soma_result)
         }
 
+    def remove_orphaned_containers(self) -> int:
+        """Remove grading containers a previous validator process left behind.
+
+        Called once at start-up, before any evaluation is started: a stop or restart
+        (``docker compose restart``, a deploy, a crash) does not wait for in-flight
+        grading, so its containers would otherwise keep running and holding resources.
+        """
+        return (
+            self._swebench_evaluator.remove_grading_containers()
+            + self._soma_task_evaluator.remove_grading_containers()
+        )
+
     def _is_soma_task(self, task: SweBenchValidationTask) -> bool:
         """Whether this validation grades a SOMA task rather than a SWE-bench one.
 
