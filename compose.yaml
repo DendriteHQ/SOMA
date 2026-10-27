@@ -65,6 +65,7 @@ services:
     environment:
       <<: *platform-env
       SOMA_SERVICE_ROLE: coordinator
+      SANDBOX_DISPATCH_METADATA_DIR: /var/lib/soma/sandbox_dispatches
       # Restarts run in the dedicated worker below, never in this API process.
       COORDINATOR_RESTARTER_ENABLED: "false"
     volumes:

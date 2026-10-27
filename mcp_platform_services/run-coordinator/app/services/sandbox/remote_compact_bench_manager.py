@@ -23,8 +23,10 @@ _CAPACITY_ERROR = (
     "Platform is at capacity. The compact-bench service is currently handling the maximum "
     "number of concurrent requests. Please try again later."
 )
-_DISPATCH_METADATA_DIR = (
-    Path(__file__).resolve().parents[3] / "metadata" / "sandbox_dispatches"
+# Runtime metadata belongs in the writable service state volume.  The source tree
+# is intentionally read-only to the unprivileged container user.
+_DISPATCH_METADATA_DIR = Path(
+    os.getenv("SANDBOX_DISPATCH_METADATA_DIR", "/var/lib/soma/sandbox_dispatches")
 )
 
 
