@@ -64,8 +64,8 @@ from app.services.swebench_orchestrator import (
 from app.services.incentive_calculator import (
     final_score_includes_screener_stage,
     load_stage1_miner_total_scores,
-    load_stage2_miner_total_scores,
 )
+from app.services.stage2_scores import load_stage2_miner_total_scores
 from app.services.blob.s3 import S3BlobStorage
 from app.db.interfaces import fetch_swebench_eligible_ss58_for_competition
 from app.api.routes.utils import (

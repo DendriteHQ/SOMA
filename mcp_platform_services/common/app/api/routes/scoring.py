@@ -1,3 +1,11 @@
+"""Canonical shared SWE scoring formulas.
+
+Despite its historical ``api.routes`` path, this module is a pure calculation
+library: results and the run coordinator both import these functions directly.
+It must remain free of request handling and database writes so scoring cannot
+diverge between display, stage-2 selection, and evaluation dispatch.
+"""
+
 from __future__ import annotations
 
 from math import ceil, log2

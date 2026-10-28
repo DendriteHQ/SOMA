@@ -426,22 +426,6 @@ async def _load_stage_total_scores(
     return _swe_scores_by_hotkey(rows)
 
 
-async def load_stage2_miner_total_scores(
-    db: AsyncSession,
-    *,
-    competition_id: int,
-) -> dict[str, float]:
-    """Per-hotkey total SWE score computed from stage-2 tasks only.
-
-    The ranking key for stage-2 top-N + delta selection. It is the same formula as
-    the final competition score, restricted to ``screener_stage == 2``, so stage-2
-    standing predicts full-eval standing.
-    """
-    return await _load_stage_total_scores(
-        db, competition_id=competition_id, screener_stage=2
-    )
-
-
 async def load_stage1_miner_total_scores(
     db: AsyncSession,
     *,
