@@ -622,10 +622,9 @@ class SomaTaskContainerEvaluator:
         suffix = str(
             self._get_setting("soma_task_test_image_tag_suffix", DEFAULT_TEST_IMAGE_TAG_SUFFIX)
         )
-        # Instance ids are already legal Docker tag characters
-        # ([a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}), and this is a tag rather than a repo
-        # path segment, so the "__" in "<org>__<repo>-<pr>" needs no escaping.
-        return f"{self._image_repository()}:{instance_id}{suffix}"
+        # Task publication canonicalizes Docker tags to lowercase. Keep validator
+        # pulls aligned with that convention even when an instance id has capitals.
+        return f"{self._image_repository()}:{instance_id.lower()}{suffix}"
 
     def _ensure_image(self, test_image: str) -> None:
         if _run(["docker", "image", "inspect", test_image]).returncode == 0:

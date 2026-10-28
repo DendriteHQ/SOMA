@@ -27,6 +27,7 @@ from validator.evaluation.soma_task_evaluator import (  # noqa: E402
     SomaTaskEvaluationError,
 )
 from validator.evaluation.soma_task_registry import (  # noqa: E402
+    SomaTaskGradingSpec,
     SomaTaskNotFoundError,
     SomaTaskRegistry,
 )
@@ -160,10 +161,25 @@ def test_resolves_when_every_graded_test_passes(tmp_path, monkeypatch):
     assert result.missing_tests == ()
     # Image reference is derived from the instance id plus the configured repository,
     # the same way the SWE-bench path derives its eval image from a template.
-    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID}.test"
+    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID.lower()}.test"
     status = result.report[INSTANCE_ID]["tests_status"]
     assert status["FAIL_TO_PASS"]["success"] == 1
     assert status["PASS_TO_PASS"]["success"] == 1
+
+
+def test_derives_lowercase_tag_for_mixed_case_instance_id(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=None)
+    evaluator = _evaluator(tmp_path, monkeypatch, fake)
+    instance_id = "ApeWorX__web3.py-3598"
+    spec = SomaTaskGradingSpec(instance_id, (), ())
+
+    image = evaluator._resolve_test_image(
+        instance_id=instance_id,
+        spec=spec,
+        image_name=None,
+    )
+
+    assert image == "example/soma-tasks:apeworx__web3.py-3598.test"
 
 
 def test_does_not_resolve_when_a_pass_to_pass_test_regresses(tmp_path, monkeypatch):
@@ -418,7 +434,7 @@ def test_the_configured_repository_wins_over_the_rows_build_time_reference(tmp_p
 
     result = evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
 
-    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID}.test"
+    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID.lower()}.test"
 
 
 # ── registry ───────────────────────────────────────────────────────────────
