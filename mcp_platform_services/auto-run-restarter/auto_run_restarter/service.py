@@ -257,7 +257,11 @@ def _classify_restart_reason(
         return "provider_500"
     if '"code":520' in error or "error code: 520" in error:
         return "provider_520"
-    if "502 Bad Gateway" in error:
+    if (
+        "502 Bad Gateway" in error
+        or "provider_unavailable" in error.lower()
+        or "HTTP 502" in error
+    ):
         return "provider_502"
     if "all predefined address pools have been fully subnetted" in error:
         return "docker_network_address_pool_exhausted"
@@ -350,6 +354,8 @@ _FETCH_CANDIDATE_ROWS_SQL = sa.text(
           OR r.last_error LIKE '%"code"' || chr(58) || '520%'
           OR r.last_error LIKE '%error code: 520%'
           OR r.last_error LIKE '%502 Bad Gateway%'
+          OR lower(r.last_error) LIKE '%provider_unavailable%'
+          OR r.last_error LIKE '%HTTP 502%'
           OR r.last_error LIKE '%all predefined address pools have been fully subnetted%'
           OR btrim(r.last_error) LIKE 'Volume soma-copilot-%'
           OR r.last_error LIKE '%Failed to clone benchmark repository%'

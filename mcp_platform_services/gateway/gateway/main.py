@@ -387,7 +387,58 @@ def _extract_response_error_message(body: bytes) -> str:
     return body.decode("utf-8", errors="replace")
 
 
+def _extract_embedded_error(body: bytes) -> dict[str, object] | None:
+    """Extract an OpenAI-style error from JSON or a complete SSE event."""
+    payloads: list[object] = [_load_json_body(body)]
+    text = body.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    for event in text.split("\n\n"):
+        data_lines = [
+            line[5:].strip() for line in event.splitlines() if line.startswith("data:")
+        ]
+        if data_lines:
+            payloads.append(_load_json_body("\n".join(data_lines).encode()))
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return error
+    return None
+
+
+def _is_provider_unavailable_error(body: bytes) -> bool:
+    error = _extract_embedded_error(body)
+    if not error:
+        return False
+    metadata = error.get("metadata")
+    return (
+        error.get("code") == 502
+        and isinstance(metadata, dict)
+        and metadata.get("error_type") == "provider_unavailable"
+    )
+
+
+def _provider_unavailable_response(body: bytes) -> bytes:
+    """Return an OpenAI-compatible error the benchmark can report verbatim."""
+    error = _extract_embedded_error(body) or {}
+    message = error.get("message")
+    if not isinstance(message, str) or not message.strip():
+        message = "Provider unavailable"
+    return json.dumps(
+        {
+            "error": {
+                "message": f"provider_unavailable (HTTP 502): {message}",
+                "type": "upstream_error",
+                "code": "provider_unavailable",
+            }
+        }
+    ).encode()
+
+
 def _classify_retryable_provider_error(status_code: int, body: bytes) -> str | None:
+    if status_code >= 500 or _is_provider_unavailable_error(body):
+        return "provider_502"
     message = _extract_response_error_message(body)
     if status_code == 404 and (
         "not found on provider" in message
@@ -397,6 +448,27 @@ def _classify_retryable_provider_error(status_code: int, body: bytes) -> str | N
     if status_code == 400:
         return "provider_400"
     return None
+
+
+async def _read_initial_stream_event(
+    response: httpx.Response,
+) -> tuple[bytes, AsyncIterator[bytes], bool]:
+    """Buffer the first SSE event so an embedded provider error stays an HTTP error."""
+    iterator = response.aiter_bytes()
+    buffered = bytearray()
+    max_prefix_bytes = 64 * 1024
+    while len(buffered) < max_prefix_bytes:
+        try:
+            chunk = await anext(iterator)
+        except StopAsyncIteration:
+            break
+        buffered.extend(chunk)
+        prefix = bytes(buffered)
+        if _is_provider_unavailable_error(prefix):
+            return prefix, iterator, True
+        if b"\n\n" in prefix.replace(b"\r\n", b"\n"):
+            return prefix, iterator, False
+    return bytes(buffered), iterator, _is_provider_unavailable_error(bytes(buffered))
 
 
 def _provider_retry_delay_seconds(attempt_no: int) -> float:
@@ -609,9 +681,40 @@ async def _stream_upstream_response(
                 retry_reason,
             )
 
+        prefix, upstream_iterator, embedded_provider_error = await _read_initial_stream_event(response)
+        if embedded_provider_error:
+            error_body = _provider_unavailable_response(prefix)
+            retry_reason = "provider_502"
+            await stream_ctx.__aexit__(None, None, None)
+            await client.aclose()
+            if attempt_no < max_attempts:
+                delay_seconds = _provider_retry_delay_seconds(attempt_no)
+                logger.warning(
+                    "gateway_provider_retry run_id=%s miner_hotkey=%s attempt=%s max_attempts=%s status_code=502 reason=%s delay_seconds=%.3f stream=true",
+                    run_id,
+                    miner_hotkey,
+                    attempt_no,
+                    max_attempts,
+                    retry_reason,
+                    delay_seconds,
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+            return (
+                None,
+                502,
+                {"content-type": "application/json"},
+                response.headers,
+                error_body,
+                attempt_no,
+                retry_reason,
+            )
+
         async def _iterator() -> AsyncIterator[bytes]:
             try:
-                async for chunk in response.aiter_bytes():
+                if prefix:
+                    yield prefix
+                async for chunk in upstream_iterator:
                     yield chunk
             finally:
                 await stream_ctx.__aexit__(None, None, None)
@@ -801,6 +904,21 @@ async def proxy_openai_compatible(
                 parsed.get("provider"),
             )
 
+    if (
+        path == "chat/completions"
+        and method == "POST"
+        and isinstance(parsed, dict)
+        and parsed.get("model") == "openai/gpt-6-luna"
+    ):
+        reasoning = parsed.get("reasoning")
+        reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+        reasoning.pop("max_tokens", None)
+        reasoning.pop("enabled", None)
+        reasoning["effort"] = "medium"
+        parsed["reasoning"] = reasoning
+        parsed.pop("reasoning_effort", None)
+        body_bytes = json.dumps(parsed).encode()
+
     invalid_assistant_message_index = _find_invalid_assistant_message_index(parsed)
     if invalid_assistant_message_index is not None:
         error_body = _invalid_assistant_message_response(invalid_assistant_message_index)
@@ -894,6 +1012,10 @@ async def proxy_openai_compatible(
         else:
             actual_provider = _extract_actual_provider(upstream_headers or httpx.Headers(), error_body)
         if stream is None:
+            if status_code >= 500:
+                error_body = _provider_unavailable_response(error_body or b"")
+                status_code = 502
+                response_headers = {"content-type": "application/json"}
             await _dump_failed_call(
                 run_id=run_id,
                 miner_hotkey=miner_hotkey,
@@ -1018,6 +1140,13 @@ async def proxy_openai_compatible(
             forced_provider=force_provider if provider_was_forced else None,
             actual_provider=actual_provider,
         )
+        if resp.status_code >= 500:
+            return Response(
+                content=_provider_unavailable_response(resp.content),
+                status_code=502,
+                media_type="application/json",
+                headers=passthrough_headers,
+            )
     logger.info(
         "gateway_request_completed run_id=%s miner_hotkey=%s method=%s path=/v1/%s status_code=%s",
         run_id,
