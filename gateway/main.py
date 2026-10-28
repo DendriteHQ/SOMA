@@ -792,6 +792,21 @@ async def proxy_openai_compatible(
                 parsed.get("provider"),
             )
 
+    if (
+        path == "chat/completions"
+        and method == "POST"
+        and isinstance(parsed, dict)
+        and parsed.get("model") == "openai/gpt-6-luna"
+    ):
+        reasoning = parsed.get("reasoning")
+        reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+        reasoning.pop("max_tokens", None)
+        reasoning.pop("enabled", None)
+        reasoning["effort"] = "medium"
+        parsed["reasoning"] = reasoning
+        parsed.pop("reasoning_effort", None)
+        body_bytes = json.dumps(parsed).encode()
+
     invalid_assistant_message_index = _find_invalid_assistant_message_index(parsed)
     if invalid_assistant_message_index is not None:
         error_body = _invalid_assistant_message_response(invalid_assistant_message_index)
