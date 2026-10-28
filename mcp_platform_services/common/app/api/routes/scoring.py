@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import ceil
+from math import ceil, log2
 from typing import Any
 
 from soma_shared.contracts.api.v1.frontend import SweMinerTaskResultItem

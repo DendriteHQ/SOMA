@@ -764,10 +764,10 @@ async def _classify_stage2_scripts(
     # Rank by the canonical SWE total score (quality + saving) computed from
     # stage-2 tasks only — the same formula as the final competition score,
     # so stage-2 standing predicts full-eval standing. Top-N + delta advance.
-    from app.services import incentive_calculator
+    from app.services.stage2_scores import load_stage2_miner_total_scores
 
     stage2_scores_by_hotkey = (
-        await incentive_calculator.load_stage2_miner_total_scores(
+        await load_stage2_miner_total_scores(
             db, competition_id=competition_id
         )
         if stage1_passers
