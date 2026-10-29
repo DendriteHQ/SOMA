@@ -1,29 +1,32 @@
+"""Executes one Copilot compact-bench run: the work a runner container does.
+
+The runner downloads the miner's compressor, runs `benchmark-solve` (which brings up the
+run's compose stack: copilot, proxy, compression-service, dind, swe-exec-broker), uploads
+the trajectory and compressor log, and returns the report. It does not tear the stack
+down beyond what soma_bench does itself: the API verifies and finishes teardown after
+the runner exits, including after a runner that was killed.
+"""
 from __future__ import annotations
 
 import hashlib
-import fcntl
-import importlib.util
 import json
 import logging
 import os
 import shlex
-import signal
 import shutil
+import signal
 import subprocess
 import sys
-import tempfile
-import threading
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib import error as urllib_error
 from urllib import request as urllib_request
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 
+from app import settings
 from soma_shared.contracts.sandbox.v1.messages import (
     CompactBenchReportRequest,
     CompactBenchRunTaskRequest,
@@ -32,82 +35,26 @@ from soma_shared.contracts.sandbox.v1.messages import (
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass(slots=True)
-class CompactBenchExecutionOutput:
-    report: CompactBenchReportRequest
-    patch_text: str
-
-
-@dataclass(slots=True)
-class NginxProxyHandle:
-    container_name: str
-    proxy_base_url: str
-    upstream_base_url: str
-    private_network_name: str
-
-
-@dataclass(slots=True)
-class CopilotCompressionHandle:
-    container_name: str
-    run_id: int
-
-
-PLUGIN_VENV_DIRNAME = ".soma-openclaw-venv"
-PLUGIN_BACKEND_FILENAME = "base_miner.py"
-PLUGIN_COPY_IGNORE_NAMES = {".git", PLUGIN_VENV_DIRNAME, "logs"}
-TIKTOKEN_CACHE_DIRNAME = "tiktoken-cache"
+SUPPORTED_AGENT_NAME = "copilot"
+MINER_MODULE_FILENAME = "base_miner.py"
 COMPRESSION_SERVICE_IMAGE_NAME = "soma-copilot-compression-service:latest"
-COMPRESSION_SERVICE_CONTEXT_DIRNAME = "compression_service"
-COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT = "soma-copilot-sandbox-shared"
-COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT = "http://compression-run-{run_id}:8000/"
-COPILOT_SHARED_PROXY_BIND_HOST_DEFAULT = "127.0.0.1"
-COPILOT_SHARED_PROXY_BIND_PORT_DEFAULT = 18080
-COPILOT_SHARED_PROXY_HOST_ALIAS_DEFAULT = "host.docker.internal"
-TIKTOKEN_CL100K_URL = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken"
-TIKTOKEN_CL100K_SHA256 = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
 BENCHMARK_PACKAGE_NAME = "soma_bench"
-DEFAULT_BENCHMARK_PACKAGE_SPEC = "git+https://github.com/DendriteHQ/SOMA-benchmark.git"
-DEFAULT_PLUGIN_REPOSITORY_URL = "https://github.com/DendriteHQ/SOMA-plugin.git"
-COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_RETENTION_SECONDS"
-COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS_ENV = "COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS"
-COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV = "COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS"
-SOMA_TASKS_FILE_ENV = "SOMA_TASKS_FILE"
-# The published task rows. The platform keeps this dataset private while the tasks are
-# hidden and flips it public for the evaluation window, so a sandbox host needs no
-# credentials and nothing copied onto it. Set it and the local file below becomes a
-# fallback for hosts that are still provisioned by hand.
-SOMA_TASKS_DATASET_REPO_ENV = "SOMA_TASKS_DATASET_REPO"
-SOMA_TASKS_DATASET_PATH_ENV = "SOMA_TASKS_DATASET_PATH"
-SOMA_TASKS_DATASET_REVISION_ENV = "SOMA_TASKS_DATASET_REVISION"
-SOMA_TASKS_DATASET_CACHE_ENV = "SOMA_TASKS_DATASET_CACHE"
-SOMA_TASKS_DATASET_REFRESH_SECONDS_ENV = "SOMA_TASKS_DATASET_REFRESH_SECONDS"
-SOMA_TASKS_DATASET_TIMEOUT_SECONDS_ENV = "SOMA_TASKS_DATASET_TIMEOUT_SECONDS"
-DEFAULT_SOMA_TASKS_DATASET_PATH = "tasks.jsonl"
-DEFAULT_SOMA_TASKS_DATASET_REVISION = "main"
-DEFAULT_SOMA_TASKS_DATASET_REFRESH_SECONDS = 300.0
-DEFAULT_SOMA_TASKS_DATASET_TIMEOUT_SECONDS = 60.0
-# Only needed to read the dataset while it is still private, which a host with runs to
-# execute never has to do.
-SOMA_TASKS_HF_TOKEN_ENVS = ("HUGGINGFACE_TOKEN", "HF_TOKEN")
+SWE_EXEC_ASSET_NAMES = ("swe_exec_broker.py", "swe-exec")
 SOMA_TASK_DIND_PREBAKED_REPO_ENV = "SOMA_TASK_DIND_PREBAKED_REPO"
 # Docker Hub repo the pre-baked dind image of a SOMA task is pulled from. Without
 # this, SOMA-benchmark derives the repo from the task row's own env image reference,
 # which points at the build-time repo rather than the one the competition serves.
 DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO = "dendritexhq/soma-competition-tasks-dind"
-# Default location of the SOMA task rows inside the checkout, resolved from this file
-# rather than the cwd. The file is provisioned onto sandbox hosts rather than committed
-# (it carries the hidden tasks' problem statements) - see
-# docs/ops/soma-task-provisioning.md.
-DEFAULT_SOMA_TASKS_FILE = Path(__file__).resolve().parents[2] / "tasks" / "soma_tasks.jsonl"
-COMPACT_BENCH_DEFAULT_OUTPUT_RETENTION_SECONDS = 24 * 60 * 60
-COMPACT_BENCH_DEFAULT_OUTPUT_CLEANUP_INTERVAL_SECONDS = 5 * 60
 
 
-def _slug(value: str, *, default: str) -> str:
-    sanitized = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in value.lower())
-    sanitized = sanitized.strip("-._")
-    return sanitized or default
+class UnsupportedAgentError(ValueError):
+    """The request names a backend this sandbox no longer runs."""
+
+
+@dataclass(slots=True)
+class CompactBenchExecutionOutput:
+    report: CompactBenchReportRequest
+    patch_text: str
 
 
 def _token_count(value: Any) -> int | None:
@@ -158,173 +105,8 @@ def _step_count(value: Any) -> int | None:
     return None
 
 
-def _coerce_positive_int(value: Any, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _coerce_positive_float(value: Any, default: float) -> float:
-    if value is None:
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _run_command(
-    args: list[str],
-    *,
-    env: dict[str, str] | None = None,
-    cwd: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-        cwd=str(cwd) if cwd is not None else None,
-    )
-
-
-def _docker_container_running(name: str) -> bool:
-    result = _run_command(["docker", "inspect", "-f", "{{.State.Running}}", name])
-    return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
-
-
-def _docker_network_exists(name: str) -> bool:
-    result = _run_command(["docker", "network", "inspect", name])
-    return result.returncode == 0
-
-
-def _ensure_docker_network(name: str, *, internal: bool) -> None:
-    if _docker_network_exists(name):
-        return
-    args = ["docker", "network", "create"]
-    if internal:
-        args.append("--internal")
-    args.append(name)
-    result = _run_command(args)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to create Docker network {name!r}: {(result.stderr or result.stdout or '').strip()}"
-        )
-
-
-def _docker_connect_network(name: str, container_name: str, *, alias: str | None = None) -> None:
-    args = ["docker", "network", "connect"]
-    if alias:
-        args.extend(["--alias", alias])
-    args.extend([name, container_name])
-    result = _run_command(args)
-    if result.returncode == 0:
-        return
-    message = (result.stderr or result.stdout or "").strip().lower()
-    if "already exists" in message or "already connected" in message or "endpoint with name" in message:
-        return
-    raise RuntimeError(
-        f"Failed to connect container {container_name!r} to Docker network {name!r}: "
-        f"{(result.stderr or result.stdout or '').strip()}"
-    )
-
-
-def _docker_remove_network(name: str) -> None:
-    _run_command(["docker", "network", "rm", name])
-
-
-def _docker_image_exists(name: str) -> bool:
-    result = _run_command(["docker", "image", "inspect", name])
-    return result.returncode == 0
-
-
-def _resolve_compression_service_context() -> Path:
-    configured = os.getenv("COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT", "").strip()
-    if configured:
-        path = Path(configured).expanduser().resolve()
-        if not path.is_dir():
-            raise RuntimeError(f"Compression service build context not found: {path}")
-        return path
-
-    candidates: list[Path] = []
-
-    # Preferred source of truth: SOMA-benchmark compression service (contains proxy + transform).
-    try:
-        import soma_bench  # type: ignore
-
-        candidates.append((Path(soma_bench.__file__).resolve().parents[1] / COMPRESSION_SERVICE_CONTEXT_DIRNAME).resolve())
-    except Exception:  # noqa: BLE001
-        pass
-
-    workspace_root = Path(__file__).resolve().parents[3]
-    candidates.append((workspace_root / "SOMA-benchmark" / "src" / COMPRESSION_SERVICE_CONTEXT_DIRNAME).resolve())
-    # Legacy fallback for local-only development setups.
-    candidates.append((Path(__file__).resolve().parents[1] / COMPRESSION_SERVICE_CONTEXT_DIRNAME).resolve())
-
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-
-    searched = ", ".join(str(path) for path in candidates)
-    raise RuntimeError(
-        "Compression service build context not found. "
-        "Set COMPACT_BENCH_COMPRESSION_SERVICE_CONTEXT explicitly. "
-        f"Checked: {searched}"
-    )
-
-
 def _get_compression_service_image_name() -> str:
     return os.getenv("COMPACT_BENCH_COMPRESSION_SERVICE_IMAGE", COMPRESSION_SERVICE_IMAGE_NAME).strip() or COMPRESSION_SERVICE_IMAGE_NAME
-
-
-def _build_compression_service_image() -> None:
-    image_name = _get_compression_service_image_name()
-    if _docker_image_exists(image_name):
-        logger.info("Compression service image already exists: %s", image_name)
-        return
-    context_path = _resolve_compression_service_context()
-    logger.info(
-        "Building compression service Docker image: name=%s context=%s",
-        image_name,
-        context_path,
-    )
-    result = _run_command(["docker", "build", "-t", image_name, str(context_path)])
-    if result.returncode != 0:
-        message = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"Failed to build compression service Docker image {image_name!r}: {message}")
-    if not _docker_image_exists(image_name):
-        raise RuntimeError(f"Compression service Docker image not found after build: {image_name}")
-    logger.info("Compression service Docker image built successfully: %s", image_name)
-
-
-def _build_proxy_container_name() -> str:
-    return "soma-benchmark-nginx"
-
-
-def _env_flag_enabled(name: str, *, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _resolve_copilot_shared_proxy_enabled() -> bool:
-    return _env_flag_enabled("COMPACT_BENCH_COPILOT_SHARED_PROXY", default=False)
-
-
-def _resolve_debug_preserve_outputs_enabled() -> bool:
-    return _env_flag_enabled(COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV, default=False)
-
-
-def _resolve_copilot_shared_compose_project() -> str:
-    value = os.getenv("COMPACT_BENCH_COPILOT_COMPOSE_PROJECT", COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT).strip()
-    return value or COPILOT_SHARED_COMPOSE_PROJECT_DEFAULT
 
 
 def _resolve_copilot_compose_file() -> Path:
@@ -349,114 +131,35 @@ def _resolve_copilot_compose_file() -> Path:
     return compose_file
 
 
-def _resolve_copilot_compression_url_template() -> str:
-    value = os.getenv("COMPACT_BENCH_COPILOT_COMPRESSION_URL_TEMPLATE", "").strip()
-    if value:
-        return value
-    return COPILOT_COMPRESSION_URL_TEMPLATE_DEFAULT
+def stage_swe_exec_assets() -> Path:
+    """Copy soma_bench's SWE exec broker script and client to a host-visible directory.
 
-
-def _resolve_copilot_shared_proxy_bind_host() -> str:
-    value = os.getenv("COMPACT_BENCH_COPILOT_PROXY_BIND_HOST", "").strip()
-    return value or COPILOT_SHARED_PROXY_BIND_HOST_DEFAULT
-
-
-def _resolve_copilot_shared_proxy_bind_port() -> int:
-    raw = os.getenv("COMPACT_BENCH_COPILOT_PROXY_BIND_PORT", "").strip()
-    if raw:
-        try:
-            value = int(raw)
-            if value > 0:
-                return value
-        except ValueError:
-            pass
-    return COPILOT_SHARED_PROXY_BIND_PORT_DEFAULT
-
-
-def _resolve_copilot_shared_proxy_host_alias() -> str:
-    value = os.getenv("COMPACT_BENCH_COPILOT_PROXY_HOST_ALIAS", "").strip()
-    return value or COPILOT_SHARED_PROXY_HOST_ALIAS_DEFAULT
-
-
-def _resolve_copilot_sandbox_network_name(*, compose_project: str) -> str:
-    return f"{compose_project}_copilot-sandbox"
-
-
-def _resolve_copilot_compression_container_name(*, run_id: int) -> str:
-    return f"compression-run-{run_id}"
-
-
-def _resolve_private_network_name() -> str:
-    return os.getenv("COMPACT_BENCH_PRIVATE_NETWORK_NAME", "soma-benchmark-private").strip() or "soma-benchmark-private"
-
-
-def _normalize_proxy_upstream_base_url(value: str) -> str:
-    parsed = urlsplit(value)
-    if not parsed.scheme or not parsed.netloc:
-        raise RuntimeError("COMPACT_BENCH_LLM_BASE_URL must be an absolute http(s) URL")
-    path = parsed.path or "/"
-    if not path.endswith("/"):
-        path = f"{path}/"
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
-
-
-def _build_nginx_config(*, upstream_base_url: str, listen_port: int) -> str:
-    connect_timeout = os.getenv("COMPACT_BENCH_NGINX_PROXY_CONNECT_TIMEOUT_SECONDS", "30").strip() or "30"
-    send_timeout = os.getenv("COMPACT_BENCH_NGINX_PROXY_SEND_TIMEOUT_SECONDS", "1800").strip() or "1800"
-    read_timeout = os.getenv("COMPACT_BENCH_NGINX_PROXY_READ_TIMEOUT_SECONDS", "1800").strip() or "1800"
-    keepalive_timeout = os.getenv("COMPACT_BENCH_NGINX_PROXY_KEEPALIVE_TIMEOUT_SECONDS", "75").strip() or "75"
-    return "\n".join(
-        [
-            "events {}",
-            "http {",
-            f"  keepalive_timeout {keepalive_timeout}s;",
-            "  server {",
-            f"    listen {listen_port};",
-            "    location / {",
-            f"      proxy_pass {upstream_base_url};",
-            "      proxy_http_version 1.1;",
-            "      proxy_socket_keepalive on;",
-            f"      proxy_connect_timeout {connect_timeout}s;",
-            f"      proxy_send_timeout {send_timeout}s;",
-            f"      proxy_read_timeout {read_timeout}s;",
-            f"      send_timeout {send_timeout}s;",
-            "      proxy_set_header Connection \"\";",
-            "      proxy_set_header Host $proxy_host;",
-            "      proxy_set_header X-Run-Id $http_x_run_id;",
-            "      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-            "      proxy_set_header X-Forwarded-Proto $scheme;",
-            "    }",
-            "  }",
-            "}",
-            "",
-        ]
-    )
-
-
-def _resolve_benchmark_package_spec() -> str:
-    return (
-        os.getenv("COMPACT_BENCH_BENCHMARK_PACKAGE_SPEC", DEFAULT_BENCHMARK_PACKAGE_SPEC).strip()
-        or DEFAULT_BENCHMARK_PACKAGE_SPEC
-    )
-
-
-def _resolve_plugin_repository_url() -> str:
-    return (
-        os.getenv("COMPACT_BENCH_PLUGIN_REPOSITORY_URL", DEFAULT_PLUGIN_REPOSITORY_URL).strip()
-        or DEFAULT_PLUGIN_REPOSITORY_URL
-    )
-
-
-def _python_module_available(python_executable: str, module_name: str) -> bool:
-    result = _run_command(
-        [
-            python_executable,
-            "-c",
-            "import importlib.util, sys; raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) else 1)",
-            module_name,
-        ]
-    )
-    return result.returncode == 0
+    soma_bench bind-mounts both into the run's containers. From a runner container its
+    own package directory exists only inside the image, so the daemon would find nothing
+    at that path on the host. The copy is keyed by content, so concurrent runners of the
+    same version share one directory and a new version never overwrites one in use.
+    """
+    compose_dir = _resolve_copilot_compose_file().parent
+    sources = [compose_dir / name for name in SWE_EXEC_ASSET_NAMES]
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(source.name.encode())
+        digest.update(source.read_bytes())
+    target = settings.assets_dir() / f"swe-exec-{digest.hexdigest()[:16]}"
+    if all((target / source.name).is_file() for source in sources):
+        return target
+    staging = target.with_name(f".{target.name}.{os.getpid()}")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    for source in sources:
+        shutil.copy2(source, staging / source.name)
+    (staging / "swe-exec").chmod(0o755)
+    try:
+        staging.rename(target)
+    except OSError:
+        # Another runner staged the same content first.
+        shutil.rmtree(staging, ignore_errors=True)
+    return target
 
 
 def _download_miner_code(script_presigned_url: str) -> str:
@@ -598,7 +301,7 @@ def _upload_run_artifact(*, presigned_url: str, artifact_file: Path) -> None:
         )
 
 
-def _get_agent_timeout_grace_seconds() -> float:
+def get_agent_timeout_grace_seconds() -> float:
     raw_grace = os.getenv("COMPACT_BENCH_AGENT_TIMEOUT_GRACE_SECONDS", "120").strip()
     try:
         grace_seconds = float(raw_grace)
@@ -607,568 +310,12 @@ def _get_agent_timeout_grace_seconds() -> float:
     return max(0.0, grace_seconds)
 
 
-def _copy_plugin_template_checkout(*, template_path: Path, plugin_path: Path) -> None:
-    """Deprecated: use CompactBenchExecutor._write_plugin_template() instead."""
-    for child in template_path.iterdir():
-        if child.name in PLUGIN_COPY_IGNORE_NAMES:
-            continue
-        destination = plugin_path / child.name
-        if child.is_dir():
-            shutil.copytree(child, destination)
-        else:
-            shutil.copy2(child, destination)
-
-
-def _resolve_tiktoken_cl100k_asset_path() -> Path | None:
-    search_roots = [
-        Path.home() / ".vscode-server" / "cli" / "servers",
-        Path("/root/.vscode-server/cli/servers"),
-    ]
-    candidates: list[Path] = []
-    for root in search_roots:
-        if not root.is_dir():
-            continue
-        candidates.extend(root.glob("*/server/extensions/copilot/dist/cl100k_base.tiktoken"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
-
-
-def _download_tiktoken_cl100k_payload() -> bytes:
-    timeout_seconds = _get_miner_download_timeout()
-    with urllib_request.urlopen(TIKTOKEN_CL100K_URL, timeout=timeout_seconds) as response:
-        return response.read()
-
-
-def _seed_tiktoken_cache(plugin_path: Path) -> Path | None:
-    """Deprecated: use CompactBenchExecutor._write_tiktoken_cache() instead."""
-    payload: bytes | None = None
-
-    try:
-        payload = _download_tiktoken_cl100k_payload()
-        logger.info("Downloaded canonical cl100k_base.tiktoken for plugin cache seeding")
-    except Exception as download_error:
-        asset_path = _resolve_tiktoken_cl100k_asset_path()
-        if asset_path is None or not asset_path.is_file():
-            raise RuntimeError(
-                "Unable to download canonical cl100k_base.tiktoken and no local fallback asset was found"
-            ) from download_error
-        payload = asset_path.read_bytes()
-        logger.warning(
-            "Falling back to local cl100k_base.tiktoken asset for plugin cache seeding: %s",
-            asset_path,
-        )
-
-    digest = hashlib.sha256(payload).hexdigest()
-    if digest != TIKTOKEN_CL100K_SHA256:
-        raise RuntimeError(
-            "Canonical cl100k_base.tiktoken hash mismatch: "
-            f"expected {TIKTOKEN_CL100K_SHA256}, got {digest}"
-        )
-
-    cache_dir = plugin_path / TIKTOKEN_CACHE_DIRNAME
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_key = hashlib.sha1(TIKTOKEN_CL100K_URL.encode("utf-8")).hexdigest()
-    cache_path = cache_dir / cache_key
-    cache_path.write_bytes(payload)
-    return cache_path
-
-
-def _resolve_soma_tasks_file() -> Path:
-    configured = (os.getenv(SOMA_TASKS_FILE_ENV) or "").strip()
-    return Path(configured).expanduser() if configured else DEFAULT_SOMA_TASKS_FILE
-
-
-def _resolve_soma_tasks_dataset_cache() -> Path:
-    configured = (os.getenv(SOMA_TASKS_DATASET_CACHE_ENV) or "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    candidate = _resolve_soma_tasks_file().parent / "soma_tasks_dataset.jsonl"
-    if candidate.parent.is_dir():
-        return candidate
-    return Path(tempfile.gettempdir()) / "soma_tasks_dataset.jsonl"
-
-
-def _soma_tasks_dataset_url() -> str:
-    repo = (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip()
-    path = (os.getenv(SOMA_TASKS_DATASET_PATH_ENV) or "").strip() or DEFAULT_SOMA_TASKS_DATASET_PATH
-    revision = (
-        os.getenv(SOMA_TASKS_DATASET_REVISION_ENV) or ""
-    ).strip() or DEFAULT_SOMA_TASKS_DATASET_REVISION
-    return f"https://huggingface.co/datasets/{repo}/resolve/{revision}/{path}"
-
-
-def _download_soma_tasks_dataset() -> str | None:
-    url = _soma_tasks_dataset_url()
-    headers: dict[str, str] = {}
-    for name in SOMA_TASKS_HF_TOKEN_ENVS:
-        token = (os.getenv(name) or "").strip()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-            break
-    timeout = _coerce_positive_float(
-        os.getenv(SOMA_TASKS_DATASET_TIMEOUT_SECONDS_ENV),
-        DEFAULT_SOMA_TASKS_DATASET_TIMEOUT_SECONDS,
-    )
-    try:
-        with urllib_request.urlopen(
-            urllib_request.Request(url, headers=headers), timeout=timeout
-        ) as response:
-            return response.read().decode("utf-8")
-    except urllib_error.HTTPError as exc:
-        # 401/403 on a repository that is still private is the normal state before the
-        # evaluation window opens, not a misconfiguration.
-        logger.warning("SOMA task dataset %s returned HTTP %s", url, exc.code)
-    except (urllib_error.URLError, UnicodeDecodeError, OSError) as exc:
-        logger.warning("SOMA task dataset %s could not be fetched: %s", url, exc)
-    return None
-
-
-def _resolve_soma_task_rows() -> tuple[list[dict], str]:
-    """``(rows, source)`` - the published dataset, then its cache, then a local file.
-
-    A successful download is cached on disk, so a later network failure runs from the
-    last known-good rows rather than from nothing.
-    """
-    from soma_bench.benchmark.soma_tasks import load_task_rows
-
-    if (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip():
-        cache = _resolve_soma_tasks_dataset_cache()
-        text = _download_soma_tasks_dataset()
-        if text is not None:
-            try:
-                cache.parent.mkdir(parents=True, exist_ok=True)
-                cache.write_text(text, encoding="utf-8")
-            except OSError as exc:
-                logger.warning("Could not cache the SOMA task dataset at %s: %s", cache, exc)
-            else:
-                return load_task_rows(cache), f"dataset {_soma_tasks_dataset_url()}"
-            # The rows are usable even when they could not be cached; stage them so
-            # load_task_rows still owns the parsing.
-            with tempfile.NamedTemporaryFile(
-                "w", suffix=".jsonl", delete=False, encoding="utf-8"
-            ) as staged:
-                staged.write(text)
-            try:
-                return load_task_rows(Path(staged.name)), f"dataset {_soma_tasks_dataset_url()}"
-            finally:
-                Path(staged.name).unlink(missing_ok=True)
-
-        if cache.is_file():
-            logger.warning(
-                "Using the cached SOMA task dataset at %s: the download failed", cache
-            )
-            return load_task_rows(cache), f"cache {cache}"
-
-    tasks_file = _resolve_soma_tasks_file()
-    if not tasks_file.is_file():
-        logger.info(
-            "No SOMA task rows on this host: dataset %r is unreachable or unset and there "
-            "is no file at %s, so only Hugging Face benchmarks will resolve (%s names the "
-            "published dataset, %s overrides the file path)",
-            (os.getenv(SOMA_TASKS_DATASET_REPO_ENV) or "").strip() or None,
-            tasks_file,
-            SOMA_TASKS_DATASET_REPO_ENV,
-            SOMA_TASKS_FILE_ENV,
-        )
-        return [], "none"
-    return load_task_rows(tasks_file), f"file {tasks_file}"
-
-
-def _materialize_soma_task_cache() -> dict[str, set[str]]:
-    """Make the SOMA task rows resolvable offline by `benchmark-solve --benchmark`.
-
-    A SOMA task list is not a Hugging Face *dataset* in the shape the runner's dataset
-    path expects: its rows carry their own env/test images and none of their
-    repositories appear in SWE-bench's spec maps. SOMA-benchmark handles that by
-    writing the rows into the same on-disk row cache its runner already prefers over
-    the datasets server, keyed by the benchmark name
-    (`soma_tasks.materialize_task_cache`, exposed as the `benchmark-load-tasks`
-    command). Doing it here means the platform can dispatch a SOMA benchmark name
-    without a separate provisioning step having been run on this host first.
-
-    Rows are grouped by their own `benchmark_name`, so one source can serve several
-    benchmark names. No rows is not an error: a sandbox host that only ever runs
-    SWE-bench Verified has nothing to materialize.
-
-    Returns the instance ids materialized per benchmark name, which is what lets a run
-    for an unknown instance trigger a refresh instead of failing.
-    """
-    from soma_bench.benchmark.soma_tasks import DEFAULT_BENCHMARK_NAME, materialize_task_cache
-
-    rows, source = _resolve_soma_task_rows()
-    if not rows:
-        return {}
-
-    rows_by_benchmark: dict[str, list[dict]] = {}
-    for row in rows:
-        benchmark_name = str(row.get("benchmark_name") or "").strip() or DEFAULT_BENCHMARK_NAME
-        rows_by_benchmark.setdefault(benchmark_name, []).append(row)
-
-    materialized: dict[str, set[str]] = {}
-    with tempfile.TemporaryDirectory(prefix="soma-task-cache-") as staging_dir:
-        for benchmark_name, benchmark_rows in rows_by_benchmark.items():
-            # materialize_task_cache() takes a file, and each benchmark name needs its
-            # own cache entry, so each group is staged as its own single-benchmark file.
-            staged = Path(staging_dir) / f"{_slug(benchmark_name, default='benchmark')}.jsonl"
-            staged.write_text(
-                "".join(json.dumps(row, ensure_ascii=True) + "\n" for row in benchmark_rows),
-                encoding="utf-8",
-            )
-            materialize_task_cache(tasks_path=staged, benchmark_name=benchmark_name)
-            materialized[benchmark_name] = {
-                str(row.get("instance_id") or "").strip()
-                for row in benchmark_rows
-                if str(row.get("instance_id") or "").strip()
-            }
-
-    logger.info(
-        "Materialized SOMA task row cache from %s: %s",
-        source,
-        {name: len(ids) for name, ids in materialized.items()},
-    )
-    return materialized
-
-
 class CompactBenchExecutor:
-    """Runs benchmark solve commands and captures produced patches."""
+    """Runs one benchmark solve command and captures the produced patch."""
 
-    def __init__(
-        self,
-        *,
-        python_executable: str | None = None,
-        output_root: str | Path | None = None,
-    ):
-        default_output_root = Path("/tmp") / "soma-benchmark-service"
+    def __init__(self, *, python_executable: str | None = None):
         self._python_executable = python_executable or os.getenv("COMPACT_BENCH_PYTHON_EXECUTABLE") or sys.executable
-        self._output_root = Path(output_root or os.getenv("COMPACT_BENCH_OUTPUT_ROOT") or default_output_root).expanduser().resolve()
-        self._llm_proxy_handle: NginxProxyHandle | None = None
-        self._llm_proxy_lock = threading.Lock()
-        self._output_cleanup_lock = threading.Lock()
-        self._last_output_cleanup_monotonic = 0.0
-        self._last_copilot_cleanup_monotonic = 0.0
-        run_root = os.getenv("SOMA_COPILOT_RUN_ROOT") or os.getenv("SOMA_COPILOT_TMP_ROOT")
-        self._copilot_run_root = Path(run_root.strip() if run_root and run_root.strip() else
-                                      Path(tempfile.gettempdir()) / "soma-benchmark-copilot-runs").expanduser().resolve()
-        # Keep locks outside the bounded run tmpfs, which may already be full.
-        root_key = hashlib.sha256(str(self._copilot_run_root).encode()).hexdigest()[:16]
-        self._copilot_lock_root = Path(tempfile.gettempdir()) / "soma-copilot-run-locks" / root_key
-        self._copilot_lock_root.mkdir(parents=True, exist_ok=True)
-        self._benchmark_package_spec = _resolve_benchmark_package_spec()
-        self._plugin_repository_url = _resolve_plugin_repository_url()
-        self._copilot_shared_proxy_enabled = _resolve_copilot_shared_proxy_enabled()
-        self._copilot_compose_project = _resolve_copilot_shared_compose_project()
-        self._copilot_compose_file: Path | None = None
-        self._copilot_compression_url_template = _resolve_copilot_compression_url_template()
-        self._copilot_shared_proxy_bind_host = _resolve_copilot_shared_proxy_bind_host()
-        self._copilot_shared_proxy_bind_port = _resolve_copilot_shared_proxy_bind_port()
-        self._copilot_shared_proxy_host_alias = _resolve_copilot_shared_proxy_host_alias()
-        self._debug_preserve_outputs = _resolve_debug_preserve_outputs_enabled()
-        self._output_root.mkdir(parents=True, exist_ok=True)
-        if self._debug_preserve_outputs:
-            logger.warning(
-                "Debug preserve outputs enabled via %s=true: output directories will not be deleted automatically",
-                COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS_ENV,
-            )
-        self._maybe_cleanup_stale_output_dirs(force=True)
-
-        # self._ensure_benchmark_installed()
-        _build_compression_service_image()
-
-        if importlib.util.find_spec("soma_bench") is None:
-            raise RuntimeError(
-                "The 'soma_bench' package is not installed in the sandbox-service environment. "
-                "Install dependencies from requirements.txt before starting the service."
-            )
-
-        self._preload_plugin_template()
-        self._preload_tiktoken_cache()
-        self._soma_task_cache_lock = threading.Lock()
-        # None, not "now": the start-up load does not start the refresh clock. A host
-        # that booted while the dataset was still private has no rows at all, and
-        # making it wait out a refresh interval before its first look would fail every
-        # SOMA run dispatched in that window. See _ensure_soma_task_row.
-        self._soma_task_cache_refreshed_at: float | None = None
-        self._soma_task_benchmarks = self._preload_soma_task_cache()
-        self._ensure_copilot_shared_proxy_stack()
-
-    def _preload_soma_task_cache(self) -> dict[str, set[str]]:
-        """Materialize the SOMA task rows once, at start, rather than per run.
-
-        A failure here must not stop the service: SWE-bench Verified runs do not
-        depend on it, and a SOMA run that finds no cached row fails on its own with a
-        clear "instance not found in benchmark" error from the runner.
-        """
-        try:
-            return _materialize_soma_task_cache()
-        except Exception:
-            logger.exception(
-                "Failed to materialize the SOMA task row cache; SOMA task runs will not "
-                "resolve on this host until it is fixed"
-            )
-            return {}
-
-    def _ensure_soma_task_row(self, *, benchmark: str, instance_id: str) -> None:
-        """Re-materialize the row cache for a SOMA task this host has never seen.
-
-        Tasks are imported and published while a competition is already running, so
-        the set materialized at start-up goes out of date. Without this the only cure
-        is restarting every sandbox host, and until then those runs fail with
-        "instance not found" for a reason the miner had no part in.
-
-        Rate-limited to one refresh per SOMA_TASKS_DATASET_REFRESH_SECONDS, and a
-        refresh that still does not know the instance is left to fail in the runner:
-        the instance may simply not be published yet.
-        """
-        from soma_bench.benchmark.swebench_images import is_swebench_benchmark
-
-        name = str(benchmark or "").strip()
-        instance = str(instance_id or "").strip()
-        if not name or not instance:
-            return
-        # SWE-bench instances resolve from a public Hugging Face dataset and are never
-        # in this cache, so a miss there means nothing. Asked of SOMA-benchmark rather
-        # than pattern-matched here, so the runner and this host cannot disagree about
-        # which benchmark a name refers to.
-        if is_swebench_benchmark(name):
-            return
-        if instance in self._soma_task_benchmarks.get(name, frozenset()):
-            return
-
-        interval = _coerce_positive_float(
-            os.getenv(SOMA_TASKS_DATASET_REFRESH_SECONDS_ENV),
-            DEFAULT_SOMA_TASKS_DATASET_REFRESH_SECONDS,
-        )
-        with self._soma_task_cache_lock:
-            if instance in self._soma_task_benchmarks.get(name, frozenset()):
-                return
-            refreshed_at = self._soma_task_cache_refreshed_at
-            # The first look is always allowed; the interval only rate-limits the ones
-            # after it, so an unreachable dataset costs one download attempt per
-            # interval rather than one per dispatched run.
-            if refreshed_at is not None and time.monotonic() - refreshed_at < interval:
-                return
-            logger.info(
-                "SOMA task row cache does not know benchmark=%s instance_id=%s; refreshing",
-                name,
-                instance,
-            )
-            self._soma_task_cache_refreshed_at = time.monotonic()
-            self._soma_task_benchmarks = self._preload_soma_task_cache()
-
-    def _ensure_copilot_shared_proxy_stack(self) -> None:
-        if not self._copilot_shared_proxy_enabled:
-            logger.info("Copilot shared proxy disabled via COMPACT_BENCH_COPILOT_SHARED_PROXY")
-            return
-
-        compose_file = _resolve_copilot_compose_file()
-        compression_image = _get_compression_service_image_name()
-        env = os.environ.copy()
-        env["COMPOSE_PROFILES"] = "copilot-sidecars"
-        env["PROXY_COMPRESSION_BASE_URL_TEMPLATE"] = self._copilot_compression_url_template
-        env["PROXY_COMPRESSION_ENABLED"] = "true"
-        env["COPILOT_PROXY_IMAGE"] = compression_image
-        env["COPILOT_COMPRESSION_SERVICE_IMAGE"] = compression_image
-        env["COPILOT_PROXY_BIND_HOST"] = self._copilot_shared_proxy_bind_host
-        env["COPILOT_PROXY_BIND_PORT"] = str(self._copilot_shared_proxy_bind_port)
-        logger.info(
-            "Ensuring shared Copilot proxy stack: compose_file=%s project=%s image=%s bind=%s:%s",
-            compose_file,
-            self._copilot_compose_project,
-            compression_image,
-            self._copilot_shared_proxy_bind_host,
-            self._copilot_shared_proxy_bind_port,
-        )
-        result = _run_command(
-            [
-                "docker",
-                "compose",
-                "-f",
-                str(compose_file),
-                "--project-name",
-                self._copilot_compose_project,
-                "up",
-                "-d",
-                "proxy",
-            ],
-            env=env,
-        )
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(f"Failed to ensure shared Copilot proxy stack: {message}")
-        self._copilot_compose_file = compose_file
-
-    def _start_copilot_run_compression_service(
-        self,
-        *,
-        run_id: int,
-        miner_module_path: Path,
-    ) -> CopilotCompressionHandle:
-        if not self._copilot_shared_proxy_enabled:
-            raise RuntimeError("Per-run Copilot compression container requires shared Copilot proxy to be enabled")
-
-        image_name = _get_compression_service_image_name()
-        if not _docker_image_exists(image_name):
-            raise RuntimeError(
-                f"Compression service Docker image not found: {image_name}. "
-                "Build it first or set COMPACT_BENCH_COMPRESSION_SERVICE_IMAGE."
-            )
-
-        network_name = _resolve_copilot_sandbox_network_name(compose_project=self._copilot_compose_project)
-        container_name = _resolve_copilot_compression_container_name(run_id=run_id)
-        miner_module_path = miner_module_path.resolve()
-        if not miner_module_path.is_file():
-            raise RuntimeError(f"Missing miner module for compression container: {miner_module_path}")
-
-        _run_command(["docker", "rm", "-f", "-v", container_name])
-
-        run_result = _run_command(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                container_name,
-                "--network",
-                network_name,
-                "--network-alias",
-                container_name,
-                "-e",
-                "MINER_MODULE_PATH=/app/miner/base_miner.py",
-                "-e",
-                "COMPRESSION_MUTATE_REQUEST=true",
-                "-v",
-                f"{miner_module_path}:/app/miner/base_miner.py:ro",
-                image_name,
-            ]
-        )
-        if run_result.returncode != 0:
-            message = (run_result.stderr or run_result.stdout or "").strip()
-            raise RuntimeError(
-                f"Failed to start per-run compression container {container_name!r}: {message}"
-            )
-
-        logger.info(
-            "Per-run Copilot compression container started: run_id=%s container=%s network=%s",
-            run_id,
-            container_name,
-            network_name,
-        )
-        return CopilotCompressionHandle(container_name=container_name, run_id=run_id)
-
-    def _stop_copilot_run_compression_service(self, handle: CopilotCompressionHandle) -> None:
-        _run_command(["docker", "rm", "-f", "-v", handle.container_name])
-        logger.info(
-            "Per-run Copilot compression container stopped: run_id=%s container=%s",
-            handle.run_id,
-            handle.container_name,
-        )
-
-    def _preload_plugin_template(self) -> None:
-        template = self._ensure_plugin_template_checkout()
-        self._plugin_template_cache: dict[str, bytes] = {}
-        total_bytes = 0
-        for f in template.rglob("*"):
-            if not f.is_file():
-                continue
-            rel = f.relative_to(template)
-            if any(part in PLUGIN_COPY_IGNORE_NAMES for part in rel.parts):
-                continue
-            data = f.read_bytes()
-            self._plugin_template_cache[str(rel)] = data
-            total_bytes += len(data)
-        logger.info(
-            "Preloaded plugin template into memory: files=%s total_bytes=%s",
-            len(self._plugin_template_cache),
-            total_bytes,
-        )
-
-    def _preload_tiktoken_cache(self) -> None:
-        payload: bytes | None = None
-
-        try:
-            payload = _download_tiktoken_cl100k_payload()
-            logger.info("Downloaded canonical cl100k_base.tiktoken for plugin cache seeding")
-        except Exception as download_error:
-            asset_path = _resolve_tiktoken_cl100k_asset_path()
-            if asset_path is None or not asset_path.is_file():
-                raise RuntimeError(
-                    "Unable to download canonical cl100k_base.tiktoken and no local fallback asset was found"
-                ) from download_error
-            payload = asset_path.read_bytes()
-            logger.warning(
-                "Falling back to local cl100k_base.tiktoken asset for plugin cache seeding: %s",
-                asset_path,
-            )
-
-        digest = hashlib.sha256(payload).hexdigest()
-        if digest != TIKTOKEN_CL100K_SHA256:
-            raise RuntimeError(
-                "Canonical cl100k_base.tiktoken hash mismatch: "
-                f"expected {TIKTOKEN_CL100K_SHA256}, got {digest}"
-            )
-
-        self._tiktoken_payload: bytes = payload
-
-    def _write_tiktoken_cache(self, plugin_path: Path) -> Path | None:
-        cache_dir = plugin_path / TIKTOKEN_CACHE_DIRNAME
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_key = hashlib.sha1(TIKTOKEN_CL100K_URL.encode("utf-8")).hexdigest()
-        cache_path = cache_dir / cache_key
-        cache_path.write_bytes(self._tiktoken_payload)
-        return cache_path
-
-    def _maybe_cleanup_stale_output_dirs(self, *, force: bool = False) -> None:
-        if self._debug_preserve_outputs:
-            return
-
-        retention_seconds = _coerce_positive_int(
-            os.getenv(COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV),
-            COMPACT_BENCH_DEFAULT_OUTPUT_RETENTION_SECONDS,
-        )
-        cleanup_interval_seconds = _coerce_positive_int(
-            os.getenv(COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS_ENV),
-            COMPACT_BENCH_DEFAULT_OUTPUT_CLEANUP_INTERVAL_SECONDS,
-        )
-
-        now_monotonic = time.monotonic()
-        with self._output_cleanup_lock:
-            if not force and now_monotonic - self._last_output_cleanup_monotonic < cleanup_interval_seconds:
-                return
-            self._last_output_cleanup_monotonic = now_monotonic
-
-        cutoff_epoch = time.time() - retention_seconds
-        removed_count = 0
-        keep_names = {"repo-cache"}
-        keep_files = {"llm-proxy.nginx.conf"}
-        self._output_root.mkdir(parents=True, exist_ok=True)
-        for candidate in self._output_root.iterdir():
-            if candidate.name in keep_names:
-                continue
-            if candidate.name in keep_files and candidate.is_file():
-                continue
-            if not candidate.is_dir():
-                continue
-
-            try:
-                modified_epoch = candidate.stat().st_mtime
-            except OSError:
-                continue
-            if modified_epoch >= cutoff_epoch:
-                continue
-
-            shutil.rmtree(candidate, ignore_errors=True)
-            if not candidate.exists():
-                removed_count += 1
-
-        if removed_count > 0:
-            logger.info(
-                "Removed stale benchmark output directories: output_root=%s removed_count=%s retention_seconds=%s",
-                self._output_root,
-                removed_count,
-                retention_seconds,
-            )
+        self._copilot_compose_file = _resolve_copilot_compose_file()
 
     @staticmethod
     def _run_benchmark_command(
@@ -1188,90 +335,14 @@ class CompactBenchExecutor:
                 raise
             return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
-    @staticmethod
-    def _remove_run_directory(path: Path) -> None:
-        try:
-            shutil.rmtree(path)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            logger.warning("Could not remove Copilot run directory: path=%s", path, exc_info=True)
-
-    def _copilot_run_lock_path(self, name: str) -> Path:
-        # A fixed set of lock files avoids accumulating one inode per historical run.
-        bucket = int(hashlib.sha256(name.encode()).hexdigest()[:8], 16) % 4096
-        return self._copilot_lock_root / str(bucket)
-
-    def _maybe_cleanup_stale_copilot_dirs(self) -> None:
-        if self._debug_preserve_outputs:
-            return
-        interval = _coerce_positive_int(
-            os.getenv(COMPACT_BENCH_OUTPUT_CLEANUP_INTERVAL_SECONDS_ENV),
-            COMPACT_BENCH_DEFAULT_OUTPUT_CLEANUP_INTERVAL_SECONDS,
-        )
-        with self._output_cleanup_lock:
-            now = time.monotonic()
-            if now - self._last_copilot_cleanup_monotonic < interval:
-                return
-            self._last_copilot_cleanup_monotonic = now
-        retention = _coerce_positive_int(
-            os.getenv(COMPACT_BENCH_OUTPUT_RETENTION_SECONDS_ENV),
-            COMPACT_BENCH_DEFAULT_OUTPUT_RETENTION_SECONDS,
-        )
-        cutoff = time.time() - retention
-        if not self._copilot_run_root.is_dir():
-            return
-        for candidate in self._copilot_run_root.iterdir():
-            if not candidate.name.startswith("run-") or candidate.is_symlink() or not candidate.is_dir():
-                continue
-            try:
-                # Never unlink lock files: all workers must lock the same inode.
-                with self._copilot_run_lock_path(candidate.name).open("a") as lock:
-                    try:
-                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        continue
-                    if candidate.stat().st_mtime < cutoff:
-                        self._remove_run_directory(candidate)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                logger.warning("Could not sweep Copilot run directory: path=%s", candidate, exc_info=True)
-
-    def execute_task(
-        self,
-        *,
-        batch_id: str,
-        task: CompactBenchRunTaskRequest,
-        timeout_per_task: float | None,
-    ) -> CompactBenchExecutionOutput:
-        if task.agent_name == "openclaw":
-            return self._execute_task(batch_id=batch_id, task=task, timeout_per_task=timeout_per_task)
-        run_dir = self._copilot_run_root / f"run-{task.run_id}"
-        with self._copilot_run_lock_path(run_dir.name).open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                self._maybe_cleanup_stale_copilot_dirs()
-                return self._execute_task(batch_id=batch_id, task=task, timeout_per_task=timeout_per_task)
-            finally:
-                if not self._debug_preserve_outputs:
-                    self._remove_run_directory(run_dir)
-
-    def _execute_task(
-        self,
-        *,
-        batch_id: str,
-        task: CompactBenchRunTaskRequest,
-        timeout_per_task: float | None,
-    ) -> CompactBenchExecutionOutput:
-        self._maybe_cleanup_stale_output_dirs()
-        self._ensure_soma_task_row(
-            benchmark=str(task.benchmark or ""), instance_id=str(task.instance_id or "")
-        )
-        output_dir = self._output_root / _slug(batch_id, default="batch") / _slug(
-            f"{task.instance_id}-{uuid.uuid4().hex[:8]}",
-            default="task",
-        )
+    def execute_task(self, *, task: CompactBenchRunTaskRequest) -> CompactBenchExecutionOutput:
+        if task.agent_name != SUPPORTED_AGENT_NAME:
+            raise UnsupportedAgentError(
+                f"agent_name={task.agent_name!r} is not supported; this sandbox only runs "
+                f"{SUPPORTED_AGENT_NAME!r}"
+            )
+        run_dir = settings.run_work_dir(task.run_id)
+        output_dir = run_dir / "sandbox-output"
         output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
             "Benchmark executor preparing run: run_id=%s benchmark=%s instance_id=%s output_dir=%s",
@@ -1281,414 +352,96 @@ class CompactBenchExecutor:
             output_dir,
         )
 
+        # In the run's own directory on the host's tmpfs, so the compressor never lands
+        # on persistent disk and is removed with the run.
+        miner_module_path = self._materialize_copilot_miner_module(
+            output_dir=output_dir,
+            script_presigned_url=task.script_presigned_url,
+        )
+        logger.info(
+            "Copilot miner module prepared: run_id=%s miner_module_path=%s",
+            task.run_id,
+            miner_module_path,
+        )
+        effective_timeout = task.openclaw_timeout
+        agent_timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
+        # The copilot backend enforces the agent timeout itself (via
+        # SOMA_COPILOT_AGENT_TIMEOUT_SECONDS below) and needs extra time afterwards
+        # to collect proxy token usage and write the result row to output.jsonl;
+        # the outer kill is a backstop and must not race that graceful shutdown.
+        timeout = agent_timeout + get_agent_timeout_grace_seconds() if agent_timeout is not None else None
+
+        command = self._build_command(task=task, output_dir=output_dir)
+        env = self._build_benchmark_env(
+            task=task,
+            agent_timeout=agent_timeout,
+            miner_module_path=miner_module_path,
+        )
+
+        started_at = time.monotonic()
+        logger.info(
+            "Starting benchmark solve command: run_id=%s timeout_seconds=%s command=%s",
+            task.run_id,
+            timeout,
+            shlex.join(command),
+        )
         try:
-            plugin_path: Path | None = None
-            miner_module_path: Path | None = None
-            if task.agent_name == "openclaw":
-                plugin_path = self._materialize_plugin_checkout(
-                    output_dir=output_dir,
-                    script_presigned_url=task.script_presigned_url,
-                )
-                logger.info(
-                    "Benchmark plugin prepared: run_id=%s plugin_path=%s",
-                    task.run_id,
-                    plugin_path,
-                )
-            else:
-                miner_module_path = self._materialize_copilot_miner_module(
-                    output_dir=output_dir,
-                    script_presigned_url=task.script_presigned_url,
-                )
-                logger.info(
-                    "Copilot miner module prepared: run_id=%s miner_module_path=%s",
-                    task.run_id,
-                    miner_module_path,
-                )
-            effective_timeout = task.openclaw_timeout if task.openclaw_timeout is not None else timeout_per_task
-            agent_timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
-            openclaw_agent_timeout_seconds = int(agent_timeout) if agent_timeout is not None else None
-            timeout = agent_timeout
-            if agent_timeout is not None and task.agent_name != "openclaw":
-                # The copilot backend enforces the agent timeout itself (via
-                # SOMA_COPILOT_AGENT_TIMEOUT_SECONDS below) and needs extra time afterwards
-                # to collect proxy token usage and write the result row to output.jsonl;
-                # the outer kill is a backstop and must not race that graceful shutdown.
-                timeout = agent_timeout + _get_agent_timeout_grace_seconds()
-
-            command = self._build_command(
-                task=task,
-                output_dir=output_dir,
-                plugin_path=plugin_path,
-                openclaw_agent_timeout_seconds=openclaw_agent_timeout_seconds,
-            )
-            env = os.environ.copy()
-            if task.agent_name != "openclaw":
-                env["SOMA_COPILOT_RUN_ID"] = str(task.run_id)
-                env["SOMA_COPILOT_RUN_ROOT"] = str(self._copilot_run_root)
-                # The host owns directory cleanup and checks active-run locks.
-                env["SOMA_COPILOT_PRESERVE_RUN_DIRS"] = "true"
-            if agent_timeout is not None and task.agent_name != "openclaw":
-                env["SOMA_COPILOT_AGENT_TIMEOUT_SECONDS"] = str(int(agent_timeout))
-            copilot_compression_handle: CopilotCompressionHandle | None = None
-            llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
-            proxy_handle: NginxProxyHandle | None = None
-            if llm_base_url:
-                if task.agent_name == "openclaw":
-                    logger.info(
-                        "Ensuring benchmark LLM proxy: run_id=%s upstream_host=%s",
-                        task.run_id,
-                        urlsplit(llm_base_url).netloc,
-                    )
-                    proxy_handle = self._ensure_llm_proxy(llm_base_url)
-                    env["LLM_BASE_URL"] = proxy_handle.proxy_base_url
-                    env["SOMA_OPENCLAW_PRIVATE_NETWORK_NAME"] = proxy_handle.private_network_name
-                    logger.info(
-                        "Benchmark LLM proxy ready: run_id=%s proxy_base_url=%s private_network=%s",
-                        task.run_id,
-                        proxy_handle.proxy_base_url,
-                        proxy_handle.private_network_name,
-                    )
-                else:
-                    # Copilot per-run mode: backend starts compose sidecars (proxy + compression-service)
-                    # inside one isolated run network, with proxy as the only egress path to gateway.
-                    env["LLM_BASE_URL"] = llm_base_url
-                    env.pop("SOMA_OPENCLAW_PRIVATE_NETWORK_NAME", None)
-                    env["SOMA_COPILOT_COMPRESSION_SERVICE_IMAGE"] = _get_compression_service_image_name()
-                    env["SOMA_COPILOT_SHARED_PROXY"] = "false"
-                    env["SOMA_COPILOT_SHARED_PROXY_TEARDOWN"] = "false"
-                    env["SOMA_COPILOT_NETWORK_ISOLATION"] = "true"
-                    env["SOMA_COPILOT_USE_COMPOSE_COMPRESSION_SERVICE"] = "true"
-                    # Expose the run_id so copilot.py derives a deterministic compose project name,
-                    # allowing host-side cleanup to reconstruct it after a SIGKILL/timeout.
-                    env["SOMA_COPILOT_RUN_ID"] = str(task.run_id)
-                    if self._copilot_compose_file is not None:
-                        env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
-                    if miner_module_path is None:
-                        raise RuntimeError("Copilot miner module path is not prepared")
-                    env["SOMA_COPILOT_COMPRESSION_SCRIPT_PATH"] = str(miner_module_path)
-                    logger.info(
-                        "Using per-run Copilot proxy/compression sidecars: run_id=%s agent=%s upstream_host=%s",
-                        task.run_id,
-                        task.agent_name,
-                        urlsplit(llm_base_url).netloc,
-                    )
-            if plugin_path is not None:
-                env["SOMA_OPENCLAW_SOMARIZER_PLUGIN_PATH"] = str(plugin_path)
-                env["SOMA_OPENCLAW_PLUGIN_PATH"] = str(plugin_path)
-            # setdefault, so a host that configures its own repo keeps it. Pulling from
-            # it needs DOCKERHUB_USERNAME/DOCKERHUB_TOKEN in the service environment
-            # while the repo is private; both are inherited through os.environ above.
-            env.setdefault(
-                SOMA_TASK_DIND_PREBAKED_REPO_ENV, DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO
-            )
-
-            started_at = time.monotonic()
-            logger.info(
-                "Starting benchmark solve command: run_id=%s timeout_seconds=%s command=%s",
-                task.run_id,
-                timeout,
-                shlex.join(command),
-            )
-            try:
-                process = self._run_benchmark_command(command, env=env, timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
-                duration = time.monotonic() - started_at
-                logger.error(
-                    "Benchmark solve command timed out: run_id=%s duration_seconds=%.3f timeout_seconds=%s",
-                    task.run_id,
-                    duration,
-                    timeout,
-                )
-                # Best-effort token collection: the agent may have written (part of) the
-                # result row before the SIGKILL, or its own internal timeout fired first.
-                total_tokens = input_tokens = cached_input_tokens = output_tokens = agent_steps = None
-                row_metadata: dict[str, Any] = {}
-                try:
-                    row = self._read_result_row(output_dir)
-                    row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-                    total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps = (
-                        self._extract_execution_metrics(row=row, metadata=row_metadata)
-                    )
-                except Exception as metrics_exc:
-                    logger.warning(
-                        "Could not extract execution metrics after timeout: run_id=%s error=%s",
-                        task.run_id,
-                        metrics_exc,
-                    )
-                logger.info(
-                    (
-                        "Benchmark timeout metrics collected: run_id=%s "
-                        "total_tokens=%s input_tokens=%s cached_input_tokens=%s output_tokens=%s agent_steps=%s"
-                    ),
-                    task.run_id,
-                    total_tokens,
-                    input_tokens,
-                    cached_input_tokens,
-                    output_tokens,
-                    agent_steps,
-                )
-                metadata = dict(task.metadata)
-                metadata.update(row_metadata)
-                metadata.update(
-                    {
-                        "benchmark": task.benchmark,
-                        "instance_id": task.instance_id,
-                        "status": "timeout",
-                        "command": shlex.join(command),
-                        "output_dir": str(output_dir),
-                        "total_tokens": total_tokens,
-                        "input_tokens": input_tokens,
-                        "cached_input_tokens": cached_input_tokens,
-                        "output_tokens": output_tokens,
-                    }
-                )
-                report = CompactBenchReportRequest(
-                    run_id=task.run_id,
-                    ok_status=False,
-                    error=str(exc),
-                    execution_time_seconds=duration,
-                    total_tokens=total_tokens,
-                    input_tokens=input_tokens,
-                    cached_input_tokens=cached_input_tokens,
-                    output_tokens=output_tokens,
-                    agent_steps=agent_steps,
-                    **_jev_usage(row_metadata),
-                    patch_capture_status=False,
-                    patch_diff=None,
-                    metadata=metadata,
-                )
-                return CompactBenchExecutionOutput(report=report, patch_text="")
-
+            process = self._run_benchmark_command(command, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
             duration = time.monotonic() - started_at
-            logger.info(
-                "Benchmark solve command finished: run_id=%s returncode=%s duration_seconds=%.3f",
+            logger.error(
+                "Benchmark solve command timed out: run_id=%s duration_seconds=%.3f timeout_seconds=%s",
                 task.run_id,
-                process.returncode,
                 duration,
+                timeout,
             )
-            row = self._read_result_row(output_dir)
-            row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-            trajectory_path = row_metadata.get("trajectory_path") if isinstance(row_metadata.get("trajectory_path"), str) else ""
-            tmp_run_dir = row_metadata.get("tmp_run_dir") if isinstance(row_metadata.get("tmp_run_dir"), str) else ""
-            stream_log_path = row_metadata.get("stream_log_path") if isinstance(row_metadata.get("stream_log_path"), str) else ""
-            patch_capture = row_metadata.get("patch_capture") if isinstance(row_metadata.get("patch_capture"), dict) else {}
-            patch_path = patch_capture.get("patch_path") if isinstance(patch_capture, dict) else None
-            patch_capture_status = False
-            patch_text = ""
-            if isinstance(patch_path, str) and patch_path.strip():
-                patch_file = Path(patch_path)
-                if patch_file.is_file():
-                    patch_capture_status = True
-                    patch_text = patch_file.read_text(encoding="utf-8")
-
-            trajectory_upload_status: bool | None = None
-            if not task.trajectory_presigned_url:
-                logger.info(
-                    "Trajectory upload not attempted, no presigned URL on task: run_id=%s instance_id=%s",
+            # Best-effort token collection: the agent may have written (part of) the
+            # result row before the SIGKILL, or its own internal timeout fired first.
+            total_tokens = input_tokens = cached_input_tokens = output_tokens = agent_steps = None
+            row_metadata: dict[str, Any] = {}
+            try:
+                row = self._read_result_row(output_dir)
+                row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps = (
+                    self._extract_execution_metrics(row=row, metadata=row_metadata)
+                )
+            except Exception as metrics_exc:
+                logger.warning(
+                    "Could not extract execution metrics after timeout: run_id=%s error=%s",
                     task.run_id,
-                    task.instance_id,
+                    metrics_exc,
                 )
-            if task.trajectory_presigned_url:
-                trajectory_upload_status = False
-                resolved_trajectory_path = trajectory_path
-                if not resolved_trajectory_path:
-                    # The openclaw backend reports the trajectory location inside
-                    # token_usage instead of a top-level trajectory_path.
-                    token_usage = row_metadata.get("token_usage") if isinstance(row_metadata.get("token_usage"), dict) else {}
-                    candidate = token_usage.get("trajectory_file")
-                    if isinstance(candidate, str):
-                        resolved_trajectory_path = candidate
-                trajectory_file = Path(resolved_trajectory_path) if resolved_trajectory_path else None
-                if trajectory_file is not None and trajectory_file.is_file():
-                    try:
-                        trajectory_max_bytes = _get_trajectory_max_bytes()
-                        upload_file = trajectory_file
-                        if trajectory_file.stat().st_size > trajectory_max_bytes:
-                            trajectory_entries = [
-                                line
-                                for line in trajectory_file.read_text(encoding="utf-8", errors="replace").splitlines()
-                                if line.strip()
-                            ]
-                            kept_entries, dropped_entries = _cap_jsonl_tail(trajectory_entries, trajectory_max_bytes)
-                            upload_file = output_dir / "trajectory-capped.jsonl"
-                            upload_file.write_text("\n".join(kept_entries) + "\n", encoding="utf-8")
-                            logger.info(
-                                "Trajectory capped before upload: run_id=%s instance_id=%s dropped_oldest_entries=%s max_bytes=%s",
-                                task.run_id,
-                                task.instance_id,
-                                dropped_entries,
-                                trajectory_max_bytes,
-                            )
-                        _upload_run_artifact(
-                            presigned_url=task.trajectory_presigned_url,
-                            artifact_file=upload_file,
-                        )
-                        trajectory_upload_status = True
-                        logger.info(
-                            "Trajectory uploaded to S3: run_id=%s instance_id=%s trajectory_bytes=%s",
-                            task.run_id,
-                            task.instance_id,
-                            upload_file.stat().st_size,
-                        )
-                    except Exception as upload_error:  # noqa: BLE001
-                        logger.warning(
-                            "Trajectory upload failed: run_id=%s instance_id=%s trajectory_path=%s error=%s",
-                            task.run_id,
-                            task.instance_id,
-                            resolved_trajectory_path,
-                            upload_error,
-                        )
-                else:
-                    logger.warning(
-                        "Trajectory upload skipped, file missing: run_id=%s instance_id=%s trajectory_path=%s",
-                        task.run_id,
-                        task.instance_id,
-                        resolved_trajectory_path,
-                    )
-
-            compression_logs_upload_status: bool | None = None
-            if not task.compression_logs_presigned_url:
-                logger.info(
-                    "Compressor execution log upload not attempted, no presigned URL on task: run_id=%s instance_id=%s",
-                    task.run_id,
-                    task.instance_id,
-                )
-            if task.compression_logs_presigned_url:
-                compression_logs_upload_status = False
-                # The copilot backend collects `docker compose logs compression-service`
-                # into tmp_run_dir and reports the path as compression-service_log. The
-                # compressor execution events (one marked JSON line per miner invocation,
-                # emitted by the compression service's /transform endpoint) are extracted
-                # from it; the rest of the container log is not uploaded.
-                compression_log_path = row_metadata.get("compression-service_log")
-                compression_log_file = (
-                    Path(compression_log_path)
-                    if isinstance(compression_log_path, str) and compression_log_path
-                    else None
-                )
-                if (compression_log_file is None or not compression_log_file.is_file()) and tmp_run_dir:
-                    fallback_log_file = Path(tmp_run_dir) / "compression-service.log"
-                    if fallback_log_file.is_file():
-                        compression_log_file = fallback_log_file
-                if compression_log_file is not None and compression_log_file.is_file():
-                    compressor_exec_log = _extract_compressor_exec_log(compression_log_file)
-                    if compressor_exec_log:
-                        compressor_exec_file = output_dir / "compressor-exec.jsonl"
-                        compressor_exec_file.write_text(compressor_exec_log, encoding="utf-8")
-                        try:
-                            _upload_run_artifact(
-                                presigned_url=task.compression_logs_presigned_url,
-                                artifact_file=compressor_exec_file,
-                            )
-                            compression_logs_upload_status = True
-                            logger.info(
-                                "Compressor execution log uploaded to S3: run_id=%s instance_id=%s events_bytes=%s",
-                                task.run_id,
-                                task.instance_id,
-                                compressor_exec_file.stat().st_size,
-                            )
-                        except Exception as upload_error:  # noqa: BLE001
-                            logger.warning(
-                                "Compressor execution log upload failed: run_id=%s instance_id=%s error=%s",
-                                task.run_id,
-                                task.instance_id,
-                                upload_error,
-                            )
-                    else:
-                        logger.warning(
-                            "Compressor execution log upload skipped, no compressor.exec events in container log "
-                            "(old compression-service image or no compressor invocations): run_id=%s instance_id=%s log_path=%s",
-                            task.run_id,
-                            task.instance_id,
-                            compression_log_file,
-                        )
-                else:
-                    logger.warning(
-                        "Compressor execution log upload skipped, container log missing: run_id=%s instance_id=%s log_path=%s",
-                        task.run_id,
-                        task.instance_id,
-                        compression_log_path,
-                    )
-
-            status = str(row.get("status") or ("completed" if process.returncode == 0 else "runtime-error"))
-            success = process.returncode == 0 and status == "completed"
-            row_error_text = str(row.get("error") or "").strip() or None
-            stderr_text = process.stderr.strip() or None
-            error_text = row_error_text or (None if success else stderr_text)
-            total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps = self._extract_execution_metrics(
-                row=row,
-                metadata=row_metadata,
-            )
             logger.info(
                 (
-                    "Benchmark result parsed: run_id=%s status=%s ok_status=%s patch_capture_status=%s "
+                    "Benchmark timeout metrics collected: run_id=%s "
                     "total_tokens=%s input_tokens=%s cached_input_tokens=%s output_tokens=%s agent_steps=%s"
                 ),
                 task.run_id,
-                status,
-                success,
-                patch_capture_status,
                 total_tokens,
                 input_tokens,
                 cached_input_tokens,
                 output_tokens,
                 agent_steps,
             )
-            if trajectory_path:
-                logger.info(
-                    "Copilot trajectory location: run_id=%s instance_id=%s trajectory_path=%s tmp_run_dir=%s stream_log_path=%s",
-                    task.run_id,
-                    task.instance_id,
-                    trajectory_path,
-                    tmp_run_dir,
-                    stream_log_path,
-                )
-            elif tmp_run_dir or stream_log_path:
-                logger.info(
-                    "Copilot run artifacts location: run_id=%s instance_id=%s tmp_run_dir=%s stream_log_path=%s trajectory_path_missing=true",
-                    task.run_id,
-                    task.instance_id,
-                    tmp_run_dir,
-                    stream_log_path,
-                )
-            if stderr_text:
-                logger.info(
-                    "Benchmark emitted stderr output: run_id=%s ok_status=%s stderr=%s",
-                    task.run_id,
-                    success,
-                    stderr_text,
-                )
-            if error_text:
-                logger.warning(
-                    "Benchmark reported error output: run_id=%s error=%s",
-                    task.run_id,
-                    error_text,
-                )
             metadata = dict(task.metadata)
             metadata.update(row_metadata)
             metadata.update(
                 {
                     "benchmark": task.benchmark,
                     "instance_id": task.instance_id,
-                    "status": status,
+                    "status": "timeout",
                     "command": shlex.join(command),
-                    "returncode": process.returncode,
                     "output_dir": str(output_dir),
-                    "plugin_path": str(plugin_path) if plugin_path is not None else "",
-                    "compression_miner_module_path": str(miner_module_path) if miner_module_path is not None else "",
                     "total_tokens": total_tokens,
                     "input_tokens": input_tokens,
                     "cached_input_tokens": cached_input_tokens,
                     "output_tokens": output_tokens,
-                    "trajectory_upload_status": trajectory_upload_status,
-                    "compression_logs_upload_status": compression_logs_upload_status,
                 }
             )
-
             report = CompactBenchReportRequest(
                 run_id=task.run_id,
-                ok_status=success,
-                error=error_text,
+                ok_status=False,
+                error=str(exc),
                 execution_time_seconds=duration,
                 total_tokens=total_tokens,
                 input_tokens=input_tokens,
@@ -1696,158 +449,319 @@ class CompactBenchExecutor:
                 output_tokens=output_tokens,
                 agent_steps=agent_steps,
                 **_jev_usage(row_metadata),
-                trajectory_upload_status=trajectory_upload_status,
-                compression_logs_upload_status=compression_logs_upload_status,
-                patch_capture_status=patch_capture_status,
-                patch_diff=patch_text or None,
+                patch_capture_status=False,
+                patch_diff=None,
                 metadata=metadata,
             )
-            return CompactBenchExecutionOutput(report=report, patch_text=patch_text)
-        finally:
-            if 'copilot_compression_handle' in locals() and copilot_compression_handle is not None:
-                self._stop_copilot_run_compression_service(copilot_compression_handle)
-            if task.agent_name != "openclaw":
-                self._cleanup_copilot_run_resources(run_id=task.run_id, output_dir=output_dir)
-            if self._debug_preserve_outputs:
-                logger.info(
-                    "Keeping benchmark output directory for debug inspection: run_id=%s output_dir=%s",
-                    task.run_id,
-                    output_dir,
-                )
-            else:
-                shutil.rmtree(output_dir, ignore_errors=True)
+            return CompactBenchExecutionOutput(report=report, patch_text="")
 
-    def _cleanup_copilot_run_resources(self, *, run_id: int, output_dir: Path) -> None:
-        """Remove Docker compose resources for a copilot run.
-
-        Runs from the host side so cleanup happens even when the subprocess was SIGKILL'd
-        (e.g. on timeout) and copilot.py's own finally block never executed.
-        Idempotent: safe to call when copilot.py already cleaned up.
-        """
-        compose_project = (
-            f"soma-copilot-"
-            f"{hashlib.sha256(f'{output_dir.resolve()}::{run_id}'.encode()).hexdigest()[:10]}"
-        )
-        workspace_volume = f"{compose_project}_copilot-workspace"
-        try:
-            compose_file = _resolve_copilot_compose_file()
-            cleanup_env = os.environ.copy()
-            cleanup_env["COPILOT_WORKSPACE_VOLUME_NAME"] = workspace_volume
-            cleanup_env["COMPOSE_PROFILES"] = "copilot-sidecars"
-            result = _run_command(
-                [
-                    "docker", "compose",
-                    "-f", str(compose_file),
-                    "--project-name", compose_project,
-                    "down", "--remove-orphans", "--volumes",
-                ],
-                env=cleanup_env,
-            )
-            if result.returncode != 0:
-                details = (result.stderr or result.stdout or "").strip()
-                if details:
-                    logger.debug(
-                        "copilot host-side compose down: run_id=%s project=%s details=%s",
-                        run_id, compose_project, details,
-                    )
-        except Exception as exc:
-            logger.debug(
-                "copilot host-side cleanup could not resolve compose file: run_id=%s error=%s",
-                run_id, exc,
-            )
-        _run_command(["docker", "volume", "rm", "-f", workspace_volume])
-        for net_suffix in ("copilot-sandbox", "copilot-egress"):
-            _run_command(["docker", "network", "rm", f"{compose_project}_{net_suffix}"])
-        logger.debug(
-            "copilot host-side resource cleanup done: run_id=%s project=%s",
-            run_id, compose_project,
-        )
-
-    def _ensure_benchmark_installed(self) -> None:
+        duration = time.monotonic() - started_at
         logger.info(
-            "Ensuring SOMA-benchmark is installed in sandbox-service environment: python=%s package_spec=%s",
-            self._python_executable,
-            self._benchmark_package_spec,
+            "Benchmark solve command finished: run_id=%s returncode=%s duration_seconds=%.3f",
+            task.run_id,
+            process.returncode,
+            duration,
         )
-        install = _run_command(
-            [
-                self._python_executable,
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--upgrade",
-                self._benchmark_package_spec,
-            ]
+        row = self._read_result_row(output_dir)
+        row_metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        trajectory_path = row_metadata.get("trajectory_path") if isinstance(row_metadata.get("trajectory_path"), str) else ""
+        tmp_run_dir = row_metadata.get("tmp_run_dir") if isinstance(row_metadata.get("tmp_run_dir"), str) else ""
+        stream_log_path = row_metadata.get("stream_log_path") if isinstance(row_metadata.get("stream_log_path"), str) else ""
+        patch_capture = row_metadata.get("patch_capture") if isinstance(row_metadata.get("patch_capture"), dict) else {}
+        patch_path = patch_capture.get("patch_path") if isinstance(patch_capture, dict) else None
+        patch_capture_status = False
+        patch_text = ""
+        if isinstance(patch_path, str) and patch_path.strip():
+            patch_file = Path(patch_path)
+            if patch_file.is_file():
+                patch_capture_status = True
+                patch_text = patch_file.read_text(encoding="utf-8")
+
+        trajectory_upload_status = self._upload_trajectory(
+            task=task,
+            output_dir=output_dir,
+            trajectory_path=trajectory_path,
         )
-        if install.returncode != 0:
-            raise RuntimeError(
-                "Failed to install SOMA-benchmark into the sandbox-service environment: "
-                f"{(install.stderr or install.stdout or '').strip()}"
+        compression_logs_upload_status = self._upload_compressor_exec_log(
+            task=task,
+            output_dir=output_dir,
+            row_metadata=row_metadata,
+            tmp_run_dir=tmp_run_dir,
+        )
+
+        status = str(row.get("status") or ("completed" if process.returncode == 0 else "runtime-error"))
+        success = process.returncode == 0 and status == "completed"
+        row_error_text = str(row.get("error") or "").strip() or None
+        stderr_text = process.stderr.strip() or None
+        error_text = row_error_text or (None if success else stderr_text)
+        total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps = self._extract_execution_metrics(
+            row=row,
+            metadata=row_metadata,
+        )
+        logger.info(
+            (
+                "Benchmark result parsed: run_id=%s status=%s ok_status=%s patch_capture_status=%s "
+                "total_tokens=%s input_tokens=%s cached_input_tokens=%s output_tokens=%s agent_steps=%s"
+            ),
+            task.run_id,
+            status,
+            success,
+            patch_capture_status,
+            total_tokens,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            agent_steps,
+        )
+        if trajectory_path:
+            logger.info(
+                "Copilot trajectory location: run_id=%s instance_id=%s trajectory_path=%s tmp_run_dir=%s stream_log_path=%s",
+                task.run_id,
+                task.instance_id,
+                trajectory_path,
+                tmp_run_dir,
+                stream_log_path,
             )
-        if not _python_module_available(self._python_executable, BENCHMARK_PACKAGE_NAME):
-            raise RuntimeError(
-                "SOMA-benchmark installation completed, but the sandbox-service interpreter still cannot import "
-                f"{BENCHMARK_PACKAGE_NAME!r}."
+        elif tmp_run_dir or stream_log_path:
+            logger.info(
+                "Copilot run artifacts location: run_id=%s instance_id=%s tmp_run_dir=%s stream_log_path=%s trajectory_path_missing=true",
+                task.run_id,
+                task.instance_id,
+                tmp_run_dir,
+                stream_log_path,
             )
+        if stderr_text:
+            logger.info(
+                "Benchmark emitted stderr output: run_id=%s ok_status=%s stderr=%s",
+                task.run_id,
+                success,
+                stderr_text,
+            )
+        if error_text:
+            logger.warning(
+                "Benchmark reported error output: run_id=%s error=%s",
+                task.run_id,
+                error_text,
+            )
+        metadata = dict(task.metadata)
+        metadata.update(row_metadata)
+        metadata.update(
+            {
+                "benchmark": task.benchmark,
+                "instance_id": task.instance_id,
+                "status": status,
+                "command": shlex.join(command),
+                "returncode": process.returncode,
+                "output_dir": str(output_dir),
+                "compression_miner_module_path": str(miner_module_path),
+                "total_tokens": total_tokens,
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "output_tokens": output_tokens,
+                "trajectory_upload_status": trajectory_upload_status,
+                "compression_logs_upload_status": compression_logs_upload_status,
+            }
+        )
 
-    def _plugin_checkout_path(self) -> Path:
-        return (self._output_root / "repo-cache" / "SOMA-plugin").resolve()
+        report = CompactBenchReportRequest(
+            run_id=task.run_id,
+            ok_status=success,
+            error=error_text,
+            execution_time_seconds=duration,
+            total_tokens=total_tokens,
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            agent_steps=agent_steps,
+            **_jev_usage(row_metadata),
+            trajectory_upload_status=trajectory_upload_status,
+            compression_logs_upload_status=compression_logs_upload_status,
+            patch_capture_status=patch_capture_status,
+            patch_diff=patch_text or None,
+            metadata=metadata,
+        )
+        return CompactBenchExecutionOutput(report=report, patch_text=patch_text)
 
-    def _ensure_plugin_template_checkout(self) -> Path:
-        checkout_path = self._plugin_checkout_path()
-        checkout_path.parent.mkdir(parents=True, exist_ok=True)
+    def _build_benchmark_env(
+        self,
+        *,
+        task: CompactBenchRunTaskRequest,
+        agent_timeout: float | None,
+        miner_module_path: Path,
+    ) -> dict[str, str]:
+        env = os.environ.copy()
+        env["SOMA_COPILOT_RUN_ID"] = str(task.run_id)
+        env["SOMA_COPILOT_RUN_ROOT"] = str(settings.copilot_run_root())
+        # The API owns directory cleanup, after the runner has exited.
+        env["SOMA_COPILOT_PRESERVE_RUN_DIRS"] = "true"
+        # A project name derived from the run id alone lets the API find and remove the
+        # stack after this runner is gone, whatever state it was killed in.
+        env["SOMA_COPILOT_COMPOSE_PROJECT"] = settings.compose_project_name(task.run_id)
+        if agent_timeout is not None:
+            env["SOMA_COPILOT_AGENT_TIMEOUT_SECONDS"] = str(int(agent_timeout))
+        llm_base_url = os.getenv("COMPACT_BENCH_LLM_BASE_URL", "").strip()
+        if llm_base_url:
+            env["LLM_BASE_URL"] = llm_base_url
+            logger.info(
+                "Using per-run Copilot proxy/compression sidecars: run_id=%s upstream_host=%s",
+                task.run_id,
+                urlsplit(llm_base_url).netloc,
+            )
+        # Per-run mode: the backend starts compose sidecars (proxy + compression-service)
+        # inside one isolated run network, with proxy as the only egress path to gateway.
+        env["SOMA_COPILOT_COMPRESSION_SERVICE_IMAGE"] = _get_compression_service_image_name()
+        env["SOMA_COPILOT_SHARED_PROXY"] = "false"
+        env["SOMA_COPILOT_SHARED_PROXY_TEARDOWN"] = "false"
+        env["SOMA_COPILOT_NETWORK_ISOLATION"] = "true"
+        env["SOMA_COPILOT_USE_COMPOSE_COMPRESSION_SERVICE"] = "true"
+        env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
+        env["SOMA_COPILOT_COMPRESSION_SCRIPT_PATH"] = str(miner_module_path)
+        env["SOMA_COPILOT_SWE_EXEC_ASSETS_DIR"] = str(stage_swe_exec_assets())
+        # setdefault, so a host that configures its own repo keeps it. Pulling from
+        # it needs DOCKERHUB_USERNAME/DOCKERHUB_TOKEN in the runner environment
+        # while the repo is private; both are inherited through os.environ above.
+        env.setdefault(SOMA_TASK_DIND_PREBAKED_REPO_ENV, DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO)
+        return env
 
-        if not (checkout_path / ".git").is_dir():
-            if checkout_path.exists():
-                shutil.rmtree(checkout_path, ignore_errors=True)
-            clone = _run_command(
-                [
-                    "git",
-                    "clone",
-                    "--depth",
-                    "1",
-                    self._plugin_repository_url,
-                    str(checkout_path),
+    def _upload_trajectory(
+        self,
+        *,
+        task: CompactBenchRunTaskRequest,
+        output_dir: Path,
+        trajectory_path: str,
+    ) -> bool | None:
+        if not task.trajectory_presigned_url:
+            logger.info(
+                "Trajectory upload not attempted, no presigned URL on task: run_id=%s instance_id=%s",
+                task.run_id,
+                task.instance_id,
+            )
+            return None
+        trajectory_file = Path(trajectory_path) if trajectory_path else None
+        if trajectory_file is None or not trajectory_file.is_file():
+            logger.warning(
+                "Trajectory upload skipped, file missing: run_id=%s instance_id=%s trajectory_path=%s",
+                task.run_id,
+                task.instance_id,
+                trajectory_path,
+            )
+            return False
+        try:
+            trajectory_max_bytes = _get_trajectory_max_bytes()
+            upload_file = trajectory_file
+            if trajectory_file.stat().st_size > trajectory_max_bytes:
+                trajectory_entries = [
+                    line
+                    for line in trajectory_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if line.strip()
                 ]
-            )
-            if clone.returncode != 0:
-                raise RuntimeError(
-                    "Failed to clone SOMA-plugin repository for sandbox-service: "
-                    f"{(clone.stderr or clone.stdout or '').strip()}"
+                kept_entries, dropped_entries = _cap_jsonl_tail(trajectory_entries, trajectory_max_bytes)
+                upload_file = output_dir / "trajectory-capped.jsonl"
+                upload_file.write_text("\n".join(kept_entries) + "\n", encoding="utf-8")
+                logger.info(
+                    "Trajectory capped before upload: run_id=%s instance_id=%s dropped_oldest_entries=%s max_bytes=%s",
+                    task.run_id,
+                    task.instance_id,
+                    dropped_entries,
+                    trajectory_max_bytes,
                 )
-            return checkout_path
-
-        remote = _run_command(["git", "-C", str(checkout_path), "remote", "get-url", "origin"])
-        current_remote = (remote.stdout or "").strip()
-        if remote.returncode != 0 or current_remote != self._plugin_repository_url:
-            shutil.rmtree(checkout_path, ignore_errors=True)
-            clone = _run_command(
-                [
-                    "git",
-                    "clone",
-                    "--depth",
-                    "1",
-                    self._plugin_repository_url,
-                    str(checkout_path),
-                ]
+            _upload_run_artifact(
+                presigned_url=task.trajectory_presigned_url,
+                artifact_file=upload_file,
             )
-            if clone.returncode != 0:
-                raise RuntimeError(
-                    "Failed to refresh SOMA-plugin repository for sandbox-service: "
-                    f"{(clone.stderr or clone.stdout or '').strip()}"
-                )
-            return checkout_path
+            logger.info(
+                "Trajectory uploaded to S3: run_id=%s instance_id=%s trajectory_bytes=%s",
+                task.run_id,
+                task.instance_id,
+                upload_file.stat().st_size,
+            )
+            return True
+        except Exception as upload_error:  # noqa: BLE001
+            logger.warning(
+                "Trajectory upload failed: run_id=%s instance_id=%s trajectory_path=%s error=%s",
+                task.run_id,
+                task.instance_id,
+                trajectory_path,
+                upload_error,
+            )
+            return False
 
-        return checkout_path
+    def _upload_compressor_exec_log(
+        self,
+        *,
+        task: CompactBenchRunTaskRequest,
+        output_dir: Path,
+        row_metadata: dict[str, Any],
+        tmp_run_dir: str,
+    ) -> bool | None:
+        if not task.compression_logs_presigned_url:
+            logger.info(
+                "Compressor execution log upload not attempted, no presigned URL on task: run_id=%s instance_id=%s",
+                task.run_id,
+                task.instance_id,
+            )
+            return None
+        # The copilot backend collects `docker compose logs compression-service`
+        # into tmp_run_dir and reports the path as compression-service_log. The
+        # compressor execution events (one marked JSON line per miner invocation,
+        # emitted by the compression service's /transform endpoint) are extracted
+        # from it; the rest of the container log is not uploaded.
+        compression_log_path = row_metadata.get("compression-service_log")
+        compression_log_file = (
+            Path(compression_log_path)
+            if isinstance(compression_log_path, str) and compression_log_path
+            else None
+        )
+        if (compression_log_file is None or not compression_log_file.is_file()) and tmp_run_dir:
+            fallback_log_file = Path(tmp_run_dir) / "compression-service.log"
+            if fallback_log_file.is_file():
+                compression_log_file = fallback_log_file
+        if compression_log_file is None or not compression_log_file.is_file():
+            logger.warning(
+                "Compressor execution log upload skipped, container log missing: run_id=%s instance_id=%s log_path=%s",
+                task.run_id,
+                task.instance_id,
+                compression_log_path,
+            )
+            return False
+        compressor_exec_log = _extract_compressor_exec_log(compression_log_file)
+        if not compressor_exec_log:
+            logger.warning(
+                "Compressor execution log upload skipped, no compressor.exec events in container log "
+                "(old compression-service image or no compressor invocations): run_id=%s instance_id=%s log_path=%s",
+                task.run_id,
+                task.instance_id,
+                compression_log_file,
+            )
+            return False
+        compressor_exec_file = output_dir / "compressor-exec.jsonl"
+        compressor_exec_file.write_text(compressor_exec_log, encoding="utf-8")
+        try:
+            _upload_run_artifact(
+                presigned_url=task.compression_logs_presigned_url,
+                artifact_file=compressor_exec_file,
+            )
+        except Exception as upload_error:  # noqa: BLE001
+            logger.warning(
+                "Compressor execution log upload failed: run_id=%s instance_id=%s error=%s",
+                task.run_id,
+                task.instance_id,
+                upload_error,
+            )
+            return False
+        logger.info(
+            "Compressor execution log uploaded to S3: run_id=%s instance_id=%s events_bytes=%s",
+            task.run_id,
+            task.instance_id,
+            compressor_exec_file.stat().st_size,
+        )
+        return True
 
     def _build_command(
         self,
         *,
         task: CompactBenchRunTaskRequest,
         output_dir: Path,
-        plugin_path: Path | None,
-        openclaw_agent_timeout_seconds: int | None = None,
     ) -> list[str]:
         # TODO: define the executable command and runtime flags directly in this service
         # instead of passing command-shaping inputs through the payload contract.
@@ -1869,61 +783,19 @@ class CompactBenchExecutor:
             "--execute",
             "--openclaw-run-id-header-value",
             str(task.run_id),
+            "--openclaw-ignore-api-key",
         ]
-        if task.agent_name == "openclaw":
-            command.extend(
-                [
-                    "--openclaw-current-user",
-                    "--openclaw-ignore-api-key",
-                ]
-            )
-            if not task.openclaw_disable_somarizer:
-                if plugin_path is None:
-                    raise RuntimeError("OpenClaw run requires plugin_path when plugin is enabled")
-                command.extend(["--openclaw-plugin-path", str(plugin_path)])
-            if openclaw_agent_timeout_seconds is not None:
-                command.extend(["--openclaw-command", f"--timeout {openclaw_agent_timeout_seconds}"])
-        else:
-            command.append("--openclaw-ignore-api-key")
         if task.model:
             command.extend(["--model", task.model])
         if task.openclaw_disable_somarizer:
             command.append("--openclaw-disable-plugin")
         return command
 
-    def _write_plugin_template(self, plugin_path: Path) -> None:
-        for rel, data in self._plugin_template_cache.items():
-            dest = plugin_path / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
-
-    def _materialize_plugin_checkout(self, *, output_dir: Path, script_presigned_url: str) -> Path:
-        plugin_path = output_dir / "soma-miner-plugin"
-        plugin_path.mkdir(parents=True, exist_ok=True)
-        logger.info(
-            "Materializing plugin checkout from preloaded template: output_dir=%s",
-            output_dir,
-        )
-
-        self._write_plugin_template(plugin_path)
-
-        miner_code = _download_miner_code(script_presigned_url)
-        (plugin_path / PLUGIN_BACKEND_FILENAME).write_text(miner_code, encoding="utf-8")
-        cache_path = self._write_tiktoken_cache(plugin_path)
-        logger.info(
-            "Injected miner code into plugin checkout: plugin_path=%s code_bytes=%s tiktoken_cache=%s",
-            plugin_path,
-            len(miner_code.encode("utf-8")),
-            cache_path,
-        )
-
-        return plugin_path
-
     def _materialize_copilot_miner_module(self, *, output_dir: Path, script_presigned_url: str) -> Path:
         miner_dir = output_dir / "copilot-miner"
         miner_dir.mkdir(parents=True, exist_ok=True)
         miner_code = _download_miner_code(script_presigned_url)
-        module_path = miner_dir / PLUGIN_BACKEND_FILENAME
+        module_path = miner_dir / MINER_MODULE_FILENAME
         module_path.write_text(miner_code, encoding="utf-8")
         logger.info(
             "Wrote Copilot miner module: path=%s code_bytes=%s",
@@ -1931,122 +803,6 @@ class CompactBenchExecutor:
             len(miner_code.encode("utf-8")),
         )
         return module_path
-
-    def _ensure_llm_proxy(self, upstream_base_url: str) -> NginxProxyHandle:
-        normalized_upstream_base_url = _normalize_proxy_upstream_base_url(upstream_base_url)
-        private_network_name = _resolve_private_network_name()
-        with self._llm_proxy_lock:
-            if (
-                self._llm_proxy_handle is not None
-                and self._llm_proxy_handle.upstream_base_url == normalized_upstream_base_url
-                and self._llm_proxy_handle.private_network_name == private_network_name
-                and _docker_container_running(self._llm_proxy_handle.container_name)
-            ):
-                return self._llm_proxy_handle
-
-            handle = self._start_llm_proxy(
-                upstream_base_url=normalized_upstream_base_url,
-                private_network_name=private_network_name,
-            )
-            self._llm_proxy_handle = handle
-            return handle
-
-    def _start_llm_proxy(
-        self,
-        *,
-        upstream_base_url: str,
-        private_network_name: str,
-    ) -> NginxProxyHandle:
-        proxy_port = self._get_llm_proxy_port()
-        container_name = _build_proxy_container_name()
-        config_path = self._output_root / "llm-proxy.nginx.conf"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            _build_nginx_config(
-                upstream_base_url=upstream_base_url,
-                listen_port=proxy_port,
-            ),
-            encoding="utf-8",
-        )
-
-        self._stop_llm_proxy(
-            NginxProxyHandle(
-                container_name=container_name,
-                proxy_base_url="",
-                upstream_base_url="",
-                private_network_name=private_network_name,
-            )
-        )
-        _ensure_docker_network(private_network_name, internal=True)
-        logger.info(
-            "Starting benchmark nginx proxy: container_name=%s upstream_host=%s private_network=%s proxy_port=%s connect_timeout=%ss send_timeout=%ss read_timeout=%ss keepalive_timeout=%ss",
-            container_name,
-            urlsplit(upstream_base_url).netloc,
-            private_network_name,
-            proxy_port,
-            os.getenv("COMPACT_BENCH_NGINX_PROXY_CONNECT_TIMEOUT_SECONDS", "30").strip() or "30",
-            os.getenv("COMPACT_BENCH_NGINX_PROXY_SEND_TIMEOUT_SECONDS", "1800").strip() or "1800",
-            os.getenv("COMPACT_BENCH_NGINX_PROXY_READ_TIMEOUT_SECONDS", "1800").strip() or "1800",
-            os.getenv("COMPACT_BENCH_NGINX_PROXY_KEEPALIVE_TIMEOUT_SECONDS", "75").strip() or "75",
-        )
-
-        result = _run_command(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--rm",
-                "--name",
-                container_name,
-                "--network",
-                "bridge",
-                "-v",
-                f"{config_path}:/etc/nginx/nginx.conf:ro",
-                self._get_llm_proxy_image(),
-            ]
-        )
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(f"Failed to start benchmark nginx proxy container: {message}")
-        try:
-            _docker_connect_network(private_network_name, container_name, alias=container_name)
-        except Exception:
-            self._stop_llm_proxy(
-                NginxProxyHandle(
-                    container_name=container_name,
-                    proxy_base_url="",
-                    upstream_base_url="",
-                    private_network_name=private_network_name,
-                )
-            )
-            raise
-        logger.info(
-            "Benchmark nginx proxy ready: container_name=%s proxy_base_url=http://%s:%s",
-            container_name,
-            container_name,
-            proxy_port,
-        )
-
-        return NginxProxyHandle(
-            container_name=container_name,
-            proxy_base_url=f"http://{container_name}:{proxy_port}",
-            upstream_base_url=upstream_base_url,
-            private_network_name=private_network_name,
-        )
-
-    def _stop_llm_proxy(self, handle: NginxProxyHandle) -> None:
-        _run_command(["docker", "rm", "-f", "-v", handle.container_name])
-
-    def _get_llm_proxy_image(self) -> str:
-        return os.getenv("COMPACT_BENCH_LLM_PROXY_IMAGE", "nginx:1.27-alpine").strip() or "nginx:1.27-alpine"
-
-    def _get_llm_proxy_port(self) -> int:
-        raw_port = os.getenv("COMPACT_BENCH_LLM_PROXY_PORT", "8080").strip()
-        try:
-            port = int(raw_port)
-        except ValueError:
-            port = 8080
-        return port if port > 0 else 8080
 
     def _read_result_row(self, output_dir: Path) -> dict[str, Any]:
         output_json_path = output_dir / "output.jsonl"
@@ -2131,34 +887,3 @@ class CompactBenchExecutor:
                 break
 
         return total_tokens, input_tokens, cached_input_tokens, output_tokens, agent_steps
-
-    def shutdown(self) -> None:
-        """Release persistent sandbox-side helper resources."""
-        with self._llm_proxy_lock:
-            if self._llm_proxy_handle is not None:
-                self._stop_llm_proxy(self._llm_proxy_handle)
-                _docker_remove_network(self._llm_proxy_handle.private_network_name)
-                self._llm_proxy_handle = None
-
-        if self._copilot_shared_proxy_enabled and self._copilot_compose_file is not None:
-            env = os.environ.copy()
-            env["COMPOSE_PROFILES"] = "copilot-sidecars"
-            logger.info(
-                "Tearing down shared Copilot proxy stack: compose_file=%s project=%s",
-                self._copilot_compose_file,
-                self._copilot_compose_project,
-            )
-            _run_command(
-                [
-                    "docker",
-                    "compose",
-                    "-f",
-                    str(self._copilot_compose_file),
-                    "--project-name",
-                    self._copilot_compose_project,
-                    "down",
-                    "--remove-orphans",
-                    "--volumes",
-                ],
-                env=env,
-            )

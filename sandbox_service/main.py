@@ -1,25 +1,27 @@
-"""Standalone sandbox service for asynchronous compact-bench execution."""
+"""Sandbox API: accepts compact-bench runs and reports their results to the platform.
+
+Each run executes in its own runner container (see app/runner.py), started and
+supervised by app/run_supervisor.py. This process holds no run in memory that it cannot
+rebuild, so restarting it does not interrupt runs in flight.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import subprocess
 import sys
-import threading
 import time
-import traceback
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Add parent directory to path to find mcp_platform module
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from soma_shared.contracts.sandbox.v1.messages import (
     CompactBenchReportRequest,
     CompactBenchRunTaskRequest,
@@ -27,8 +29,11 @@ from soma_shared.contracts.sandbox.v1.messages import (
 )
 
 import volume_janitor
+from app import settings
 from app.callback_queue import CallbackQueue
-from app.compact_bench_executor import CompactBenchExecutor
+from app.compact_bench_executor import SUPPORTED_AGENT_NAME
+from app.run_supervisor import RunSupervisor
+from app.soma_task_rows import SomaTaskRowCache
 
 
 # Load environment variables from .env file
@@ -47,15 +52,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 app = FastAPI(
     title="Sandbox Service",
     description="Remote sandbox execution service for SOMA platform",
-    version="1.0.0",
+    version="2.0.0",
 )
-
-
-def _get_callback_queue_path() -> Path:
-    configured = os.getenv("COMPACT_BENCH_CALLBACK_QUEUE_PATH", "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return Path("/var/lib/soma-sandbox/callback_queue.sqlite3").resolve()
 
 
 def _get_capacity_cooldown_seconds() -> float:
@@ -76,6 +74,13 @@ def _get_max_concurrent() -> int:
             logger.warning("Invalid SOMA_SWEBENCH_MAX_CONCURRENT=%r; using CPU-based default", raw)
     cpu_count = os.cpu_count() or 2
     return int(min(12, max(1, cpu_count - 1)))
+
+
+def _get_runner_image() -> str:
+    image = os.getenv("SANDBOX_RUNNER_IMAGE", "").strip()
+    if not image:
+        raise RuntimeError("SANDBOX_RUNNER_IMAGE must name the image runner containers are started from")
+    return image
 
 
 def _get_callback_retry_poll_seconds() -> float:
@@ -118,158 +123,121 @@ def _classify_runtime_failure(error: str | None) -> str:
     lower = error.lower()
     if "/var/run/docker.sock" in lower or "docker.sock" in lower:
         return "docker_sock_missing"
-    if "gatewaytransporterror" in lower and "1006" in lower:
-        return "gateway_ws_1006"
-    if "gatewaytransporterror" in lower:
-        return "gateway_transport_error"
+    if "runnerdeadlineexceeded" in lower:
+        return "runner_deadline_exceeded"
+    if "runnerexited" in lower or "runnernotstarted" in lower or "runnerstarterror" in lower:
+        return "runner_error"
     if "timeout" in lower or "timed out" in lower:
         return "timeout"
     return "runtime_error"
 
 
-def _mark_last_transport_error(
-    *,
-    run_id: int,
-    error: str,
-    source: str,
-    ws_close_code: int | None = None,
-    ws_close_reason: str | None = None,
-    last_hook_event: dict[str, Any] | None = None,
-    delta_to_fail_s: float | None = None,
-    gateway_container_state_at_fail: dict[str, Any] | None = None,
-) -> None:
+def _mark_last_transport_error(*, run_id: int, error: str) -> None:
     app.state.last_transport_error = {
         "run_id": run_id,
         "error": error,
-        "source": source,
+        "source": "callback",
         "at": datetime.now(timezone.utc).isoformat(),
-        "ws_close_code": ws_close_code,
-        "ws_close_reason": ws_close_reason,
-        "last_hook_event": last_hook_event,
-        "delta_to_fail_s": delta_to_fail_s,
-        "gateway_container_state_at_fail": gateway_container_state_at_fail,
     }
 
 
-def _prune_stale_copilot_networks() -> None:
-    try:
-        result = subprocess.run(
-            ["docker", "network", "ls", "--format", "{{.Name}}", "--filter", "name=soma-copilot-"],
-            capture_output=True, text=True, timeout=10,
-        )
-        networks = [n.strip() for n in result.stdout.splitlines() if n.strip()]
-        if not networks:
-            return
-        rm = subprocess.run(
-            ["docker", "network", "rm", *networks],
-            capture_output=True, text=True, timeout=30,
-        )
-        removed = [n for n in networks if n in (rm.stdout or "")]
-        skipped = len(networks) - len(removed)
-        logger.info(
-            "Startup network prune: found=%d removed=%d skipped_in_use=%d",
-            len(networks), len(removed), skipped,
-        )
-    except Exception as exc:
-        logger.warning("Startup network prune failed: %s", exc)
+def _volume_sweep_mode() -> str:
+    """Legacy age-based volume sweep: "log" (default) only reports what it would remove.
 
-
-def _volume_janitor_loop(stop_event: threading.Event) -> None:
-    """Background-thread loop: periodically sweep orphaned Docker volumes.
-
-    Runs on a plain OS thread (not an asyncio task) because volume_janitor's
-    work is blocking subprocess calls to the docker CLI - running it as a
-    thread keeps it off the event loop entirely instead of needing
-    run_in_executor for every call.
+    Teardown by ownership replaces it. It stays in log mode until a quiet stretch shows
+    teardown leaves nothing behind, and can be switched to "delete" or "off".
     """
-    logger.info(
-        "Volume janitor thread started: interval=%ds min_age=%ds",
-        volume_janitor.SWEEP_INTERVAL_SECONDS,
-        volume_janitor.MIN_AGE_SECONDS,
+    mode = (os.getenv("SANDBOX_LEGACY_VOLUME_SWEEP") or "log").strip().lower()
+    return mode if mode in {"off", "log", "delete"} else "log"
+
+
+async def _legacy_volume_sweep_loop() -> None:
+    mode = _volume_sweep_mode()
+    if mode == "off":
+        return
+    while True:
+        try:
+            await asyncio.to_thread(volume_janitor.sweep, dry_run=(mode != "delete"))
+        except Exception:
+            logger.exception("Legacy volume sweep failed")
+        await asyncio.sleep(volume_janitor.SWEEP_INTERVAL_SECONDS)
+
+
+def _prepare_run(request: CompactBenchRunTaskRequest) -> None:
+    """Make the run's task row resolvable before its runner starts (runs in a thread)."""
+    app.state.task_rows.ensure(
+        benchmark=str(request.benchmark or ""),
+        instance_id=str(request.instance_id or ""),
     )
-    while not stop_event.is_set():
-        try:
-            volume_janitor.sweep()
-        except Exception:
-            logger.exception("Volume janitor sweep failed")
-        try:
-            get_compact_bench_executor()._maybe_cleanup_stale_copilot_dirs()
-        except Exception:
-            logger.exception("Copilot run directory sweep failed")
-        stop_event.wait(volume_janitor.SWEEP_INTERVAL_SECONDS)
-    logger.info("Volume janitor thread stopped")
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    """Initialize compact-bench executor and shared capacity controls."""
-    _prune_stale_copilot_networks()
-    get_compact_bench_executor()
-    max_concurrent = _get_max_concurrent()
-    app.state.sandbox_semaphore = asyncio.Semaphore(max_concurrent)
-    app.state.active_runs: set[int] = set()
+    """Rebuild run state from Docker and disk, then start supervising."""
+    app.state.max_concurrent = _get_max_concurrent()
     app.state.capacity_reject_count = 0
     app.state.accepted_after_reject = 0
     app.state.rejected_by_run_id: dict[int, int] = {}
     app.state.capacity_cooldown_until = 0.0
     app.state.runtime_fail_counters = Counter()
     app.state.last_transport_error: dict[str, Any] | None = None
+    app.state.draining = False
 
-    app.state.callback_queue = CallbackQueue(_get_callback_queue_path())
+    app.state.callback_queue = CallbackQueue(settings.callback_queue_path())
+    app.state.callback_queue.prune_reported(older_than_seconds=30 * 86400)
+    app.state.callback_drain_lock = asyncio.Lock()
     app.state.callback_retry_task = asyncio.create_task(_callback_retry_loop())
 
-    app.state.volume_janitor_stop = threading.Event()
-    app.state.volume_janitor_thread = threading.Thread(
-        target=_volume_janitor_loop,
-        args=(app.state.volume_janitor_stop,),
-        name="volume-janitor",
-        daemon=True,
+    app.state.task_rows = SomaTaskRowCache()
+    await asyncio.to_thread(app.state.task_rows.preload)
+
+    app.state.supervisor = RunSupervisor(
+        runner_image=_get_runner_image(),
+        report_sink=_enqueue_callback,
+        already_reported=lambda dispatch_id: _get_callback_queue().was_reported(dispatch_id),
+        prepare_run=_prepare_run,
     )
-    app.state.volume_janitor_thread.start()
+    await app.state.supervisor.start()
+    app.state.volume_sweep_task = asyncio.create_task(_legacy_volume_sweep_loop())
 
     logger.info(
-        "Sandbox initialized: max_concurrent=%d callback_queue=%s cooldown_seconds=%.2f",
-        max_concurrent,
-        _get_callback_queue_path(),
+        "Sandbox initialized: max_concurrent=%d callback_queue=%s cooldown_seconds=%.2f "
+        "runner_image=%s legacy_volume_sweep=%s",
+        app.state.max_concurrent,
+        settings.callback_queue_path(),
         _get_capacity_cooldown_seconds(),
+        _get_runner_image(),
+        _volume_sweep_mode(),
     )
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    """Release persistent compact-bench helper resources."""
-    retry_task: asyncio.Task[Any] | None = getattr(app.state, "callback_retry_task", None)
-    if retry_task is not None:
-        retry_task.cancel()
+    """Stop background work. Runners are left running for the next API to adopt."""
+    supervisor: RunSupervisor | None = getattr(app.state, "supervisor", None)
+    if supervisor is not None:
+        await supervisor.stop()
+    for name in ("callback_retry_task", "volume_sweep_task"):
+        task: asyncio.Task[Any] | None = getattr(app.state, name, None)
+        if task is None:
+            continue
+        task.cancel()
         try:
-            await retry_task
+            await task
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception("Callback retry task shutdown failed")
-
-    janitor_stop: threading.Event | None = getattr(app.state, "volume_janitor_stop", None)
-    if janitor_stop is not None:
-        janitor_stop.set()
-        janitor_thread: threading.Thread | None = getattr(app.state, "volume_janitor_thread", None)
-        if janitor_thread is not None:
-            janitor_thread.join(timeout=5)
-
-    executor = getattr(app.state, "compact_bench_executor", None)
-    if executor is not None:
-        executor.shutdown()
-
-
-def get_compact_bench_executor() -> CompactBenchExecutor:
-    """Get or create compact-bench executor instance."""
-    if not hasattr(app.state, "compact_bench_executor"):
-        app.state.compact_bench_executor = CompactBenchExecutor()
-    return app.state.compact_bench_executor
+            logger.exception("%s shutdown failed", name)
 
 
 def _get_callback_queue() -> CallbackQueue:
     queue: CallbackQueue = app.state.callback_queue
     return queue
+
+
+def _get_supervisor() -> RunSupervisor:
+    supervisor: RunSupervisor = app.state.supervisor
+    return supervisor
 
 
 def _record_capacity_reject(*, operation_kind: str, operation_id: str, reason: str) -> None:
@@ -290,8 +258,7 @@ def _record_capacity_reject(*, operation_kind: str, operation_id: str, reason: s
     )
 
 
-async def _acquire_capacity_slot(*, operation_kind: str, operation_id: str) -> None:
-    semaphore: asyncio.Semaphore = app.state.sandbox_semaphore
+def _check_capacity(*, operation_kind: str, operation_id: str) -> None:
     now = time.monotonic()
     cooldown_until: float = app.state.capacity_cooldown_until
     if now < cooldown_until:
@@ -308,26 +275,18 @@ async def _acquire_capacity_slot(*, operation_kind: str, operation_id: str) -> N
             ),
         )
 
-    try:
-        async with asyncio.timeout(0):
-            await semaphore.acquire()
-    except (asyncio.TimeoutError, TimeoutError):
+    if _get_supervisor().occupied() >= app.state.max_concurrent:
         cooldown_seconds = _get_capacity_cooldown_seconds()
         app.state.capacity_cooldown_until = time.monotonic() + cooldown_seconds
         _record_capacity_reject(
             operation_kind=operation_kind,
             operation_id=operation_id,
-            reason="semaphore_exhausted",
+            reason="slots_exhausted",
         )
         raise HTTPException(
             status_code=429,
             detail=f"{operation_kind} service is at capacity. Please try again later.",
         )
-
-
-def _release_capacity_slot() -> None:
-    semaphore: asyncio.Semaphore = app.state.sandbox_semaphore
-    semaphore.release()
 
 
 def _get_compact_bench_report_url() -> str:
@@ -388,6 +347,13 @@ async def _deliver_callback_once(report: CompactBenchReportRequest) -> tuple[boo
 
 
 async def _drain_callback_queue(*, limit: int) -> None:
+    # Serialized: the immediate drain after an enqueue and the retry loop would otherwise
+    # both fetch the same due item and deliver it twice.
+    async with app.state.callback_drain_lock:
+        await _drain_due_callbacks(limit=limit)
+
+
+async def _drain_due_callbacks(*, limit: int) -> None:
     queue = _get_callback_queue()
     due_items = queue.fetch_due(now=time.time(), limit=limit)
     if not due_items:
@@ -417,11 +383,27 @@ async def _drain_callback_queue(*, limit: int) -> None:
             detail,
         )
         if "transport_error" in detail:
-            _mark_last_transport_error(run_id=item.run_id, error=detail, source="callback")
+            _mark_last_transport_error(run_id=item.run_id, error=detail)
 
 
-async def _enqueue_callback(report: CompactBenchReportRequest) -> None:
-    callback_id = _get_callback_queue().enqueue(report)
+async def _enqueue_callback(report: CompactBenchReportRequest, dispatch_id: str) -> None:
+    logger.info(
+        "Compact-bench execution finished: run_id=%s ok_status=%s patch_capture_status=%s "
+        "trajectory_upload_status=%s compression_logs_upload_status=%s error=%s execution_time_seconds=%s",
+        report.run_id,
+        report.ok_status,
+        report.patch_capture_status,
+        report.trajectory_upload_status,
+        report.compression_logs_upload_status,
+        report.error,
+        report.execution_time_seconds,
+    )
+    callback_id = _get_callback_queue().enqueue(report, dispatch_id=dispatch_id)
+    if callback_id is None:
+        logger.warning("Report for this dispatch was already queued: run_id=%s", report.run_id)
+        return
+    if not report.ok_status:
+        app.state.runtime_fail_counters[_classify_runtime_failure(report.error)] += 1
     logger.info(
         "Callback enqueued: callback_id=%s run_id=%s ok_status=%s",
         callback_id,
@@ -441,127 +423,6 @@ async def _callback_retry_loop() -> None:
         await asyncio.sleep(_get_callback_retry_poll_seconds())
 
 
-async def _execute_compact_bench_task_in_background(request: CompactBenchRunTaskRequest) -> None:
-    try:
-        executor = get_compact_bench_executor()
-        logger.info(
-            "Starting compact-bench background execution: run_id=%s benchmark=%s instance_id=%s",
-            request.run_id,
-            request.benchmark,
-            request.instance_id,
-        )
-        output = await asyncio.to_thread(
-            executor.execute_task,
-            batch_id=str(request.run_id),
-            task=request,
-            timeout_per_task=request.openclaw_timeout,
-        )
-        if output.report.run_id != request.run_id:
-            logger.error(
-                "run_id_mismatch_detected: request_run_id=%s report_run_id=%s; overriding callback run_id",
-                request.run_id,
-                output.report.run_id,
-            )
-            output.report = output.report.model_copy(update={"run_id": request.run_id})
-
-        error_text = output.report.error or ""
-        has_gateway_transport_error = "gatewaytransporterror" in error_text.lower()
-        report_metadata = output.report.metadata if isinstance(output.report.metadata, dict) else {}
-        ws_close_code_raw = report_metadata.get("ws_close_code")
-        try:
-            ws_close_code = int(ws_close_code_raw) if ws_close_code_raw is not None else None
-        except (TypeError, ValueError):
-            ws_close_code = None
-        ws_close_reason = (
-            str(report_metadata.get("ws_close_reason")).strip()
-            if report_metadata.get("ws_close_reason") is not None
-            else None
-        )
-        last_hook_event = (
-            report_metadata.get("last_hook_event")
-            if isinstance(report_metadata.get("last_hook_event"), dict)
-            else None
-        )
-        delta_to_fail_raw = report_metadata.get("delta_to_fail_s")
-        try:
-            delta_to_fail_s = (
-                float(delta_to_fail_raw) if delta_to_fail_raw is not None else None
-            )
-        except (TypeError, ValueError):
-            delta_to_fail_s = None
-        gateway_container_state_at_fail = (
-            report_metadata.get("gateway_container_state_at_fail")
-            if isinstance(report_metadata.get("gateway_container_state_at_fail"), dict)
-            else None
-        )
-        logger.info(
-            "Compact-bench execution finished: run_id=%s ok_status=%s patch_capture_status=%s "
-            "trajectory_upload_status=%s compression_logs_upload_status=%s error=%s "
-            "gateway_transport_error=%s ws_close_code=%s ws_close_reason=%s last_hook_event=%s "
-            "delta_to_fail_s=%s gateway_container_state_at_fail=%s execution_time_seconds=%s",
-            request.run_id,
-            output.report.ok_status,
-            output.report.patch_capture_status,
-            output.report.trajectory_upload_status,
-            output.report.compression_logs_upload_status,
-            output.report.error,
-            has_gateway_transport_error,
-            ws_close_code,
-            ws_close_reason,
-            last_hook_event,
-            delta_to_fail_s,
-            gateway_container_state_at_fail,
-            output.report.execution_time_seconds,
-        )
-
-        if not output.report.ok_status:
-            reason = _classify_runtime_failure(output.report.error)
-            app.state.runtime_fail_counters[reason] += 1
-            if has_gateway_transport_error:
-                _mark_last_transport_error(
-                    run_id=request.run_id,
-                    error=output.report.error or "GatewayTransportError",
-                    source="runtime",
-                    ws_close_code=ws_close_code,
-                    ws_close_reason=ws_close_reason,
-                    last_hook_event=last_hook_event,
-                    delta_to_fail_s=delta_to_fail_s,
-                    gateway_container_state_at_fail=gateway_container_state_at_fail,
-                )
-
-        await _enqueue_callback(output.report)
-    except Exception as exc:
-        tb = traceback.format_exc()
-        logger.error(
-            "Compact-bench task failed before reporting: run_id=%s, error=%s\n%s",
-            request.run_id,
-            str(exc),
-            tb,
-        )
-        fallback_report = CompactBenchReportRequest(
-            run_id=request.run_id,
-            ok_status=False,
-            error=f"{type(exc).__name__}: {exc}",
-            execution_time_seconds=None,
-            total_tokens=None,
-            agent_steps=None,
-            patch_capture_status=False,
-            patch_diff=None,
-            metadata={
-                "benchmark": request.benchmark,
-                "instance_id": request.instance_id,
-                "traceback": tb,
-            },
-        )
-        app.state.runtime_fail_counters[_classify_runtime_failure(fallback_report.error)] += 1
-        await _enqueue_callback(fallback_report)
-    finally:
-        active_runs: set[int] = app.state.active_runs
-        active_runs.discard(request.run_id)
-        logger.info("Releasing compact-bench capacity slot: run_id=%s", request.run_id)
-        _release_capacity_slot()
-
-
 @app.post("/run_compact_bench_task", response_model=CompactBenchRunTaskResponse)
 async def run_compact_bench_task(
     request: CompactBenchRunTaskRequest,
@@ -569,15 +430,25 @@ async def run_compact_bench_task(
     """Accept a compact-bench task for asynchronous execution and callback reporting."""
 
     _get_compact_bench_report_url()
-    await _acquire_capacity_slot(
-        operation_kind="Compact-bench",
-        operation_id=str(request.run_id),
-    )
+    if request.agent_name != SUPPORTED_AGENT_NAME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"agent_name={request.agent_name!r} is not supported; only {SUPPORTED_AGENT_NAME!r} runs here.",
+        )
+    if app.state.draining:
+        raise HTTPException(status_code=503, detail="Sandbox is draining and accepts no new runs.")
+    supervisor = _get_supervisor()
+    if request.run_id in supervisor.slots:
+        # The platform retried a dispatch that already landed; one run, one report.
+        logger.warning("Duplicate dispatch for an active run ignored: run_id=%s", request.run_id)
+        return CompactBenchRunTaskResponse(success=True)
+    # The capacity check and the reservation in accept() must not be separated by an await.
+    _check_capacity(operation_kind="Compact-bench", operation_id=str(request.run_id))
     rejected_by_run_id: dict[int, int] = app.state.rejected_by_run_id
     previous_rejects = rejected_by_run_id.pop(request.run_id, 0)
     if previous_rejects > 0:
         app.state.accepted_after_reject += 1
-    app.state.active_runs.add(request.run_id)
+    supervisor.accept(request)
     logger.info(
         "Accepted compact-bench task: run_id=%s benchmark=%s instance_id=%s previous_rejects=%s accepted_after_reject=%s",
         request.run_id,
@@ -586,8 +457,23 @@ async def run_compact_bench_task(
         previous_rejects,
         app.state.accepted_after_reject,
     )
-    asyncio.create_task(_execute_compact_bench_task_in_background(request))
     return CompactBenchRunTaskResponse(success=True)
+
+
+class DrainRequest(BaseModel):
+    enabled: bool = True
+
+
+@app.post("/admin/drain")
+async def drain(body: DrainRequest) -> dict[str, Any]:
+    """Stop (or resume) accepting runs, e.g. before host maintenance.
+
+    Not needed to deploy a new API or runner image: runners outlive the API.
+    """
+    app.state.draining = body.enabled
+    supervisor = _get_supervisor()
+    logger.warning("Drain %s: active_runs=%s", "enabled" if body.enabled else "disabled", supervisor.occupied())
+    return {"draining": app.state.draining, "active_runs": supervisor.active_run_ids()}
 
 
 @app.get("/health")
@@ -599,12 +485,15 @@ async def health() -> dict[str, str]:
 @app.get("/health/swebench")
 async def health_swebench() -> dict[str, Any]:
     queue_stats = _get_callback_queue().stats()
-    active_runs: set[int] = app.state.active_runs
+    supervisor = _get_supervisor()
     return {
         "status": "ok",
+        "draining": app.state.draining,
+        "max_concurrent": app.state.max_concurrent,
         "active_runs": {
-            "count": len(active_runs),
-            "run_ids": sorted(active_runs),
+            "count": supervisor.occupied(),
+            "run_ids": supervisor.active_run_ids(),
+            "by_phase": dict(Counter(slot.phase for slot in supervisor.slots.values())),
         },
         "queued_callbacks": queue_stats["queued_callbacks"],
         "callback_retry_backlog": queue_stats["callback_retry_backlog"],
@@ -627,4 +516,6 @@ if __name__ == "__main__":
         host=host,
         port=port,
         log_level="info",
+        # Let uvicorn finish in-flight requests on SIGTERM; runners are unaffected.
+        timeout_graceful_shutdown=10,
     )

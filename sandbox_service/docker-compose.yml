@@ -1,0 +1,41 @@
+# The long-running part of a sandbox host: the API. Runners (one per run) are started
+# by the API itself from the same image, so they are not services here.
+#
+#   SANDBOX_IMAGE=soma-sandbox:<tag> docker compose -f docker-compose.yml up -d
+#
+# Every host path below is mounted at the same path inside the container: the API and
+# its runners pass these paths to the host's Docker daemon as bind-mount sources.
+name: soma-sandbox
+
+services:
+  sandbox-api:
+    image: ${SANDBOX_IMAGE:?set SANDBOX_IMAGE to the soma-sandbox image tag to run}
+    network_mode: host
+    restart: unless-stopped
+    env_file:
+      - ${SANDBOX_ENV_FILE:-/root/SOMA-wt/sandbox_service/.env}
+    environment:
+      SANDBOX_RUNNER_IMAGE: ${SANDBOX_IMAGE}
+      SANDBOX_DATA_DIR: /var/lib/soma-sandbox
+      SANDBOX_SECRETS_DIR: /run/soma-sandbox/secrets
+      SOMA_COPILOT_RUN_ROOT: /tmp/soma-benchmark-copilot-runs
+      SOMA_BENCHMARK_CACHE_DIR: /var/lib/soma-sandbox/benchmark-cache
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/soma-sandbox:/var/lib/soma-sandbox
+      - /run/soma-sandbox:/run/soma-sandbox
+      - /tmp/soma-benchmark-copilot-runs:/tmp/soma-benchmark-copilot-runs
+    # Stopping the API does not stop runs: runners are separate containers that the
+    # next API adopts. Nothing to drain on a redeploy.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${SANDBOX_SERVICE_PORT:-8001}/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
