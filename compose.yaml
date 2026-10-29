@@ -41,7 +41,7 @@ services:
       <<: *platform-env
       SOMA_SERVICE_ROLE: metagraph
     volumes:
-      - metagraph-state:/var/lib/soma
+      - ${SOMA_RUNTIME_DIR:-../SOMA/runtime}/metagraph:/var/lib/soma
 
   platform-api:
     <<: *python-service
@@ -52,7 +52,7 @@ services:
       <<: *platform-env
       SOMA_SERVICE_ROLE: api
     volumes:
-      - api-state:/var/lib/soma
+      - ${SOMA_RUNTIME_DIR:-../SOMA/runtime}/platform-api:/var/lib/soma
       - ${SOMA_WALLETS_DIR:-./secrets/wallets}:/run/wallets:ro
     depends_on:
       metagraph: {condition: service_healthy}
@@ -69,7 +69,7 @@ services:
       # Restarts run in the dedicated worker below, never in this API process.
       COORDINATOR_RESTARTER_ENABLED: "false"
     volumes:
-      - coordinator-state:/var/lib/soma
+      - ${SOMA_RUNTIME_DIR:-../SOMA/runtime}/run-coordinator:/var/lib/soma
       - ${SOMA_TASKS_DIR:-./tasks}:/data/tasks:ro
 
   auto-run-restarter:
@@ -80,7 +80,7 @@ services:
     environment:
       <<: *platform-env
     volumes:
-      - restarter-state:/var/lib/soma
+      - ${SOMA_RUNTIME_DIR:-../SOMA/runtime}/auto-run-restarter:/var/lib/soma
     depends_on:
       run-coordinator: {condition: service_healthy}
 
@@ -93,7 +93,7 @@ services:
       <<: *platform-env
       SOMA_SERVICE_ROLE: results
     volumes:
-      - results-state:/var/lib/soma
+      - ${SOMA_RUNTIME_DIR:-../SOMA/runtime}/results:/var/lib/soma
     depends_on:
       metagraph: {condition: service_healthy}
 
@@ -106,7 +106,9 @@ services:
       GATEWAY_FAILED_CALLS_DIR: /var/lib/soma/failed_calls
       GATEWAY_INSTANCE_ID: gateway-1
     volumes:
-      - gateway-1-state:/var/lib/soma
+      # Both replicas share a durable parent. The application isolates audit
+      # records below an instance-specific child directory.
+      - ${SOMA_RUNTIME_DIR:-../SOMA/runtime}/gateways:/var/lib/soma
     stop_grace_period: ${GATEWAY_STOP_GRACE_PERIOD:-30m}
 
   gateway-2:
@@ -118,7 +120,7 @@ services:
       GATEWAY_FAILED_CALLS_DIR: /var/lib/soma/failed_calls
       GATEWAY_INSTANCE_ID: gateway-2
     volumes:
-      - gateway-2-state:/var/lib/soma
+      - ${SOMA_RUNTIME_DIR:-../SOMA/runtime}/gateways:/var/lib/soma
     stop_grace_period: ${GATEWAY_STOP_GRACE_PERIOD:-30m}
 
   ingress:
@@ -147,12 +149,3 @@ networks:
     ipam:
       config:
         - subnet: 172.30.114.0/24
-
-volumes:
-  metagraph-state:
-  api-state:
-  coordinator-state:
-  restarter-state:
-  results-state:
-  gateway-1-state:
-  gateway-2-state:

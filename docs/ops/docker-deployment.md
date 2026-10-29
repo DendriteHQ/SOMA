@@ -65,7 +65,10 @@ health check before starting.
 
 The exception is the gateway: `gateway-1` and `gateway-2` are intentionally a
 small, independently addressable pool. They do not hold platform correctness
-state; their failed-call files are per-instance diagnostics. Ingress uses least
+state; their failed-call files are persisted below
+`$SOMA_RUNTIME_DIR/gateways/failed_calls/<gateway-instance>/`. The shared parent
+is safe because every replica has a distinct `GATEWAY_INSTANCE_ID` and therefore
+never appends to another replica's daily audit JSONL. Ingress uses least
 connections and Docker DNS re-resolution so a recreated gateway gets a new IP
 without an ingress restart. The public URL remains port 8050.
 
@@ -121,6 +124,22 @@ Populate `.env` using the existing deployment's configuration, including:
 - Existing task publication credentials and feature flags. The example disables
   publication until configured; do not use those disabled values accidentally
   when replacing a deployment that publishes tasks.
+
+All service-local runtime data is bind-mounted from `SOMA_RUNTIME_DIR`, including
+rotated logs, caches, aggregate snapshots, dispatch/restart audit records, and
+gateway failed-call records. Its default is `../SOMA/runtime`, which resolves to
+`/root/SOMA/runtime` for this checkout. Set an absolute value when the sibling
+layout is not used. Before the first start, prepare the directories for the
+unprivileged container user:
+
+```bash
+sudo ./mcp_platform_services/prepare-runtime-state.sh
+```
+
+The script dynamically locates this checkout to choose its default and creates
+one UID/GID `10001` owned directory per service. It does not create or modify
+wallets or task-definition inputs. Treat the runtime directory as operational
+data and back it up with a retention policy appropriate for logs and audits.
 
 Translate host filesystem paths to their container mounts. For example, task rows
 under `SOMA_TASKS_DIR` are visible to the coordinator at `/data/tasks`; set
@@ -255,7 +274,8 @@ TLS termination remains at the existing external proxy/load balancer.
 
 ## Retry service and persistent state
 
-`auto-run-restarter` is a separate worker with its own `restarter-state` volume.
+`auto-run-restarter` is a separate worker with durable state in
+`$SOMA_RUNTIME_DIR/auto-run-restarter`.
 It starts after the coordinator is healthy, scans retryable terminal runs, and
 deletes eligible rows so coordinator seeding creates replacements. Existing
 `AUTO_RUN_RESTARTER_*` controls, including dry-run mode, still apply. A health
@@ -267,7 +287,7 @@ an operator accidentally starts another restarter. The split preserves existing
 deletion/reseeding semantics; it does not introduce durable attempt versioning
 or transactional retry-count storage.
 
-Its state volume contains `restart_counts.json`, `last_successful_tick`, and
+Its state directory contains `restart_counts.json`, `last_successful_tick`, and
 daily `YYYY-MM-DD/restarted_runs.jsonl` audit files. The health check accepts a
 marker no older than `max(180 seconds, 3 × configured interval + 30 seconds)`.
 Use the worker's [service README](../../mcp_platform_services/auto-run-restarter/README.md)
@@ -287,7 +307,7 @@ rebuild/restart commands.
 4. Release or reroute ports 8000/8050, then start Compose. Confirm upload/validator
    requests, sandbox callbacks, streaming and task readiness.
 5. On rollback, stop the Docker coordinator before restoring the prior process.
-   Restore routing rather than deleting database history or state volumes.
+   Restore routing rather than deleting database history or host runtime data.
 
 This change does not manage the separately maintained SOMA-admin-endpoints project,
 move schema ownership, or deploy the proposal's outbox/event transport. Those are

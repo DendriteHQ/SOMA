@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 from typing import AsyncIterator
 from urllib.parse import quote
@@ -227,6 +228,17 @@ def _failed_calls_dir() -> Path:
     )
 
 
+def _gateway_instance_directory() -> str:
+    """Return a safe, stable directory component for a gateway replica.
+
+    Audit records are persisted on a shared host mount.  Separating replicas by
+    instance ID prevents concurrent containers from appending to one daily JSONL.
+    """
+    instance_id = _gateway_instance_id()
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", instance_id).strip(".-")
+    return normalized or "gateway"
+
+
 def _decode_body_preview(body: bytes, *, limit: int = 20000) -> str:
     if not body:
         return ""
@@ -246,7 +258,11 @@ def _load_json_body(body: bytes) -> dict | list | None:
 
 
 def _failed_call_record_path(now: datetime) -> Path:
-    return _failed_calls_dir() / f"{now.date().isoformat()}.jsonl"
+    return (
+        _failed_calls_dir()
+        / _gateway_instance_directory()
+        / f"{now.date().isoformat()}.jsonl"
+    )
 
 
 def _append_text_line(path: Path, line: str) -> None:

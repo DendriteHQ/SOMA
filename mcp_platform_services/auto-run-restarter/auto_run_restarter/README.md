@@ -9,7 +9,8 @@ For every successfully deleted run, the service appends a JSON line to:
 /var/lib/soma/restarts/YYYY-MM-DD/restarted_runs.jsonl
 ```
 
-That is the path used by the Compose worker's `restarter-state` volume. The
+That path is bind-mounted from
+`$SOMA_RUNTIME_DIR/auto-run-restarter/restarts` for the Compose worker. The
 repository-local metadata path below is only for a standalone developer run.
 
 Current restart rules:

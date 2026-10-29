@@ -45,12 +45,12 @@ Compose deployment.
 | Compose service | Build folder | HTTP ownership | Background ownership | Persistent state |
 | --- | --- | --- | --- | --- |
 | `ingress` | `mcp_platform_services/ingress` | Public port 8000 and gateway port 8050; routing only | None | None |
-| `metagraph` | `mcp_platform_services/metagraph` | Internal metagraph snapshot and economics API | Bittensor synchronization | `metagraph-state` volume |
-| `platform-api` | `mcp_platform_services/platform-api` | Miner and validator endpoints | Validator heartbeat | `api-state` volume |
-| `run-coordinator` | `mcp_platform_services/run-coordinator` | `/api/private/sandbox/*` callbacks | Competition seeding, dispatch, run recovery, and task publication | `coordinator-state` volume |
-| `auto-run-restarter` | `mcp_platform_services/auto-run-restarter` | None | Retry-policy scan and deletion of eligible failed runs | `restarter-state` volume |
-| `results` | `mcp_platform_services/results` | `/api/private/frontend/*` and `/api/private/incentives/*` | Aggregate snapshot refresh | `results-state` volume |
-| `gateway-1`, `gateway-2` | `mcp_platform_services/gateway` | Existing OpenAI-compatible gateway routes on port 8050 | None | One `gateway-*-state` volume per instance |
+| `metagraph` | `mcp_platform_services/metagraph` | Internal metagraph snapshot and economics API | Bittensor synchronization | `$SOMA_RUNTIME_DIR/metagraph` |
+| `platform-api` | `mcp_platform_services/platform-api` | Miner and validator endpoints | Validator heartbeat | `$SOMA_RUNTIME_DIR/platform-api` |
+| `run-coordinator` | `mcp_platform_services/run-coordinator` | `/api/private/sandbox/*` callbacks | Competition seeding, dispatch, run recovery, and task publication | `$SOMA_RUNTIME_DIR/run-coordinator` |
+| `auto-run-restarter` | `mcp_platform_services/auto-run-restarter` | None | Retry-policy scan and deletion of eligible failed runs | `$SOMA_RUNTIME_DIR/auto-run-restarter` |
+| `results` | `mcp_platform_services/results` | `/api/private/frontend/*` and `/api/private/incentives/*` | Aggregate snapshot refresh | `$SOMA_RUNTIME_DIR/results` |
+| `gateway-1`, `gateway-2` | `mcp_platform_services/gateway` | Existing OpenAI-compatible gateway routes on port 8050 | None | Shared `$SOMA_RUNTIME_DIR/gateways`, instance-scoped audit paths |
 
 All platform services except `metagraph` connect to the existing PostgreSQL
 database. This is a shared schema during the current transition; a container's
@@ -90,8 +90,9 @@ normal platform access to private wallet material. The process runs as UID 10001
 so its selected hotkey must grant that UID read access while retaining private
 permissions (for example, owner UID 10001 and mode `0600`).
 
-The container stores service-local logs, caches, and other runtime files in the
-`api-state` Docker volume. PostgreSQL remains the source of truth for platform
+The container stores service-local logs, caches, and other runtime files under
+`$SOMA_RUNTIME_DIR/platform-api` (by default `/root/SOMA/runtime/platform-api`).
+PostgreSQL remains the source of truth for platform
 data. The container has no Docker socket and does not dispatch sandbox work.
 
 ## `run-coordinator`
@@ -117,7 +118,7 @@ that match the established retry policy, deletes those rows, and records audit
 metadata. The coordinator seeds replacement work on its ordinary tick. The
 worker has no public endpoint and does not call the sandbox fleet.
 
-Its `restarter-state` volume contains restart counters, JSONL audit records,
+Its runtime directory contains restart counters, JSONL audit records,
 and a health marker written only after a successful database scan. PostgreSQL's
 advisory lock remains a protection against accidental duplicate workers, while
 Compose explicitly disables the former coordinator-embedded loop.
@@ -141,7 +142,8 @@ is `results`, which loads the frontend and incentive-admin routers. It runs the
 aggregate refresh task. Displayed economics depend on chain data supplied by the
 dedicated metagraph service.
 
-The service persists aggregate snapshots and local cache files in `results-state`.
+The service persists aggregate snapshots and local cache files in
+`$SOMA_RUNTIME_DIR/results`.
 It gets current chain economics from the same cached metagraph client used by the
 API. It does not seed, dispatch, publish, or receive sandbox callbacks. This keeps
 frontend-refresh failures from stopping run dispatch and keeps run activity from
@@ -170,8 +172,10 @@ of the existing OpenAI-compatible LLM proxy, exposed through ingress on port
 secret from SSM, and stream requests to the configured upstream provider. Their
 public behavior and URL shape are preserved for benchmark callers.
 
-Failed-call records are written beneath `/var/lib/soma/failed_calls` in an
-instance-specific state volume. Ingress uses least-connections balancing and
+Failed-call records are written below
+`$SOMA_RUNTIME_DIR/gateways/failed_calls/<gateway-instance>/`. Both replicas can
+write concurrently because each instance has an isolated directory and daily
+JSONL file; any added replica must use a unique `GATEWAY_INSTANCE_ID`. Ingress uses least-connections balancing and
 re-resolves Docker service addresses after a replacement. The update script in
 `mcp_platform_services/gateway/rolling-update.sh` drains one instance at a time, waits for
 existing streams, recreates it, then proceeds to the other instance. A drain

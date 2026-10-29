@@ -6,9 +6,9 @@ the run coordinator seeds replacements on its next normal tick. It has no HTTP
 port, does not call the sandbox fleet, and is not routed through ingress.
 
 A successful database scan updates its health marker; the container becomes
-unhealthy if that marker is stale. Restart counts and audit JSONL are stored in
-the dedicated `restarter-state` Docker volume at
-`/var/lib/soma/restarts`.
+unhealthy if that marker is stale. Restart counts and audit JSONL are persisted
+at `$SOMA_RUNTIME_DIR/auto-run-restarter/restarts` (mounted in the container at
+`/var/lib/soma/restarts`).
 
 The PostgreSQL advisory lock remains a final safeguard against two restarters,
 but Compose starts exactly one `auto-run-restarter` instance and explicitly
@@ -69,7 +69,7 @@ SOMA_ENV_FILE=.env docker compose --env-file .env exec -T auto-run-restarter \
   cat /var/lib/soma/restarts/last_successful_tick
 ```
 
-The volume contains `restart_counts.json`, the health marker, and daily audit
+The host runtime directory contains `restart_counts.json`, the health marker, and daily audit
 files at `/var/lib/soma/restarts/YYYY-MM-DD/restarted_runs.jsonl`. Rebuild or
 restart only this worker after a policy change; this does not interrupt gateway
 streams or public HTTP endpoints:
@@ -81,8 +81,8 @@ SOMA_ENV_FILE=.env docker compose --env-file .env up -d --build --force-recreate
 For a safe policy check, set `AUTO_RUN_RESTARTER_DRY_RUN=true` in a staging
 environment, recreate the worker, and review `matched_runs` in its logs. Return
 the setting to `false` and recreate the worker to resume deletion. Do not delete
-the `restarter-state` volume during routine restarts because it contains the
-persisted per-miner restart caps and audit trail.
+`$SOMA_RUNTIME_DIR/auto-run-restarter` during routine restarts because it contains
+the persisted per-miner restart caps and audit trail.
 
 See the [deployment guide](../../docs/ops/docker-deployment.md) for the full
 stack lifecycle and [container responsibilities](../../docs/ops/container-responsibilities.md)
