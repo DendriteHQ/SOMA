@@ -61,6 +61,11 @@ DEFAULT_EVAL_MEMORY = "4g"
 DEFAULT_EVAL_PIDS_LIMIT = 1024
 DEFAULT_EVAL_NOFILE = 65536
 
+# Temporary task-specific workaround: LMCache's shared tests/conftest.py allocates a
+# 5 GiB session fixture that its configuration tests don't use. The evaluator's 4 GiB
+# cgroup limit would otherwise kill pytest before it writes its report.
+LMCACHE_CONFIG_TASK_ID = "LMCache__LMCache-4380"
+
 # A task's tests size their parallelism from the CPU count they see: pytest-xdist
 # `-n auto|logical` (psutil), multiprocessing pools (os.cpu_count()) and native thread
 # pools (OpenBLAS, polars/rayon, tokio, V8). Both Python counts read this file, which
@@ -444,10 +449,11 @@ class SomaTaskContainerEvaluator:
                         dropped_test_files=dropped_test_files,
                     )
 
-                tested = _run(
-                    ["docker", "exec", "-w", workdir, container_id, "sh", "-lc", run_tests],
-                    timeout=timeout,
-                )
+                exec_args = ["docker", "exec", "-w", workdir]
+                if normalized_instance_id == LMCACHE_CONFIG_TASK_ID:
+                    exec_args.extend(["-e", "PYTEST_ADDOPTS=--noconftest"])
+                exec_args.extend([container_id, "sh", "-lc", run_tests])
+                tested = _run(exec_args, timeout=timeout)
                 test_logs = (tested.stdout or "") + (tested.stderr or "")
 
                 report_path = work_path / "report.json"
