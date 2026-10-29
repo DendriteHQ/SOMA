@@ -926,7 +926,7 @@ async def _fetch_swe_task_groups_by_hotkey_live(
         WITH baseline_validation_choice AS (
             SELECT DISTINCT ON (rv.run_fk)
                 rv.run_fk,
-                resolved.resolved
+                CASE WHEN rv.scored_at IS NOT NULL THEN resolved.resolved END AS resolved
             FROM swe_bench_run_validations rv
             LEFT JOIN {resolved_validation_table} resolved
               ON resolved.validation_fk = rv.id
@@ -970,7 +970,7 @@ async def _fetch_swe_task_groups_by_hotkey_live(
         WITH miner_validation_choice AS (
             SELECT DISTINCT ON (rv.run_fk)
                 rv.run_fk,
-                resolved.resolved
+                CASE WHEN rv.scored_at IS NOT NULL THEN resolved.resolved END AS resolved
             FROM swe_bench_run_validations rv
             LEFT JOIN {resolved_validation_table} resolved
               ON resolved.validation_fk = rv.id
