@@ -146,6 +146,31 @@ class SWEBenchContainerEvaluator:
                         "Failed to close Docker client after cleanup", exc_info=True
                     )
 
+    def remove_grading_containers(self) -> int:
+        """Force-remove harness containers started by this validator, running or not.
+
+        The harness names them ``sweb.eval.<instance>.<run_id>`` and every run id here
+        comes from ``_make_run_id``, so other SWE-bench users on the host are left
+        alone. Only safe when no evaluation is in flight (see the SOMA evaluator).
+        """
+        docker = importlib.import_module("docker")
+        client = docker.from_env(timeout=600)
+        removed = 0
+        try:
+            for container in client.containers.list(all=True, filters={"name": "sweb.eval."}):
+                if ".validator-" not in str(getattr(container, "name", "")):
+                    continue
+                try:
+                    container.remove(force=True)
+                    removed += 1
+                except Exception:
+                    logger.debug(
+                        "Failed to remove SWE-Bench container", exc_info=True
+                    )
+            return removed
+        finally:
+            client.close()
+
     def _evaluate_instance_diff_sync(
         self,
         *,

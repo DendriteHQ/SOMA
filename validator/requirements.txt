@@ -1,0 +1,20 @@
+# Validator-only dependencies, used by validator/Dockerfile. Versions match the
+# repository-wide requirements.txt; the git dependencies are pinned to a commit so an
+# image built from a given commit always contains the same code.
+bittensor==9.0.0
+# bittensor 9.0.0 does not cap these; newer async-substrate-interface pulls cyscale,
+# which refuses to import next to bittensor's scalecodec.
+async-substrate-interface==1.5.15
+bittensor-wallet==4.0.1
+bt-decode==0.8.0
+scalecodec==1.2.11
+docker==7.1.0
+fastapi==0.110.3
+httpx==0.28.1
+numpy==2.0.2
+pydantic==2.12.5
+python-dotenv==1.2.1
+requests==2.32.5
+uvicorn==0.40.0
+swebench @ git+https://github.com/SWE-rebench/SWE-bench-fork.git@e4907b7a90eafaa1f0a6428fd04fe31cdd8b4284
+soma-shared @ git+https://github.com/DendriteHQ/SOMA-shared.git@cb2d697f46a193c56ec928b66dadb73d3018be3b

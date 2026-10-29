@@ -284,15 +284,8 @@ class SomaTaskContainerEvaluator:
         Scoped by the configured repository prefix so nothing else is touched.
         """
         prefix = self._image_repository()
-        removed_containers = 0
+        removed_containers = self.remove_grading_containers()
         removed_images = 0
-
-        listing = _run(
-            ["docker", "ps", "-a", "--filter", f"name={CONTAINER_NAME_PREFIX}", "--format", "{{.ID}}"]
-        )
-        for container_id in (listing.stdout or "").split():
-            if _run(["docker", "rm", "-f", "-v", container_id]).returncode == 0:
-                removed_containers += 1
 
         images = _run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"])
         for reference in (images.stdout or "").splitlines():
@@ -314,6 +307,22 @@ class SomaTaskContainerEvaluator:
             "removed_containers": removed_containers,
             "removed_images": removed_images,
         }
+
+    def remove_grading_containers(self) -> int:
+        """Force-remove every grading container, running or not.
+
+        Only safe when no evaluation is in flight: at the end of a competition, or at
+        start-up, where anything left is an orphan of a previous process (a stopped or
+        restarted validator does not wait for its graded containers to finish).
+        """
+        removed = 0
+        listing = _run(
+            ["docker", "ps", "-a", "--filter", f"name={CONTAINER_NAME_PREFIX}", "--format", "{{.ID}}"]
+        )
+        for container_id in (listing.stdout or "").split():
+            if _run(["docker", "rm", "-f", "-v", container_id]).returncode == 0:
+                removed += 1
+        return removed
 
     # -- grading -------------------------------------------------------------
 
