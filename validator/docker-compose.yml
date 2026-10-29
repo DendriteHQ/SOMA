@@ -11,6 +11,9 @@ services:
       context: ..
       dockerfile: validator/Dockerfile
     env_file: .env
+    environment:
+      # Grading work dirs (tempfile) must live under the shared path mounted below.
+      TMPDIR: /tmp/soma-validator
     restart: unless-stopped
     # Reaps the docker CLI subprocesses and forwards SIGTERM to uvicorn.
     init: true
@@ -24,6 +27,9 @@ services:
       # Graded task containers run as siblings on the host's Docker daemon. Access to
       # this socket is root-equivalent on the host.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Grading bind-mounts files from its work dir into those siblings, and the host
+      # daemon resolves that source path on the host, so it must be identical here.
+      - /tmp/soma-validator:/tmp/soma-validator
       # Only the hotkey is used (signing and set_weights); the coldkey need not be
       # on this host at all.
       - ${BT_WALLET_PATH:-~/.bittensor/wallets}:/root/.bittensor/wallets:ro
