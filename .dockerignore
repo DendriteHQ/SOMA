@@ -1,0 +1,14 @@
+.git
+**/.env
+**/.env.*
+!.env.example
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/metadata
+**/logs
+secrets
+tasks
+downloads
+*.dump
+*.zip

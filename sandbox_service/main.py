@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Add parent directory to path to find mcp_platform module
+# Add the repository root so shared local modules remain importable.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import httpx
