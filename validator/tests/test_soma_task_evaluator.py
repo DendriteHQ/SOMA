@@ -33,6 +33,7 @@ from validator.evaluation.soma_task_registry import (  # noqa: E402
 )
 
 INSTANCE_ID = "prompt-toolkit__python-prompt-toolkit-2025"
+LMCACHE_CONFIG_TASK_ID = "LMCache__LMCache-4380"
 FAIL_TO_PASS = ["tests/test_document.py::test_get_word_before_cursor_with_whitespace_and_pattern"]
 PASS_TO_PASS = ["tests/test_document.py::test_current_char"]
 
@@ -348,6 +349,52 @@ def test_workdir_and_run_tests_come_from_the_image_labels(tmp_path, monkeypatch)
         call for call in fake.calls if call[:2] == ["docker", "exec"] and "/soma/run_tests.sh" in call
     )
     assert exec_call[exec_call.index("-w") + 1] == "/repo"
+
+
+def test_lmcache_config_task_skips_its_unneeded_shared_conftest(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    from validator.evaluation import soma_task_evaluator
+
+    monkeypatch.setattr(soma_task_evaluator, "_run", fake)
+    monkeypatch.setattr(
+        SomaTaskContainerEvaluator, "_image_labels", staticmethod(lambda _image: dict(IMAGE_LABELS))
+    )
+    grading_file = _write_grading_file(
+        tmp_path,
+        [{
+            "instance_id": LMCACHE_CONFIG_TASK_ID,
+            "FAIL_TO_PASS": FAIL_TO_PASS,
+            "PASS_TO_PASS": PASS_TO_PASS,
+        }],
+    )
+    evaluator = SomaTaskContainerEvaluator(
+        settings=SimpleNamespace(
+            soma_task_test_image_repository="example/soma-tasks",
+            soma_task_eval_remove_image_after_run=False,
+        ),
+        registry=SomaTaskRegistry(grading_file),
+    )
+
+    evaluator._evaluate_instance_diff_sync(instance_id=LMCACHE_CONFIG_TASK_ID, diff=VALID_DIFF)
+
+    exec_call = next(
+        call for call in fake.calls
+        if call[:2] == ["docker", "exec"] and "/soma/run_tests.sh" in call
+    )
+    assert exec_call[exec_call.index("-e") + 1] == "PYTEST_ADDOPTS=--noconftest"
+
+
+def test_other_tasks_do_not_skip_conftest(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    evaluator = _evaluator(tmp_path, monkeypatch, fake)
+
+    evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
+
+    exec_call = next(
+        call for call in fake.calls
+        if call[:2] == ["docker", "exec"] and "/soma/run_tests.sh" in call
+    )
+    assert "PYTEST_ADDOPTS=--noconftest" not in exec_call
 
 
 def test_report_path_is_read_off_the_image_test_command(tmp_path, monkeypatch):
