@@ -29,7 +29,6 @@ from soma_shared.contracts.api.v1.frontend import (
     ValidatorsListResponse,
 )
 from soma_shared.db.models.competition import Competition
-from soma_shared.db.models.competition_challenge import CompetitionChallenge
 from soma_shared.db.models.competition_config import CompetitionConfig
 from soma_shared.db.models.competition_timeframe import CompetitionTimeframe
 from soma_shared.db.models.miner import Miner
@@ -2341,23 +2340,12 @@ async def get_active_competitions(
     request: Request,
     db: AsyncSession = Depends(get_db_read_session),
 ) -> list[MinerCompetitionItem]:
-    has_swe_tasks = True
-    has_compression_tasks = (
-        select(CompetitionChallenge.challenge_fk)
-        .where(CompetitionChallenge.competition_fk == Competition.id)
-        .exists()
-    )
-
     rows = (
         await db.execute(
             select(
                 Competition.id.label("competition_id"),
                 Competition.competition_name,
-                sa.case(
-                    (has_swe_tasks, "swe"),
-                    (has_compression_tasks, "compression"),
-                    else_="compression",
-                ).label("competition_type"),
+                sa.literal("swe").label("competition_type"),
                 CompetitionTimeframe.upload_starts_at.label("upload_start"),
                 CompetitionTimeframe.upload_ends_at.label("upload_end"),
                 CompetitionTimeframe.eval_starts_at.label("evaluation_start"),
