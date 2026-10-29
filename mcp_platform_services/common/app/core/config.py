@@ -1,0 +1,1011 @@
+from __future__ import annotations
+
+import json
+import subprocess
+
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import quote
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(Path(__file__).resolve().parents[2] / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    _wallet: Any = PrivateAttr(default=None)
+
+    # App
+    service_role: Literal["api", "coordinator", "results", "metagraph"] = Field(
+        default="api", alias="SOMA_SERVICE_ROLE",
+    )
+    db_initialize_schema: bool = Field(default=False, alias="DB_INITIALIZE_SCHEMA")
+    app_name: str = Field(default="MCP-subnet", alias="APP_NAME")
+    app_env: str = Field(default="dev", alias="APP_ENV")
+    app_host: str = Field(default="0.0.0.0", alias="APP_HOST")
+    app_port: int = Field(default=8000, alias="APP_PORT")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    debug: bool = Field(default=False, alias="DEBUG")
+    debug_clear_db: bool = Field(default=False, alias="DEBUG_CLEAR_DB")
+    inject_mock_data: bool = Field(default=False, alias="INJECT_MOCK")
+    log_levels: dict[str, str] = Field(default_factory=dict, alias="LOG_LEVELS")
+    log_include_extras: bool = Field(default=True, alias="LOG_INCLUDE_EXTRAS")
+    log_dir: Path | None = Field(default=None, alias="LOG_DIR")
+    log_file_max_bytes: int = Field(
+        default=10 * 1024 * 1024,
+        alias="LOG_FILE_MAX_BYTES",
+    )
+    log_file_backup_count: int = Field(default=5, alias="LOG_FILE_BACKUP_COUNT")
+
+    # DB
+    postgres_dsn: str | None = Field(
+        default=None, alias="POSTGRES_DSN"
+    )  # TODO think how to fix no default and strict typing
+    db_pool_size: int = Field(default=10, alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=20, alias="DB_MAX_OVERFLOW")
+    db_echo: bool = Field(default=False, alias="DB_ECHO")
+    rds_secret_id: str | None = Field(default=None, alias="RDS_SECRET_ID")
+    rds_port: int | None = Field(default=None, alias="RDS_PORT")
+    rds_db_name: str | None = Field(default=None, alias="RDS_DB_NAME")
+    rds_use_reader: bool = Field(default=False, alias="RDS_USE_READER")
+    miner_max_solution_size_bytes: int = Field(
+        default=10 * 1024 * 1024, alias="MINER_MAX_SOLUTION_SIZE_BYTES"
+    )
+    # Per-hotkey limit on /miner/run-logs (sliding window); 0 disables it.
+    miner_run_logs_rate_limit_requests: int = Field(
+        default=5, alias="MINER_RUN_LOGS_RATE_LIMIT_REQUESTS"
+    )
+    miner_run_logs_rate_limit_window_secs: int = Field(
+        default=60, alias="MINER_RUN_LOGS_RATE_LIMIT_WINDOW_SECS"
+    )
+    # Bytes of a run's compressor log returned by /miner/run-logs, newest kept. The
+    # sandbox caps the log at 1 MiB, but the newest entry is kept even when larger and
+    # the miner's code runs in the process that writes it, so it is not trusted.
+    miner_run_logs_max_bytes: int = Field(
+        default=2 * 1024 * 1024, alias="MINER_RUN_LOGS_MAX_BYTES"
+    )
+    # S3
+    s3_bucket: str | None = Field(default=None, alias="S3_BUCKET")
+
+    # Bittensor / Metagraph
+    wallet_name: str | None = Field(default=None, alias="WALLET_NAME")
+    wallet_path: str | None = Field(default=None, alias="WALLET_PATH")
+    wallet_hotkey: str | None = Field(default=None, alias="WALLET_HOTKEY")
+    bt_netuid: int = Field(default=114, alias="BT_NETUID")
+    bt_network: str = Field(default="finney", alias="BT_NETWORK")
+    bt_chain_endpoint: str | None = Field(default=None, alias="BT_CHAIN_ENDPOINT")
+    bt_metagraph_epoch_length: int = Field(
+        default=100, alias="BT_METAGRAPH_EPOCH_LENGTH"
+    )
+    bt_metagraph_sync_secs: int = Field(default=360, alias="BT_METAGRAPH_SYNC_SECS")
+    bt_metagraph_sync_timeout_secs: int = Field(
+        default=30, alias="BT_METAGRAPH_SYNC_TIMEOUT_SECS"
+    )
+    bt_metagraph_init_timeout_secs: int = Field(
+        default=30, alias="BT_METAGRAPH_INIT_TIMEOUT_SECS"
+    )
+    metagraph_service_url: str = Field(
+        default="http://metagraph:8000", alias="METAGRAPH_SERVICE_URL"
+    )
+    metagraph_client_refresh_secs: float = Field(
+        default=5.0, alias="METAGRAPH_CLIENT_REFRESH_SECS"
+    )
+    metagraph_client_timeout_secs: float = Field(
+        default=5.0, alias="METAGRAPH_CLIENT_TIMEOUT_SECS"
+    )
+
+    # Weight setting
+    max_miners_for_weights: int = Field(default=1, alias="MAX_MINERS_FOR_WEIGHTS")
+    
+    # Evaluation: top fraction of screened scripts to evaluate (0-1 or percent)
+    top_screener_scripts: float = Field(
+        default=0.2,
+        alias="TOP_SCREENER_SCRIPTS",
+    )
+    # Additional miners to include beyond top fraction when they are near best score.
+    screener_extra_miners_limit: int = Field(
+        default=10,
+        alias="SCREENER_EXTRA_MINERS_LIMIT",
+    )
+    # Minimum number of stage-2 screeners that should advance to full evaluation
+    # before applying any extra delta-window additions.
+    screener_stage2_min_advancers: int = Field(
+        default=60,
+        alias="SCREENER_STAGE2_MIN_ADVANCERS",
+    )
+    # Score window in percentage points from best screener score (e.g. 0.03 = 3pp).
+    screener_extra_score_points: float = Field(
+        default=0.03,
+        alias="SCREENER_EXTRA_SCORE_POINTS",
+    )
+
+    screener_min_resolved: int = Field(
+        default=4,
+        alias="SCREENER_MIN_RESOLVED",
+    )
+    screener_weight_per_miner: float = Field(
+        default=0.00002,
+        alias="SCREENER_WEIGHT_PER_MINER",
+    )
+    previous_competition_screeners_grace_hours: float = Field(
+        default=4.0,
+        alias="PREVIOUS_COMPETITION_SCREENERS_GRACE_HOURS",
+    )
+    # Absolute weight per compression-ratio (partial) winner category.
+    # Each layer gets exactly this weight; the overall winner receives whatever
+    # remains after burn and partial allocations.
+    partial_winners_weight_fraction: float = Field(
+        default=0.05,
+        alias="PARTIAL_WINNERS_WEIGHT_FRACTION",
+    )
+
+    # Private network CIDRs for frontend API access
+    private_network_cidrs: list[str] = Field(
+        alias="PRIVATE_NETWORK_CIDRS",
+    )
+    trusted_proxy_cidrs: list[str] = Field(
+        alias="TRUSTED_PROXY_CIDRS",
+    )
+    frontend_api_key_default_rpm: int = Field(
+        default=120,
+        alias="FRONTEND_API_KEY_DEFAULT_RPM",
+    )
+    frontend_api_key_default_rpd: int = Field(
+        default=5000,
+        alias="FRONTEND_API_KEY_DEFAULT_RPD",
+    )
+    frontend_aggregate_snapshot_version: str = Field(
+        default="v1",
+        alias="FRONTEND_AGGREGATE_SNAPSHOT_VERSION",
+    )
+    frontend_aggregate_snapshot_dir: Path = Field(
+        default=Path("/tmp/soma/frontend_aggregate_snapshots"),
+        alias="FRONTEND_AGGREGATE_SNAPSHOT_DIR",
+    )
+    frontend_aggregate_snapshot_s3_prefix: str = Field(
+        default="frontend/competition_aggregate_snapshots",
+        alias="FRONTEND_AGGREGATE_SNAPSHOT_S3_PREFIX",
+    )
+    best_miners_cache_path: Path = Field(
+        default=Path("/tmp/soma/best_miners_cache.json"),
+        alias="BEST_MINERS_CACHE_PATH",
+    )
+
+    validator_openrouter_error_cooldown_seconds: float = Field(
+        default=600.0,
+        alias="VALIDATOR_OPENROUTER_ERROR_COOLDOWN_SECONDS",
+    )
+    openrouter_ssm_prefix: str = Field(
+        default="/s114/dev",
+        alias="OPENROUTER_SSM_PREFIX",
+    )
+
+    # Sandbox timeout configuration
+    sandbox_timeout_per_task_seconds: float = Field(
+        default=10.0,
+        alias="SANDBOX_TIMEOUT_PER_TASK_SECONDS",
+        description="Maximum execution time forwarded to one sandbox task",
+    )
+    sandbox_submission_timeout_seconds: float = Field(
+        default=10.0,
+        alias="SANDBOX_SUBMISSION_TIMEOUT_SECONDS",
+        description="Timeout for waiting on sandbox task acceptance response",
+    )
+
+    # Validator stake requirements
+    # total_weight = alpha_stake + tao_stake * tao_weight
+    min_validator_total_weight: float = Field(
+        default=30000.0,
+        alias="MIN_VALIDATOR_TOTAL_WEIGHT",
+        validation_alias=AliasChoices(
+            "MIN_VALIDATOR_TOTAL_WEIGHT",
+            "MIN_VALIDATOR_STAKE",
+        ),
+    )
+    min_validator_alpha_weight: float = Field(
+        default=5000.0,
+        alias="MIN_VALIDATOR_ALPHA_WEIGHT",
+    )
+
+    # Remote sandbox service configuration (required)
+    sandbox_service_url: str = Field(
+        ...,
+        alias="SANDBOX_SERVICE_URL",
+    )
+    compact_bench_service_url: str | None = Field(
+        default=None,
+        alias="COMPACT_BENCH_SERVICE_URL",
+    )
+    compact_bench_service_urls: list[str] = Field(
+        default_factory=list,
+        alias="COMPACT_BENCH_SERVICE_URLS",
+    )
+    swebench_benchmark_name: str = Field(
+        default="SWE-bench/SWE-bench_Verified",
+        alias="SWEBENCH_BENCHMARK_NAME",
+    )
+    # Benchmark a task is dispatched against is read from swe_bench_tasks.benchmark_name
+    # (a task row knows which dataset it belongs to). These two settings are only the
+    # fallbacks used when that column is empty, keyed by the task's screener stage:
+    # stage 1 stays on public SWE-bench Verified, while stage 2 and full evaluation run
+    # SOMA's own task lists, whose rows ship their own env/test images.
+    swebench_screener1_benchmark_name: str = Field(
+        default="SWE-bench/SWE-bench_Verified",
+        alias="SWEBENCH_SCREENER1_BENCHMARK_NAME",
+    )
+    soma_tasks_benchmark_name: str = Field(
+        default="soma-is-tasks",
+        alias="SOMA_TASKS_BENCHMARK_NAME",
+    )
+
+    # Docker Hub visibility automation for the hidden-task image repository.
+    # SOMA task rows are graded from container images the validator has to pull, and
+    # those images live in a private Docker Hub repository. Rather than distributing
+    # registry credentials to every validator, the platform flips that one repository
+    # public for the evaluation window and back to private afterwards.
+    dockerhub_username: str | None = Field(default=None, alias="DOCKERHUB_USERNAME")
+    dockerhub_token: str | None = Field(default=None, alias="DOCKERHUB_TOKEN")
+    dockerhub_task_repositories: list[str] = Field(
+        default_factory=list,
+        alias="DOCKERHUB_TASK_REPOSITORIES",
+    )
+    dockerhub_visibility_enabled: bool = Field(
+        default=False,
+        alias="DOCKERHUB_VISIBILITY_ENABLED",
+    )
+    dockerhub_visibility_interval_seconds: float = Field(
+        default=300.0,
+        alias="DOCKERHUB_VISIBILITY_INTERVAL_SECONDS",
+    )
+    # Which timeframe boundary opens the public window. Screener stage 2 and full
+    # evaluation both run inside the evaluation window (stage-2 seeding is gated on
+    # now >= eval_starts_at), so "eval_starts_at" already covers every hidden-task run.
+    # "upload_ends_at" only opens earlier, during the idle stretch before stage 2; it
+    # grades nothing extra and only lengthens the exposure window. The boundary itself
+    # is handled without it: the reconcile loop wakes on the window edge rather than on
+    # the interval, and the dispatch gates hold runs back until the repository has been
+    # observed public.
+    dockerhub_visibility_public_from: Literal["eval_starts_at", "upload_ends_at"] = Field(
+        default="eval_starts_at",
+        alias="DOCKERHUB_VISIBILITY_PUBLIC_FROM",
+    )
+    # Optional cutover to append-only public task archives. Before this timestamp the
+    # release targets follow the regular private/public competition window. At and
+    # after it, Docker Hub and Hugging Face stay public and only receive tasks whose
+    # evaluation window is open. A cutover outside an evaluation window is safe only
+    # after the release targets have been audited empty.
+    task_artifact_archive_starts_at: datetime | None = Field(
+        default=None,
+        alias="TASK_ARTIFACT_ARCHIVE_STARTS_AT",
+    )
+    dockerhub_api_timeout_seconds: float = Field(
+        default=30.0,
+        alias="DOCKERHUB_API_TIMEOUT_SECONDS",
+    )
+
+    # Task image sync: the platform mirrors the images of the SOMA tasks that are
+    # actually in swe_bench_tasks from the long-lived source repository into the
+    # competition repository, so the repository it publishes contains exactly the
+    # current competition's hidden tasks and nothing else.
+    dockerhub_task_sync_enabled: bool = Field(
+        default=False,
+        alias="DOCKERHUB_TASK_SYNC_ENABLED",
+    )
+    dockerhub_task_source_repository: str = Field(
+        default="dendritexhq/soma-is-task-dind",
+        alias="DOCKERHUB_TASK_SOURCE_REPOSITORY",
+    )
+    # Defaults to the single entry of DOCKERHUB_TASK_REPOSITORIES; set explicitly only
+    # when more than one repository is kept under visibility management.
+    dockerhub_task_target_repository: str | None = Field(
+        default=None,
+        alias="DOCKERHUB_TASK_TARGET_REPOSITORY",
+    )
+    # Delete every tag in the target repository that no current competition asks for.
+    # This is what empties the repository at the start of a competition; it only ever
+    # runs while the repository is private (see dockerhub_task_sync).
+    dockerhub_task_sync_prune: bool = Field(
+        default=True,
+        alias="DOCKERHUB_TASK_SYNC_PRUNE",
+    )
+    # Hold back dispatch of a SOMA task whose images are not fully in the competition
+    # repository yet. Without this a run is sent to a sandbox that cannot pull its env
+    # image, and it fails for a reason the miner had no part in.
+    dockerhub_task_sync_block_dispatch: bool = Field(
+        default=True,
+        alias="DOCKERHUB_TASK_SYNC_BLOCK_DISPATCH",
+    )
+
+    # Hugging Face task dataset. The task *rows* - problem statement, image
+    # references, graded test ids - travel the same release schedule as the images
+    # themselves: the platform publishes the current competition's rows into one
+    # dataset repository, private while the tasks are hidden and public for the
+    # evaluation window. It replaces provisioning tasks/soma_tasks.jsonl onto every
+    # sandbox host and tasks/soma_tasks_grading.jsonl onto every validator by hand.
+    #
+    # The window itself is not configured twice: the dataset follows the same
+    # DOCKERHUB_VISIBILITY_PUBLIC_FROM boundary, because a
+    # deployment where the images and the rows they describe open at different
+    # moments has no useful meaning.
+    huggingface_token: str | None = Field(default=None, alias="HUGGINGFACE_TOKEN")
+    hf_dataset_enabled: bool = Field(
+        default=False,
+        alias="HF_DATASET_ENABLED",
+    )
+    # The dataset repository the platform publishes. It must already exist: the
+    # competition token is scoped to a repository rather than carrying repo.create,
+    # and a repository the platform created itself would be one nobody reviewed the
+    # visibility of.
+    hf_dataset_repository: str = Field(
+        default="soma114/soma-competition-dataset",
+        alias="HF_DATASET_REPOSITORY",
+    )
+    # Where the task rows are read from. swe_bench_tasks records only which tasks a
+    # competition uses, not their content, so the rows come from the same file the
+    # importer was fed and the database decides which of them get published.
+    hf_dataset_source_file: str = Field(
+        default="tasks/soma_tasks.jsonl",
+        alias="HF_DATASET_SOURCE_FILE",
+    )
+    hf_dataset_target_path: str = Field(
+        default="tasks.jsonl",
+        alias="HF_DATASET_TARGET_PATH",
+    )
+    # Drop published rows no current competition asks for. This is what empties the
+    # dataset at the start of a competition; like the image prune it only ever runs
+    # while the repository is private (see hf_task_sync).
+    hf_dataset_prune: bool = Field(
+        default=True,
+        alias="HF_DATASET_PRUNE",
+    )
+    # Collapse the repository's commit history after a prune. A dataset repository is
+    # a git repository, so without this the commit listing of a published repository
+    # walks back through every previous competition's rows.
+    hf_dataset_squash_on_prune: bool = Field(
+        default=True,
+        alias="HF_DATASET_SQUASH_ON_PRUNE",
+    )
+    # Hold back dispatch of a SOMA task whose row is not published yet. Off by
+    # default: it only becomes true once the sandbox and validator actually read the
+    # dataset instead of a file provisioned onto the host.
+    hf_dataset_block_dispatch: bool = Field(
+        default=False,
+        alias="HF_DATASET_BLOCK_DISPATCH",
+    )
+    # Commits above this size have to go through LFS, which this client does not
+    # implement. Refusing early turns that into a log line instead of a rejected
+    # commit at publication time.
+    hf_dataset_max_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        alias="HF_DATASET_MAX_BYTES",
+    )
+    hf_api_timeout_seconds: float = Field(
+        default=60.0,
+        alias="HF_API_TIMEOUT_SECONDS",
+    )
+    swebench_default_model: str = Field(
+        default="qwen/qwen3-coder",
+        alias="SWEBENCH_DEFAULT_MODEL",
+    )
+    swebench_orchestrator_interval_seconds: float = Field(
+        default=2.0,
+        alias="SWEBENCH_ORCHESTRATOR_INTERVAL_SECONDS",
+    )
+    swebench_dispatch_batch_size: int = Field(
+        default=8,
+        alias="SWEBENCH_DISPATCH_BATCH_SIZE",
+    )
+    swebench_dispatch_strict_fifo: bool = Field(
+        default=False,
+        alias="SWEBENCH_DISPATCH_STRICT_FIFO",
+    )
+    swebench_full_eval_enabled: bool = Field(
+        default=False,
+        alias="SWEBENCH_FULL_EVAL_ENABLED",
+    )
+    swebench_dispatch_window_seconds: float = Field(
+        default=60.0,
+        alias="SWEBENCH_DISPATCH_WINDOW_SECONDS",
+    )
+    swebench_dispatch_max_runs_per_window: int = Field(
+        default=20,
+        alias="SWEBENCH_DISPATCH_MAX_RUNS_PER_WINDOW",
+    )
+    swebench_max_concurrent_dispatched_per_miner: int = Field(
+        default=30,
+        alias="SWEBENCH_MAX_CONCURRENT_DISPATCHED_PER_MINER",
+    )
+    swebench_max_concurrent_dispatched_baseline_runs: int = Field(
+        default=30,
+        alias="SWEBENCH_MAX_CONCURRENT_DISPATCHED_BASELINE_RUNS",
+    )
+    swebench_dispatched_ttl_seconds: int = Field(
+        default=2400,
+        alias="SWEBENCH_DISPATCHED_TTL_SECONDS",
+    )
+    swebench_retry_base_seconds: float = Field(
+        default=5.0,
+        alias="SWEBENCH_RETRY_BASE_SECONDS",
+    )
+    swebench_retry_max_seconds: float = Field(
+        default=120.0,
+        alias="SWEBENCH_RETRY_MAX_SECONDS",
+    )
+    swebench_retry_jitter_seconds: float = Field(
+        default=2.0,
+        alias="SWEBENCH_RETRY_JITTER_SECONDS",
+    )
+    swebench_validation_claim_ttl_seconds: int = Field(
+        default=900,
+        alias="SWEBENCH_VALIDATION_CLAIM_TTL_SECONDS",
+    )
+    swebench_screening_min_passed_tasks: int = Field(
+        default=0,
+        alias="SWEBENCH_SCREENING_MIN_PASSED_TASKS",
+    )
+    swebench_screening_pass_ratio: float = Field(
+        default=0.5,
+        alias="SWEBENCH_SCREENING_PASS_RATIO",
+    )
+    swebench_screening_min_weighted_token_saving_ratio: float = Field(
+        default=0.1,
+        alias="SWEBENCH_SCREENING_MIN_WEIGHTED_TOKEN_SAVING_RATIO",
+    )
+    swebench_screening_input_tokens_weight: float = Field(
+        default=1.0,
+        alias="SWEBENCH_SCREENING_INPUT_TOKENS_WEIGHT",
+    )
+    swebench_screening_cached_input_tokens_weight: float = Field(
+        default=1.0 / 10.0,
+        alias="SWEBENCH_SCREENING_CACHED_INPUT_TOKENS_WEIGHT",
+    )
+    swebench_screening_output_tokens_weight: float = Field(
+        default=3.0,
+        alias="SWEBENCH_SCREENING_OUTPUT_TOKENS_WEIGHT",
+    )
+    # Jev input tokens spent by a miner's compressor (compressor services). Miner
+    # side only: a baseline run has no compressor and no Jev cost.
+    swebench_screening_jev_input_tokens_weight: float = Field(
+        default=0.2,
+        alias="SWEBENCH_SCREENING_JEV_INPUT_TOKENS_WEIGHT",
+    )
+    swebench_dynamic_screener_task_count: int = Field(
+        default=3,
+        alias="SWEBENCH_DYNAMIC_SCREENER_TASK_COUNT",
+    )
+    # Two-stage screening. Stage 1 is a liveness / non-regression + savings gate
+    # that runs during the upload window on public SWE-bench Verified tasks.
+    # Stage 2 keeps the existing pass-ratio + weighted saving threshold on the
+    # hidden SOMA tasks after the upload window closes.
+    #
+    # Quality-drop tolerance for stage 1. Stage 1 pools the quality of the WHOLE
+    # stage-1 sample (all tasks × all attempts, e.g. 5 tasks × 5 runs = 25
+    # samples) and passes when pooled_miner_mean >= pooled_baseline_mean -
+    # epsilon. Quality is a resolved fraction (0..1); the default (5%) tolerates
+    # roughly a one-to-two-run swing from baseline (variance floor) without
+    # letting a real regression through. Epsilon is an absolute margin on the
+    # pooled mean, NOT a per-task tolerance.
+    swebench_screening_stage1_quality_epsilon_verified: float = Field(
+        default=0.05,
+        alias="SWEBENCH_SCREENING_STAGE1_QUALITY_EPSILON_VERIFIED",
+    )
+    # Stage-1 token savings: besides non-regressing quality, a script must
+    # reduce pooled WEIGHTED tokens vs pooled baseline weighted tokens by at
+    # least this ratio. A script fails when
+    # (baseline_total - miner_total) / baseline_total < ratio.
+    swebench_screening_stage1_token_saving_ratio_verified: float = Field(
+        default=0.0,
+        alias="SWEBENCH_SCREENING_STAGE1_TOKEN_SAVING_RATIO_VERIFIED",
+    )
+
+    @field_validator("debug", "debug_clear_db", mode="before")
+    @classmethod
+    def _parse_debug_like_bool(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw in {"release", "prod", "production"}:
+                return False
+            if raw in {"debug", "dev", "development"}:
+                return True
+        return value
+
+    @field_validator("log_levels", mode="before")
+    @classmethod
+    def _parse_log_levels(cls, value: Any) -> dict[str, str]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return {}
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = {}
+                for item in raw.split(","):
+                    if not item.strip():
+                        continue
+                    if "=" in item:
+                        key, level = item.split("=", 1)
+                    elif ":" in item:
+                        key, level = item.split(":", 1)
+                    else:
+                        continue
+                    parsed[key.strip()] = level.strip()
+            return {str(k): str(v) for k, v in parsed.items()}
+        raise ValueError("LOG_LEVELS must be a mapping or JSON string")
+
+    @field_validator("log_dir", mode="before")
+    @classmethod
+    def _parse_log_dir(cls, value: Any) -> Path | None:
+        if value is None:
+            return None
+        if isinstance(value, Path):
+            return value
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            return Path(raw)
+        raise ValueError("LOG_DIR must be a filesystem path")
+
+    @field_validator("private_network_cidrs", mode="before")
+    @classmethod
+    def _parse_private_network_cidrs(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        raise ValueError(
+            "PRIVATE_NETWORK_CIDRS must be a list or comma-separated string"
+        )
+
+    @field_validator("trusted_proxy_cidrs", mode="before")
+    @classmethod
+    def _parse_trusted_proxy_cidrs(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        raise ValueError("TRUSTED_PROXY_CIDRS must be a list or comma-separated string")
+
+    @field_validator("compact_bench_service_urls", mode="before")
+    @classmethod
+    def _parse_compact_bench_service_urls(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        raise ValueError(
+            "COMPACT_BENCH_SERVICE_URLS must be a list or comma-separated string"
+        )
+
+    @field_validator("dockerhub_task_repositories", mode="before")
+    @classmethod
+    def _parse_dockerhub_task_repositories(cls, value: Any) -> list[str]:
+        """Normalize the repository list.
+
+        In the environment this must be a JSON array (``["ns/repo"]``), like every
+        other list setting here: pydantic-settings JSON-decodes a ``list[str]`` field
+        inside its env source, so a bare or comma-separated string is rejected before
+        this validator ever sees it. The string branches below therefore only apply
+        when Settings is constructed programmatically.
+        """
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                return [str(item).strip() for item in json.loads(raw) if str(item).strip()]
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        raise ValueError(
+            "DOCKERHUB_TASK_REPOSITORIES must be a JSON array of '<namespace>/<repo>' strings"
+        )
+
+    @field_validator("frontend_aggregate_snapshot_dir", mode="before")
+    @classmethod
+    def _parse_frontend_aggregate_snapshot_dir(cls, value: Any) -> Path:
+        if value is None or value == "":
+            return Path("/tmp/soma/frontend_aggregate_snapshots")
+        if isinstance(value, Path):
+            return value
+        if isinstance(value, str):
+            return Path(value.strip())
+        raise ValueError("FRONTEND_AGGREGATE_SNAPSHOT_DIR must be a filesystem path")
+
+    @field_validator("frontend_aggregate_snapshot_s3_prefix", mode="before")
+    @classmethod
+    def _parse_frontend_aggregate_snapshot_s3_prefix(cls, value: Any) -> str:
+        if value is None or value == "":
+            return "frontend/competition_aggregate_snapshots"
+        if not isinstance(value, str):
+            raise ValueError("FRONTEND_AGGREGATE_SNAPSHOT_S3_PREFIX must be a string")
+        normalized = value.strip().strip("/")
+        if not normalized:
+            return "frontend/competition_aggregate_snapshots"
+        return normalized
+
+    @field_validator("top_screener_scripts", mode="before")
+    @classmethod
+    def _parse_top_screener_scripts(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.2
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("TOP_SCREENER_SCRIPTS must be a number") from exc
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator("screener_extra_miners_limit", mode="before")
+    @classmethod
+    def _parse_screener_extra_miners_limit(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 10
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SCREENER_EXTRA_MINERS_LIMIT must be an integer") from exc
+        if numeric < 0:
+            numeric = 0
+        return numeric
+
+    @field_validator("screener_stage2_min_advancers", mode="before")
+    @classmethod
+    def _parse_screener_stage2_min_advancers(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 40
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SCREENER_STAGE2_MIN_ADVANCERS must be an integer") from exc
+        if numeric < 0:
+            numeric = 0
+        return numeric
+
+    @field_validator("screener_extra_score_points", mode="before")
+    @classmethod
+    def _parse_screener_extra_score_points(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.03
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SCREENER_EXTRA_SCORE_POINTS must be a number") from exc
+        # Accept either ratio [0..1] or percent points [0..100].
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator("swebench_screening_min_passed_tasks", mode="before")
+    @classmethod
+    def _parse_swebench_screening_min_passed_tasks(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 0
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SWEBENCH_SCREENING_MIN_PASSED_TASKS must be an integer"
+            ) from exc
+        return max(0, numeric)
+
+    @field_validator("swebench_dispatch_window_seconds", mode="before")
+    @classmethod
+    def _parse_swebench_dispatch_window_seconds(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 60.0
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_DISPATCH_WINDOW_SECONDS must be a number") from exc
+        return max(1.0, numeric)
+
+    @field_validator("swebench_dispatch_max_runs_per_window", mode="before")
+    @classmethod
+    def _parse_swebench_dispatch_max_runs_per_window(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 10
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_DISPATCH_MAX_RUNS_PER_WINDOW must be an integer") from exc
+        return max(0, numeric)
+
+    @field_validator("swebench_max_concurrent_dispatched_per_miner", mode="before")
+    @classmethod
+    def _parse_swebench_max_concurrent_dispatched_per_miner(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 30
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_MAX_CONCURRENT_DISPATCHED_PER_MINER must be an integer") from exc
+        return max(0, numeric)
+
+    @field_validator("swebench_max_concurrent_dispatched_baseline_runs", mode="before")
+    @classmethod
+    def _parse_swebench_max_concurrent_dispatched_baseline_runs(cls, value: Any) -> int:
+        if value is None or value == "":
+            return 30
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_MAX_CONCURRENT_DISPATCHED_BASELINE_RUNS must be an integer") from exc
+        return max(0, numeric)
+
+    @field_validator("swebench_screening_pass_ratio", mode="before")
+    @classmethod
+    def _parse_swebench_screening_pass_ratio(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.5
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SWEBENCH_SCREENING_PASS_RATIO must be a number") from exc
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator("swebench_screening_min_weighted_token_saving_ratio", mode="before")
+    @classmethod
+    def _parse_swebench_screening_min_weighted_token_saving_ratio(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.2
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SWEBENCH_SCREENING_MIN_WEIGHTED_TOKEN_SAVING_RATIO must be a number"
+            ) from exc
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator(
+        "swebench_screening_input_tokens_weight",
+        "swebench_screening_cached_input_tokens_weight",
+        "swebench_screening_output_tokens_weight",
+        "swebench_screening_jev_input_tokens_weight",
+        mode="after",
+    )
+    @classmethod
+    def _validate_swebench_screening_token_weights(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("SWEBENCH screening token weights must be non-negative")
+        return float(value)
+
+    @field_validator(
+        "swebench_screening_stage1_quality_epsilon_verified",
+        "swebench_screening_stage1_token_saving_ratio_verified",
+        mode="before",
+    )
+    @classmethod
+    def _parse_swebench_screening_stage1_quality_epsilon(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.0
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SWEBENCH_SCREENING_STAGE1_* epsilon/ratio settings must be a number"
+            ) from exc
+        # Accept percent-style input (e.g. "5" -> 0.05) for consistency with the
+        # other screening ratio settings; quality metrics never exceed magnitude 1.
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    @field_validator("previous_competition_screeners_grace_hours", mode="before")
+    @classmethod
+    def _parse_previous_competition_screeners_grace_hours(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 4.0
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "PREVIOUS_COMPETITION_SCREENERS_GRACE_HOURS must be a number"
+            ) from exc
+        if numeric < 0:
+            numeric = 0.0
+        return numeric
+
+    @field_validator("partial_winners_weight_fraction", mode="before")
+    @classmethod
+    def _parse_partial_winners_weight_fraction(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.5
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "PARTIAL_WINNERS_WEIGHT_FRACTION must be a number"
+            ) from exc
+        # Accept either ratio [0..1] or percent [0..100].
+        if numeric > 1:
+            if numeric > 100:
+                numeric = 100.0
+            numeric = numeric / 100.0
+        if numeric < 0:
+            numeric = 0.0
+        if numeric > 1:
+            numeric = 1.0
+        return numeric
+
+    def _build_wallet(self):
+        from soma_shared.utils.signer import get_wallet
+
+        return get_wallet(
+            self.wallet_name or "",
+            self.wallet_hotkey,
+            self.wallet_path,
+        )
+
+    @property
+    def wallet(self):
+        if self._wallet is None:
+            self._wallet = self._build_wallet()
+        return self._wallet
+
+    def _read_rds_secret(self) -> dict[str, Any]:
+        if not self.rds_secret_id:
+            raise RuntimeError("RDS_SECRET_ID is required to load the RDS secret")
+        cmd = [
+            "aws",
+            "secretsmanager",
+            "get-secret-value",
+            "--secret-id",
+            self.rds_secret_id,
+            "--query",
+            "SecretString",
+            "--output",
+            "text",
+        ]
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        secret_str = result.stdout.strip()
+        try:
+            return json.loads(secret_str)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("RDS secret is not valid JSON") from exc
+
+    @staticmethod
+    def _rds_writer_host_from_secret(secret: dict[str, Any]) -> str:
+        host = str(secret.get("host") or secret.get("hostname") or "").strip()
+        if not host:
+            raise RuntimeError("RDS secret is missing writer host information")
+        return host
+
+    @staticmethod
+    def _rds_reader_host_from_writer(writer_host: str) -> str:
+        if ".cluster-ro-" in writer_host:
+            return writer_host
+        if ".cluster-" not in writer_host:
+            raise RuntimeError(
+                "Cannot derive an Aurora reader host from RDS secret host "
+                f"{writer_host!r}; expected an endpoint containing '.cluster-'"
+            )
+        return writer_host.replace(".cluster-", ".cluster-ro-", 1)
+
+    def _build_postgres_dsn_for_host(self, secret: dict[str, Any], host: str) -> str:
+        user = secret.get("username")
+        password = secret.get("password")
+        if not user or not password:
+            raise RuntimeError("RDS secret is missing username or password")
+        db_name = (
+            self.rds_db_name
+            or secret.get("dbname")
+            or secret.get("db_name")
+            or secret.get("database")
+        )
+        if not db_name:
+            raise RuntimeError("RDS secret is missing database name")
+        port = self.rds_port or secret.get("port") or 5432
+        engine = str(secret.get("engine") or "postgres").lower()
+        scheme = "postgresql+asyncpg" if "postgres" in engine else "postgresql+asyncpg"
+
+        return (
+            f"{scheme}://{quote(str(user))}:{quote(str(password))}"
+            f"@{host}:{port}/{quote(str(db_name))}"
+        )
+
+    def get_postgres_dsn(self) -> str | None:
+        if self.postgres_dsn:
+            return self.postgres_dsn
+        if not self.rds_secret_id:
+            return None
+        secret = self._read_rds_secret()
+        writer_host = self._rds_writer_host_from_secret(secret)
+        host = (
+            self._rds_reader_host_from_writer(writer_host)
+            if self.rds_use_reader
+            else writer_host
+        )
+        return self._build_postgres_dsn_for_host(secret, host)
+
+    def get_postgres_writer_dsn(self) -> str | None:
+        if self.postgres_dsn:
+            return self.postgres_dsn
+        if not self.rds_secret_id:
+            return None
+        secret = self._read_rds_secret()
+        return self._build_postgres_dsn_for_host(
+            secret, self._rds_writer_host_from_secret(secret)
+        )
+
+    def get_postgres_reader_dsn(self) -> str | None:
+        if self.postgres_dsn:
+            return self.postgres_dsn
+        if not self.rds_secret_id:
+            return None
+        secret = self._read_rds_secret()
+        writer_host = self._rds_writer_host_from_secret(secret)
+        return self._build_postgres_dsn_for_host(
+            secret, self._rds_reader_host_from_writer(writer_host)
+        )
+
+
+settings = Settings()

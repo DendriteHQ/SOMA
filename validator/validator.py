@@ -6,9 +6,6 @@ import os
 import threading
 
 ROOT = Path(__file__).resolve().parent.parent
-MCP_PLATFORM_DIR = ROOT / "mcp_platform"
-if str(MCP_PLATFORM_DIR) not in sys.path:
-    sys.path.insert(0, str(MCP_PLATFORM_DIR))
 
 from datetime import datetime, timezone
 import time

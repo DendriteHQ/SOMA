@@ -12,13 +12,10 @@ import pytest
 
 TESTS_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../.."))
-MCP_PLATFORM_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../../mcp_platform"))
 os.environ.setdefault("VALIDATOR_DISABLE_APP_INIT", "1")
 
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
-if MCP_PLATFORM_DIR not in sys.path:
-    sys.path.insert(0, MCP_PLATFORM_DIR)
 
 from soma_shared.contracts.common.signatures import Signature, SignedEnvelope
 from soma_shared.contracts.validator.v1.messages import (

@@ -44,6 +44,14 @@ SOMA's objective is not simply to maximize compression ratio.
 The objective is to find the **maximum useful compression an AI agent can sustain while continuing to complete real work.**
 
 
+## Docker deployment
+
+Local platform services can be built and run with Docker Compose. See the
+[Docker deployment guide](docs/ops/docker-deployment.md) for per-service builds,
+configuration, API compatibility, remote-sandbox integration and cutover steps.
+The failed-run recovery worker is documented in
+[mcp_platform_services/auto-run-restarter](mcp_platform_services/auto-run-restarter/README.md).
+
 ## Architecture
 
 ### Platform
