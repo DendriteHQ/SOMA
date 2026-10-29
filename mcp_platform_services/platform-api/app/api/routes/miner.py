@@ -27,7 +27,7 @@ from soma_shared.contracts.miner.v1.messages import (
     DeleteOpenRouterApiKeyRequest,
     DeleteOpenRouterApiKeyResponse,
 )
-from app.contracts.miner_logs import (
+from soma_shared.contracts.miner.v1.messages import (
     CompressorExecLogEntry,
     GetRunLogsRequest,
     GetRunLogsResponse,
