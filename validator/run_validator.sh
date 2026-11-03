@@ -17,9 +17,16 @@ if [[ -z "${REPO_DIR:-}" ]]; then
         exit 1
     fi
 fi
+# docker: run the validator with validator/docker-compose.yml, rebuilding the image on updates.
+# pm2: run it from the repo's .venv as a PM2 process.
+# auto (default): docker when Docker with the Compose plugin is usable, else pm2. A
+# watcher started before docker support picks this up on its next self-update, so
+# existing PM2 validators move to the container without any change on the host.
+VALIDATOR_RUNTIME="${VALIDATOR_RUNTIME:-auto}"
 PM2_NAME="${PM2_NAME:-mcp-validator}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-origin/main}"
 ENV_FILE="${ENV_FILE:-validator/.env}"
+COMPOSE_FILE="${COMPOSE_FILE:-validator/docker-compose.yml}"
 SOMA_SHARED_PACKAGE_NAME="${SOMA_SHARED_PACKAGE_NAME:-soma-shared}"
 SOMA_SHARED_REPO_URL="${SOMA_SHARED_REPO_URL:-https://github.com/DendriteHQ/SOMA-shared.git}"
 SOMA_SHARED_BRANCH="${SOMA_SHARED_BRANCH:-main}"
@@ -29,10 +36,33 @@ log() {
     printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
 }
 
-if ! command -v pm2 >/dev/null 2>&1; then
-    log "pm2 command not found; please install pm2 first."
-    exit 1
+if [[ "$VALIDATOR_RUNTIME" == "auto" ]]; then
+    if docker compose version >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        VALIDATOR_RUNTIME=docker
+    else
+        log "Docker with the Compose plugin is not usable; running the validator via pm2."
+        VALIDATOR_RUNTIME=pm2
+    fi
 fi
+
+case "$VALIDATOR_RUNTIME" in
+    pm2)
+        if ! command -v pm2 >/dev/null 2>&1; then
+            log "pm2 command not found; please install pm2 first."
+            exit 1
+        fi
+        ;;
+    docker)
+        if ! docker compose version >/dev/null 2>&1; then
+            log "docker compose not found; please install Docker with the Compose plugin first."
+            exit 1
+        fi
+        ;;
+    *)
+        log "VALIDATOR_RUNTIME must be 'pm2' or 'docker' (got '$VALIDATOR_RUNTIME')."
+        exit 1
+        ;;
+esac
 
 if [[ ! -d "$REPO_DIR/.git" ]]; then
     log "Repository directory '$REPO_DIR' does not contain a .git folder."
@@ -81,13 +111,15 @@ restart_monitor_if_script_changed() {
     log "Detected updated monitor script; restarting self."
     exec env \
         REPO_DIR="$REPO_DIR" \
+        VALIDATOR_RUNTIME="$VALIDATOR_RUNTIME" \
         PM2_NAME="$PM2_NAME" \
         UPSTREAM_BRANCH="$UPSTREAM_BRANCH" \
         ENV_FILE="$ENV_FILE" \
+        COMPOSE_FILE="$COMPOSE_FILE" \
         SOMA_SHARED_PACKAGE_NAME="$SOMA_SHARED_PACKAGE_NAME" \
         SOMA_SHARED_REPO_URL="$SOMA_SHARED_REPO_URL" \
         SOMA_SHARED_BRANCH="$SOMA_SHARED_BRANCH" \
-        "$SCRIPT_PATH" "$INTERVAL"
+        bash "$SCRIPT_PATH" "$INTERVAL"
 }
 
 SCRIPT_FINGERPRINT=$(get_file_fingerprint "$SCRIPT_PATH")
@@ -154,8 +186,42 @@ update_requirements() {
     return 0
 }
 
+stop_pm2_validator() {
+    # A validator left in PM2 (e.g. from before switching to docker) holds the port
+    # the container publishes, so it has to go before the container starts.
+    if command -v pm2 >/dev/null 2>&1 && pm2 describe "$PM2_NAME" >/dev/null 2>&1; then
+        log "Removing PM2 validator '$PM2_NAME' so the container can bind its port."
+        pm2 delete "$PM2_NAME" >/dev/null 2>&1 || true
+    fi
+}
+
+start_validator_docker() {
+    # Build before touching anything that runs, so a failed build leaves the current
+    # validator (container or PM2 process) serving, and the switch from PM2 is short.
+    log "Building validator image ('$COMPOSE_FILE')."
+    if ! docker compose -f "$COMPOSE_FILE" build; then
+        log "Image build failed; leaving validator as-is. Resolve manually."
+        return 1
+    fi
+    stop_pm2_validator
+    log "Starting validator via docker compose."
+    if ! docker compose -f "$COMPOSE_FILE" up -d; then
+        log "docker compose up failed. Resolve manually."
+        return 1
+    fi
+}
+
+is_validator_running_docker() {
+    [[ -n "$(docker compose -f "$COMPOSE_FILE" ps --status running --quiet validator 2>/dev/null)" ]]
+}
+
 start_validator() {
     local python_bin
+
+    if [[ "$VALIDATOR_RUNTIME" == "docker" ]]; then
+        start_validator_docker
+        return
+    fi
 
     if ! python_bin=$(resolve_python_bin); then
         log "No Python interpreter found to start validator."
@@ -170,6 +236,12 @@ start_validator() {
 
 is_validator_running() {
     local pid
+
+    if [[ "$VALIDATOR_RUNTIME" == "docker" ]]; then
+        is_validator_running_docker
+        return
+    fi
+
     pid=$(pm2 pid "$PM2_NAME" 2>/dev/null | tr -d '\n' | tr -d '[:space:]')
     if [[ -z "$pid" || "$pid" == "0" || "$pid" == "[]" ]]; then
         return 1
@@ -191,17 +263,21 @@ action_if_needed() {
     local_hash=$(git rev-parse HEAD)
     remote_hash=$(git rev-parse "$UPSTREAM_BRANCH")
 
-    if ! python_bin=$(resolve_python_bin); then
-        log "No Python interpreter found for dependency inspection."
-        return 1
-    fi
+    # The image installs dependencies, soma-shared included at the commit pinned in
+    # validator/requirements.txt, so in docker mode only the repository is tracked.
+    if [[ "$VALIDATOR_RUNTIME" == "pm2" ]]; then
+        if ! python_bin=$(resolve_python_bin); then
+            log "No Python interpreter found for dependency inspection."
+            return 1
+        fi
 
-    installed_soma_shared_commit=$(get_installed_soma_shared_commit "$python_bin")
-    remote_soma_shared_commit=$(get_remote_soma_shared_commit)
-    if [[ -z "$remote_soma_shared_commit" ]]; then
-        log "Unable to resolve remote commit for $SOMA_SHARED_PACKAGE_NAME on $SOMA_SHARED_BRANCH."
-    elif [[ "$installed_soma_shared_commit" != "$remote_soma_shared_commit" ]]; then
-        soma_shared_update_needed=1
+        installed_soma_shared_commit=$(get_installed_soma_shared_commit "$python_bin")
+        remote_soma_shared_commit=$(get_remote_soma_shared_commit)
+        if [[ -z "$remote_soma_shared_commit" ]]; then
+            log "Unable to resolve remote commit for $SOMA_SHARED_PACKAGE_NAME on $SOMA_SHARED_BRANCH."
+        elif [[ "$installed_soma_shared_commit" != "$remote_soma_shared_commit" ]]; then
+            soma_shared_update_needed=1
+        fi
     fi
 
     if [[ "$local_hash" != "$remote_hash" ]]; then
@@ -222,7 +298,7 @@ action_if_needed() {
         log "New $SOMA_SHARED_PACKAGE_NAME commit detected on $SOMA_SHARED_BRANCH (${installed_soma_shared_commit:-none} -> $remote_soma_shared_commit)."
     fi
 
-    if [[ "$repo_update_needed" -eq 1 ]]; then
+    if [[ "$repo_update_needed" -eq 1 && "$VALIDATOR_RUNTIME" == "pm2" ]]; then
         log "Updating dependencies from requirements.txt."
         if ! update_requirements; then
             log "Dependency update failed; leaving validator as-is. Resolve manually."
