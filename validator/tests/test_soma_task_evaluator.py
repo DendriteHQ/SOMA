@@ -27,11 +27,13 @@ from validator.evaluation.soma_task_evaluator import (  # noqa: E402
     SomaTaskEvaluationError,
 )
 from validator.evaluation.soma_task_registry import (  # noqa: E402
+    SomaTaskGradingSpec,
     SomaTaskNotFoundError,
     SomaTaskRegistry,
 )
 
 INSTANCE_ID = "prompt-toolkit__python-prompt-toolkit-2025"
+LMCACHE_CONFIG_TASK_ID = "LMCache__LMCache-4380"
 FAIL_TO_PASS = ["tests/test_document.py::test_get_word_before_cursor_with_whitespace_and_pattern"]
 PASS_TO_PASS = ["tests/test_document.py::test_current_char"]
 
@@ -160,10 +162,25 @@ def test_resolves_when_every_graded_test_passes(tmp_path, monkeypatch):
     assert result.missing_tests == ()
     # Image reference is derived from the instance id plus the configured repository,
     # the same way the SWE-bench path derives its eval image from a template.
-    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID}.test"
+    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID.lower()}.test"
     status = result.report[INSTANCE_ID]["tests_status"]
     assert status["FAIL_TO_PASS"]["success"] == 1
     assert status["PASS_TO_PASS"]["success"] == 1
+
+
+def test_derives_lowercase_tag_for_mixed_case_instance_id(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=None)
+    evaluator = _evaluator(tmp_path, monkeypatch, fake)
+    instance_id = "ApeWorX__web3.py-3598"
+    spec = SomaTaskGradingSpec(instance_id, (), ())
+
+    image = evaluator._resolve_test_image(
+        instance_id=instance_id,
+        spec=spec,
+        image_name=None,
+    )
+
+    assert image == "example/soma-tasks:apeworx__web3.py-3598.test"
 
 
 def test_does_not_resolve_when_a_pass_to_pass_test_regresses(tmp_path, monkeypatch):
@@ -334,6 +351,52 @@ def test_workdir_and_run_tests_come_from_the_image_labels(tmp_path, monkeypatch)
     assert exec_call[exec_call.index("-w") + 1] == "/repo"
 
 
+def test_lmcache_config_task_skips_its_unneeded_shared_conftest(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    from validator.evaluation import soma_task_evaluator
+
+    monkeypatch.setattr(soma_task_evaluator, "_run", fake)
+    monkeypatch.setattr(
+        SomaTaskContainerEvaluator, "_image_labels", staticmethod(lambda _image: dict(IMAGE_LABELS))
+    )
+    grading_file = _write_grading_file(
+        tmp_path,
+        [{
+            "instance_id": LMCACHE_CONFIG_TASK_ID,
+            "FAIL_TO_PASS": FAIL_TO_PASS,
+            "PASS_TO_PASS": PASS_TO_PASS,
+        }],
+    )
+    evaluator = SomaTaskContainerEvaluator(
+        settings=SimpleNamespace(
+            soma_task_test_image_repository="example/soma-tasks",
+            soma_task_eval_remove_image_after_run=False,
+        ),
+        registry=SomaTaskRegistry(grading_file),
+    )
+
+    evaluator._evaluate_instance_diff_sync(instance_id=LMCACHE_CONFIG_TASK_ID, diff=VALID_DIFF)
+
+    exec_call = next(
+        call for call in fake.calls
+        if call[:2] == ["docker", "exec"] and "/soma/run_tests.sh" in call
+    )
+    assert exec_call[exec_call.index("-e") + 1] == "PYTEST_ADDOPTS=--noconftest"
+
+
+def test_other_tasks_do_not_skip_conftest(tmp_path, monkeypatch):
+    fake = _FakeDocker(report=_report({FAIL_TO_PASS[0]: "passed", PASS_TO_PASS[0]: "passed"}))
+    evaluator = _evaluator(tmp_path, monkeypatch, fake)
+
+    evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
+
+    exec_call = next(
+        call for call in fake.calls
+        if call[:2] == ["docker", "exec"] and "/soma/run_tests.sh" in call
+    )
+    assert "PYTEST_ADDOPTS=--noconftest" not in exec_call
+
+
 def test_report_path_is_read_off_the_image_test_command(tmp_path, monkeypatch):
     """The report path is an argument of the task's own pytest command, not a guess."""
     from validator.evaluation import soma_task_evaluator
@@ -418,7 +481,7 @@ def test_the_configured_repository_wins_over_the_rows_build_time_reference(tmp_p
 
     result = evaluator._evaluate_instance_diff_sync(instance_id=INSTANCE_ID, diff=VALID_DIFF)
 
-    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID}.test"
+    assert result.image_name == f"example/soma-tasks:{INSTANCE_ID.lower()}.test"
 
 
 # ── registry ───────────────────────────────────────────────────────────────
