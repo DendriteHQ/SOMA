@@ -31,7 +31,7 @@ from soma_shared.contracts.sandbox.v1.messages import (
 import volume_janitor
 from app import settings
 from app.callback_queue import CallbackQueue
-from app.compact_bench_executor import SUPPORTED_AGENT_NAME
+from app.compact_bench_executor import SUPPORTED_AGENTS, unsupported_agent_message
 from app.run_supervisor import RunSupervisor
 from app.soma_task_rows import SomaTaskRowCache
 
@@ -430,11 +430,8 @@ async def run_compact_bench_task(
     """Accept a compact-bench task for asynchronous execution and callback reporting."""
 
     _get_compact_bench_report_url()
-    if request.agent_name != SUPPORTED_AGENT_NAME:
-        raise HTTPException(
-            status_code=400,
-            detail=f"agent_name={request.agent_name!r} is not supported; only {SUPPORTED_AGENT_NAME!r} runs here.",
-        )
+    if request.agent_name not in SUPPORTED_AGENTS:
+        raise HTTPException(status_code=400, detail=unsupported_agent_message(request.agent_name))
     if app.state.draining:
         raise HTTPException(status_code=503, detail="Sandbox is draining and accepts no new runs.")
     supervisor = _get_supervisor()
