@@ -429,6 +429,10 @@ class Settings(BaseSettings):
         default=2400,
         alias="SWEBENCH_DISPATCHED_TTL_SECONDS",
     )
+    harness_agent_name: str = Field(
+        default="copilot",
+        alias="HARNESS_AGENT_NAME",
+    )
     swebench_retry_base_seconds: float = Field(
         default=5.0,
         alias="SWEBENCH_RETRY_BASE_SECONDS",

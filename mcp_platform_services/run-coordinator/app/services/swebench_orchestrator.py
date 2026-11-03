@@ -1957,6 +1957,7 @@ async def _dispatch_due_runs(
                         "benchmark_type": run_benchmark_type,
                         "benchmark_name": run_benchmark,
                         "screener_stage": _coerce_optional_int(row.get("screener_stage")),
+                        "agent_name": settings.harness_agent_name,
                     },
                 )
                 return row, run_id, bool(ok), error, bool(retryable)
