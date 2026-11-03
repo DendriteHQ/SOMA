@@ -133,11 +133,11 @@ def list_orphan_run_ids(*, live_run_ids: set[int]) -> set[int]:
         if run_id is not None and run_id not in live_run_ids:
             orphan_ids.add(run_id)
     for line in output_lines(run_docker(["volume", "ls", "-q", "--filter", f"name={settings.COMPOSE_PROJECT_PREFIX}"])):
-        if line.endswith(f"_{settings.COPILOT_WORKSPACE_VOLUME_BASENAME}"):
+        if line.endswith(f"_{settings.WORKSPACE_VOLUME_BASENAME}"):
             run_id = settings.run_id_from_compose_project(line.rsplit("_", 1)[0])
             if run_id is not None and run_id not in live_run_ids:
                 orphan_ids.add(run_id)
-    run_root = settings.copilot_run_root()
+    run_root = settings.run_root()
     # With outputs preserved, teardown keeps work dirs on purpose; listing them would
     # only re-flag the same kept dirs on every scan.
     if run_root.is_dir() and not settings.debug_preserve_outputs():

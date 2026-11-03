@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 #
 # One image for the sandbox API and its per-run runners (`python -m app.runner`).
-# Build with scripts/build_sandbox_images.sh, which pins SOMA-benchmark and
+# Build with build_images.sh, which pins SOMA-benchmark and
 # SOMA-shared to exact commits and tags the image with them.
 #
 #   docker build \

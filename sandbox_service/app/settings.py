@@ -15,8 +15,11 @@ RUNNER_ROLE = "runner"
 RUN_ID_LABEL = "soma.run_id"
 DEADLINE_LABEL = "soma.deadline"
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+# Both names come from soma_bench's shared harness and are the same for every agent
+# (Copilot, Claude Code): the project is set per run through SOMA_COPILOT_COMPOSE_PROJECT,
+# and each agent's compose file declares the workspace volume under this name.
 COMPOSE_PROJECT_PREFIX = "soma-copilot-run-"
-COPILOT_WORKSPACE_VOLUME_BASENAME = "copilot-workspace"
+WORKSPACE_VOLUME_BASENAME = "copilot-workspace"
 
 
 def debug_preserve_outputs() -> bool:
@@ -40,8 +43,11 @@ def secrets_root() -> Path:
     return _path_env("SANDBOX_SECRETS_DIR", "/run/soma-sandbox/secrets")
 
 
-def copilot_run_root() -> Path:
-    """Per-run working directories (checkout, miner module, outputs); tmpfs on hosts."""
+def run_root() -> Path:
+    """Per-run working directories (checkout, miner module, outputs); tmpfs on hosts.
+
+    soma_bench reads it as SOMA_COPILOT_RUN_ROOT whichever agent runs.
+    """
     return _path_env("SOMA_COPILOT_RUN_ROOT", "/tmp/soma-benchmark-copilot-runs")
 
 
@@ -74,7 +80,7 @@ def run_secrets_dir(run_id: int) -> Path:
 
 def run_work_dir(run_id: int) -> Path:
     # soma_bench derives the same `run-<id>` directory from SOMA_COPILOT_RUN_ROOT.
-    return copilot_run_root() / f"run-{run_id}"
+    return run_root() / f"run-{run_id}"
 
 
 def runner_logs_dir() -> Path:
@@ -100,4 +106,4 @@ def run_id_from_compose_project(project: str) -> int | None:
 def workspace_volume_name(run_id: int) -> str:
     # Mirrors soma_bench's _workspace_volume_name(); created with `docker volume create`,
     # so it carries no compose label and is removed by name.
-    return f"{compose_project_name(run_id)}_{COPILOT_WORKSPACE_VOLUME_BASENAME}"
+    return f"{compose_project_name(run_id)}_{WORKSPACE_VOLUME_BASENAME}"

@@ -13,7 +13,7 @@ services:
     network_mode: host
     restart: unless-stopped
     env_file:
-      - ${SANDBOX_ENV_FILE:-/root/SOMA-wt/sandbox_service/.env}
+      - ${SANDBOX_ENV_FILE:-/root/SOMA/sandbox_service/.env}
     environment:
       SANDBOX_RUNNER_IMAGE: ${SANDBOX_IMAGE}
       SANDBOX_DATA_DIR: /var/lib/soma-sandbox

@@ -1,8 +1,8 @@
-"""Executes one Copilot compact-bench run: the work a runner container does.
+"""Executes one compact-bench run: the work a runner container does.
 
 The runner downloads the miner's compressor, runs `benchmark-solve` (which brings up the
-run's compose stack: copilot, proxy, compression-service, dind, swe-exec-broker), uploads
-the trajectory and compressor log, and returns the report. It does not tear the stack
+run's compose stack: the agent, proxy, compression-service, dind, swe-exec-broker),
+uploads the trajectory and compressor log, and returns the report. It does not tear the stack
 down beyond what soma_bench does itself: the API verifies and finishes teardown after
 the runner exits, including after a runner that was killed.
 """
@@ -35,7 +35,14 @@ from soma_shared.contracts.sandbox.v1.messages import (
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_AGENT_NAME = "copilot"
+# soma_bench backend name (the request's agent_name) -> name used in logs. Every agent
+# runs on soma_bench's shared harness: the same per-run stack (proxy, compression-service,
+# dind, swe-exec-broker), configured through the same SOMA_COPILOT_* variables, which
+# soma_bench kept from when Copilot was the only harness. Only the agent container differs.
+SUPPORTED_AGENTS = {
+    "copilot": "Copilot",
+    "claude_code": "Claude Code",
+}
 MINER_MODULE_FILENAME = "base_miner.py"
 COMPRESSION_SERVICE_IMAGE_NAME = "soma-copilot-compression-service:latest"
 BENCHMARK_PACKAGE_NAME = "soma_bench"
@@ -48,7 +55,12 @@ DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO = "dendritexhq/soma-competition-tasks-dind"
 
 
 class UnsupportedAgentError(ValueError):
-    """The request names a backend this sandbox no longer runs."""
+    """The request names a backend this sandbox does not run."""
+
+
+def unsupported_agent_message(agent_name: str) -> str:
+    supported = ", ".join(repr(name) for name in SUPPORTED_AGENTS)
+    return f"agent_name={agent_name!r} is not supported; this sandbox runs {supported}."
 
 
 @dataclass(slots=True)
@@ -110,6 +122,8 @@ def _get_compression_service_image_name() -> str:
 
 
 def _resolve_copilot_compose_file() -> Path:
+    """Copilot's compose file. Its directory also holds the SWE exec broker and client
+    that every agent's stack mounts (see stage_swe_exec_assets)."""
     configured = os.getenv("COMPACT_BENCH_COPILOT_COMPOSE_FILE", "").strip()
     if configured:
         compose_file = Path(configured).expanduser().resolve()
@@ -336,17 +350,16 @@ class CompactBenchExecutor:
             return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
     def execute_task(self, *, task: CompactBenchRunTaskRequest) -> CompactBenchExecutionOutput:
-        if task.agent_name != SUPPORTED_AGENT_NAME:
-            raise UnsupportedAgentError(
-                f"agent_name={task.agent_name!r} is not supported; this sandbox only runs "
-                f"{SUPPORTED_AGENT_NAME!r}"
-            )
+        if task.agent_name not in SUPPORTED_AGENTS:
+            raise UnsupportedAgentError(unsupported_agent_message(task.agent_name))
+        agent = SUPPORTED_AGENTS[task.agent_name]
         run_dir = settings.run_work_dir(task.run_id)
         output_dir = run_dir / "sandbox-output"
         output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
-            "Benchmark executor preparing run: run_id=%s benchmark=%s instance_id=%s output_dir=%s",
+            "Benchmark executor preparing run: run_id=%s agent=%s benchmark=%s instance_id=%s output_dir=%s",
             task.run_id,
+            agent,
             task.benchmark,
             task.instance_id,
             output_dir,
@@ -354,18 +367,18 @@ class CompactBenchExecutor:
 
         # In the run's own directory on the host's tmpfs, so the compressor never lands
         # on persistent disk and is removed with the run.
-        miner_module_path = self._materialize_copilot_miner_module(
+        miner_module_path = self._materialize_miner_module(
             output_dir=output_dir,
             script_presigned_url=task.script_presigned_url,
         )
         logger.info(
-            "Copilot miner module prepared: run_id=%s miner_module_path=%s",
+            "Miner module prepared: run_id=%s miner_module_path=%s",
             task.run_id,
             miner_module_path,
         )
         effective_timeout = task.openclaw_timeout
         agent_timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
-        # The copilot backend enforces the agent timeout itself (via
+        # soma_bench's harness enforces the agent timeout itself (via
         # SOMA_COPILOT_AGENT_TIMEOUT_SECONDS below) and needs extra time afterwards
         # to collect proxy token usage and write the result row to output.jsonl;
         # the outer kill is a backstop and must not race that graceful shutdown.
@@ -374,6 +387,7 @@ class CompactBenchExecutor:
         command = self._build_command(task=task, output_dir=output_dir)
         env = self._build_benchmark_env(
             task=task,
+            agent=agent,
             agent_timeout=agent_timeout,
             miner_module_path=miner_module_path,
         )
@@ -515,7 +529,8 @@ class CompactBenchExecutor:
         )
         if trajectory_path:
             logger.info(
-                "Copilot trajectory location: run_id=%s instance_id=%s trajectory_path=%s tmp_run_dir=%s stream_log_path=%s",
+                "%s trajectory location: run_id=%s instance_id=%s trajectory_path=%s tmp_run_dir=%s stream_log_path=%s",
+                agent,
                 task.run_id,
                 task.instance_id,
                 trajectory_path,
@@ -524,7 +539,8 @@ class CompactBenchExecutor:
             )
         elif tmp_run_dir or stream_log_path:
             logger.info(
-                "Copilot run artifacts location: run_id=%s instance_id=%s tmp_run_dir=%s stream_log_path=%s trajectory_path_missing=true",
+                "%s run artifacts location: run_id=%s instance_id=%s tmp_run_dir=%s stream_log_path=%s trajectory_path_missing=true",
+                agent,
                 task.run_id,
                 task.instance_id,
                 tmp_run_dir,
@@ -586,12 +602,14 @@ class CompactBenchExecutor:
         self,
         *,
         task: CompactBenchRunTaskRequest,
+        agent: str,
         agent_timeout: float | None,
         miner_module_path: Path,
     ) -> dict[str, str]:
+        # SOMA_COPILOT_* configures soma_bench's shared harness, whichever agent runs on it.
         env = os.environ.copy()
         env["SOMA_COPILOT_RUN_ID"] = str(task.run_id)
-        env["SOMA_COPILOT_RUN_ROOT"] = str(settings.copilot_run_root())
+        env["SOMA_COPILOT_RUN_ROOT"] = str(settings.run_root())
         # The API owns directory cleanup, after the runner has exited.
         env["SOMA_COPILOT_PRESERVE_RUN_DIRS"] = "true"
         # A project name derived from the run id alone lets the API find and remove the
@@ -603,7 +621,8 @@ class CompactBenchExecutor:
         if llm_base_url:
             env["LLM_BASE_URL"] = llm_base_url
             logger.info(
-                "Using per-run Copilot proxy/compression sidecars: run_id=%s upstream_host=%s",
+                "Using per-run %s proxy/compression sidecars: run_id=%s upstream_host=%s",
+                agent,
                 task.run_id,
                 urlsplit(llm_base_url).netloc,
             )
@@ -614,6 +633,8 @@ class CompactBenchExecutor:
         env["SOMA_COPILOT_SHARED_PROXY_TEARDOWN"] = "false"
         env["SOMA_COPILOT_NETWORK_ISOLATION"] = "true"
         env["SOMA_COPILOT_USE_COMPOSE_COMPRESSION_SERVICE"] = "true"
+        # Read by the Copilot backend only; Claude Code uses its own compose file from the
+        # soma_bench package (SOMA_CLAUDE_CODE_COMPOSE_FILE overrides it).
         env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
         env["SOMA_COPILOT_COMPRESSION_SCRIPT_PATH"] = str(miner_module_path)
         env["SOMA_COPILOT_SWE_EXEC_ASSETS_DIR"] = str(stage_swe_exec_assets())
@@ -701,7 +722,7 @@ class CompactBenchExecutor:
                 task.instance_id,
             )
             return None
-        # The copilot backend collects `docker compose logs compression-service`
+        # soma_bench's harness collects `docker compose logs compression-service`
         # into tmp_run_dir and reports the path as compression-service_log. The
         # compressor execution events (one marked JSON line per miner invocation,
         # emitted by the compression service's /transform endpoint) are extracted
@@ -791,14 +812,14 @@ class CompactBenchExecutor:
             command.append("--openclaw-disable-plugin")
         return command
 
-    def _materialize_copilot_miner_module(self, *, output_dir: Path, script_presigned_url: str) -> Path:
-        miner_dir = output_dir / "copilot-miner"
+    def _materialize_miner_module(self, *, output_dir: Path, script_presigned_url: str) -> Path:
+        miner_dir = output_dir / "miner"
         miner_dir.mkdir(parents=True, exist_ok=True)
         miner_code = _download_miner_code(script_presigned_url)
         module_path = miner_dir / MINER_MODULE_FILENAME
         module_path.write_text(miner_code, encoding="utf-8")
         logger.info(
-            "Wrote Copilot miner module: path=%s code_bytes=%s",
+            "Wrote miner module: path=%s code_bytes=%s",
             module_path,
             len(miner_code.encode("utf-8")),
         )
@@ -836,6 +857,14 @@ class CompactBenchExecutor:
             token_usage.get("input_tokens"),
             token_usage_total.get("input_tokens"),
         )
+        # The proxy reports cache writes apart from the non-cached input; they are
+        # input the agent sent, so they count as input (and through it, as total).
+        cache_creation_tokens = _first_token_count(
+            token_usage.get("cache_creation_tokens"),
+            token_usage_total.get("cache_creation_tokens"),
+        )
+        if cache_creation_tokens:
+            input_tokens = (input_tokens or 0) + cache_creation_tokens
         cached_input_tokens = _first_token_count(
             row.get("cached_input_tokens"),
             metadata.get("cached_input_tokens"),

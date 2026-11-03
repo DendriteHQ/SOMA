@@ -1,14 +1,14 @@
 # sandbox_service
 
-Runs compact-bench runs (Copilot backend) dispatched by the platform and reports
-each result back to it. One host, one API, one container per run.
+Runs compact-bench runs (Copilot and Claude Code agents) dispatched by the platform
+and reports each result back to it. One host, one API, one container per run.
 
 ```
 docker compose ─► sandbox-api (:8001, host network)
                      │  docker run, one per run
                      ▼
                   sandbox-runner ─► benchmark-solve ─► the run's compose stack
-                                                       (copilot, proxy, compression-service,
+                                                       (agent, proxy, compression-service,
                                                         dind, swe-exec-broker)
 platform ─POST /run_compact_bench_task─► sandbox-api ─POST report─► platform
 ```
@@ -18,7 +18,21 @@ enforces the host's concurrency limit, starts a runner per run, collects its
 result and delivers it to the platform. The runner (`python -m app.runner`)
 executes exactly one run and exits.
 
-Only `agent_name="copilot"` is accepted; anything else gets HTTP 400.
+## Agents
+
+| `agent_name` | agent image (env) | built by |
+|---|---|---|
+| `copilot` | `COPILOT_AGENT_IMAGE` (`local/copilot-cli`) | `build_images.sh --harness copilot` |
+| `claude_code` | `CLAUDE_CODE_AGENT_IMAGE` (`local/claude-code-agent`) | `build_images.sh --harness claude_code` |
+
+Anything else gets HTTP 400. Both agents run on soma_bench's shared harness: the same
+per-run stack (proxy, compression-service, dind, swe-exec-broker), the same teardown,
+the same report. soma_bench still names that harness's settings `SOMA_COPILOT_*` and
+the run's compose project `soma-copilot-run-<run_id>` for either agent.
+
+Claude Code speaks the Anthropic Messages API. For any model not served by Anthropic
+the run's proxy translates its requests to OpenAI chat completions for the gateway
+(`PROXY_OPENAI_TRANSLATION`, on by default for such models).
 
 
 ## Lifecycle of a run
@@ -66,8 +80,9 @@ teardown missed something. Retire it once it stays quiet.
 ./build_images.sh --benchmark-ref <ref> --shared-ref <ref> [--push <registry>]
 ```
 
-builds `soma-sandbox`, `soma-copilot-compression-service` and `local/copilot-cli`,
-each tagged with the commits it contains, and prints the lines that select them.
+builds `soma-sandbox`, `soma-copilot-compression-service` and the agent images picked
+with `--harness` (`copilot` by default, `claude_code`, or `all`), each tagged with the
+commits it contains, and prints the lines that select them.
 Hosts are set up and updated with SANDBOX-ANSIBLE (`playbook.yml`, `deploy.yml`).
 By hand:
 

@@ -41,7 +41,9 @@ ReportSink = Callable[[CompactBenchReportRequest, str], Awaitable[None]]
 _FORWARDED_ENV_PREFIXES = (
     "COMPACT_BENCH_",
     "SOMA_",
-    "COPILOT_",
+    "COPILOT_",  # Copilot agent image
+    "CLAUDE_CODE_",  # Claude Code agent image
+    "PROXY_OPENAI_",  # the proxy's Anthropic -> OpenAI translation, for Claude Code
     "LLM_",
     "OPENROUTER_",
     "DOCKERHUB_",
@@ -226,7 +228,7 @@ class RunSupervisor:
     def _docker_run_runner(self, run_id: int, deadline: float, plain_env: dict[str, str]) -> str:
         mounts = [
             Path("/var/run/docker.sock"),
-            settings.copilot_run_root(),
+            settings.run_root(),
             settings.run_io_dir(run_id),
             settings.run_secrets_dir(run_id),
             settings.benchmark_cache_dir(),
@@ -258,7 +260,7 @@ class RunSupervisor:
             **plain_env,
             "SANDBOX_DATA_DIR": str(settings.data_dir()),
             "SANDBOX_SECRETS_DIR": str(settings.secrets_root()),
-            "SOMA_COPILOT_RUN_ROOT": str(settings.copilot_run_root()),
+            "SOMA_COPILOT_RUN_ROOT": str(settings.run_root()),
             "SOMA_BENCHMARK_CACHE_DIR": str(settings.benchmark_cache_dir()),
         }
         for name, value in sorted(env.items()):
