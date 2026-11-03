@@ -1,0 +1,11 @@
+# Dependencies of the sandbox image (API and runner), pinned to the versions the
+# pm2-run sandbox used from SOMA/requirements.txt. soma_shared and soma_bench are
+# installed separately from pinned git refs; see Dockerfile.
+anyio==4.12.1
+datasets==5.0.1
+fastapi==0.110.3
+httpx==0.28.1
+pydantic==2.12.5
+python-dotenv==1.2.1
+starlette==0.37.2
+uvicorn==0.40.0

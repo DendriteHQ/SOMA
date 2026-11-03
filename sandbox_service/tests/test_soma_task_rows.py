@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-# Make `app.compact_bench_executor` importable, mirroring sandbox_service/main.py.
+# Make `app.soma_task_rows` importable, mirroring sandbox_service/main.py.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
@@ -34,7 +34,7 @@ def _install_stub(module_name: str, **attributes) -> types.ModuleType:
 
 
 def _install_dependency_stubs() -> None:
-    """Stub the packages the executor imports but these tests do not exercise."""
+    """Stub the packages the row cache imports but these tests do not exercise."""
     try:
         import soma_shared.contracts.sandbox.v1.messages  # noqa: F401
     except ImportError:
@@ -69,7 +69,7 @@ def _install_dependency_stubs() -> None:
 
 _install_dependency_stubs()
 
-from app import compact_bench_executor as executor  # noqa: E402
+from app import soma_task_rows as executor  # noqa: E402
 
 REPO = "ns/dataset"
 
@@ -215,22 +215,21 @@ def test_the_dataset_url_is_configurable(monkeypatch):
 # ── refresh on an unknown task ─────────────────────────────────────────────
 
 
-class _Executor:
-    """Just enough of CompactBenchExecutor to exercise _ensure_soma_task_row."""
+class _Executor(executor.SomaTaskRowCache):
+    """A row cache whose loads are recorded instead of downloading anything."""
 
     def __init__(self, known, *, refreshed, refreshed_at=None):
-        import threading
-
-        self._soma_task_benchmarks = known
-        self._soma_task_cache_lock = threading.Lock()
-        self._soma_task_cache_refreshed_at = refreshed_at
+        super().__init__()
+        self._benchmarks = known
+        self._refreshed_at = refreshed_at
         self._refreshed = refreshed
 
-    def _preload_soma_task_cache(self):
+    def _load(self):
         self._refreshed.append(True)
         return {"soma-is-tasks": {"known", "new"}}
 
-    _ensure_soma_task_row = executor.CompactBenchExecutor._ensure_soma_task_row
+    def _ensure_soma_task_row(self, *, benchmark, instance_id):
+        self.ensure(benchmark=benchmark, instance_id=instance_id)
 
 
 def test_an_unknown_soma_task_triggers_one_refresh(monkeypatch):
@@ -240,7 +239,7 @@ def test_an_unknown_soma_task_triggers_one_refresh(monkeypatch):
     instance._ensure_soma_task_row(benchmark="soma-is-tasks", instance_id="new")
 
     assert refreshed == [True]
-    assert "new" in instance._soma_task_benchmarks["soma-is-tasks"]
+    assert "new" in instance._benchmarks["soma-is-tasks"]
 
 
 def test_a_known_task_does_not_refresh(monkeypatch):

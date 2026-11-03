@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="1270" viewBox="0 0 2000 1270" role="img" aria-labelledby="title desc">
+  <title id="title">SOMA proposed microservices architecture</title>
+  <desc id="desc">A two-lane diagram. Competition events reach the task publisher, whose verified release event reaches the run coordinator. The coordinator dispatches sandboxes and receives their callbacks. Sandboxes call the existing LLM gateway and provider. The coordinator emits a run event to validation; validation emits a score event to scoring and results; scoring sends a stage decision back to the coordinator. Shared infrastructure is shown separately without misleading point-to-point arrows.</desc>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#d8d8cd" stroke-width="1" opacity=".35"/>
+    </pattern>
+    <marker id="sync-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M1 1L11 6L1 11Z" fill="#173b45"/>
+    </marker>
+    <marker id="event-arrow" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="9" markerHeight="9" orient="auto">
+      <path d="M1 1L11 6L1 11Z" fill="#c36233"/>
+    </marker>
+    <style>
+      .bg { fill: #f5f3ea; }
+      .lane { fill: #fbfaf4; stroke: #dad9cc; stroke-width: 2; }
+      .core { fill: #e5f0ec; stroke: #173b45; stroke-width: 2.5; }
+      .worker { fill: #f7e8c4; stroke: #866438; stroke-width: 2.5; }
+      .external { fill: #e9edf0; stroke: #596b76; stroke-width: 2.5; }
+      .result { fill: #e1e8d1; stroke: #526b46; stroke-width: 2.5; }
+      .infra { fill: #eae9df; stroke: #8c8f85; stroke-width: 2; }
+      .tag { font: 700 17px 'Trebuchet MS', sans-serif; letter-spacing: 2px; fill: #b7562b; }
+      .title { font: 700 47px Georgia, serif; fill: #172e35; }
+      .subtitle { font: 21px 'Trebuchet MS', sans-serif; fill: #4c6064; }
+      .name { font: 700 24px 'Trebuchet MS', sans-serif; fill: #172e35; }
+      .small { font: 18px 'Trebuchet MS', sans-serif; fill: #415358; }
+      .tiny { font: 16px 'Trebuchet MS', sans-serif; fill: #415358; }
+      .flow { fill: none; stroke: #173b45; stroke-width: 4; marker-end: url(#sync-arrow); stroke-linecap: round; stroke-linejoin: round; }
+      .event { fill: none; stroke: #c36233; stroke-width: 4; stroke-dasharray: 12 8; marker-end: url(#event-arrow); stroke-linecap: round; stroke-linejoin: round; }
+      .num { font: 700 16px 'Trebuchet MS', sans-serif; fill: #b7562b; }
+      .badge { fill: #fffaf1; stroke: #d6c8af; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="2000" height="1270"/>
+  <rect width="2000" height="1270" fill="url(#grid)"/>
+  <text x="80" y="78" class="title">SOMA, split at the state boundaries</text>
+  <text x="82" y="114" class="subtitle">Proposed target architecture | solid arrows = request/callback | dashed arrows = durable events</text>
+
+  <rect class="lane" x="50" y="160" width="1900" height="335" rx="22"/>
+  <text x="80" y="204" class="tag">01  RELEASE AND EXECUTION</text>
+
+  <rect class="core" x="80" y="250" width="280" height="195" rx="18"/>
+  <text x="103" y="293" class="name">Competition &amp;</text>
+  <text x="103" y="321" class="name">Submission</text>
+  <text x="103" y="358" class="small">Uploads, bans, windows</text>
+  <text x="103" y="386" class="small">Miner identity / scripts</text>
+  <text x="103" y="421" class="tiny">Miner + operator API</text>
+
+  <rect class="core" x="390" y="250" width="280" height="195" rx="18"/>
+  <text x="413" y="293" class="name">Task Catalog &amp;</text>
+  <text x="413" y="321" class="name">Publisher</text>
+  <text x="413" y="358" class="small">Task selection + release</text>
+  <text x="413" y="386" class="small">Verify image AND row</text>
+  <text x="413" y="421" class="tiny">One owner for both channels</text>
+
+  <rect class="worker" x="700" y="250" width="280" height="195" rx="18"/>
+  <text x="723" y="293" class="name">Run Coordinator</text>
+  <text x="723" y="332" class="small">Seed SC1 / SC2 / eval</text>
+  <text x="723" y="360" class="small">Dispatch, callback, retry</text>
+  <text x="723" y="421" class="tiny">Only writer of run state</text>
+
+  <rect class="external" x="1010" y="250" width="280" height="195" rx="18"/>
+  <text x="1033" y="293" class="name">Sandbox Fleet</text>
+  <text x="1033" y="332" class="small">Run benchmark task</text>
+  <text x="1033" y="360" class="small">Pull released artifacts</text>
+  <text x="1033" y="421" class="tiny">Uploads diff + trajectory</text>
+
+  <rect class="external" x="1320" y="250" width="280" height="195" rx="18"/>
+  <text x="1343" y="293" class="name">LLM Gateway</text>
+  <text x="1343" y="332" class="small">Proxy + metering</text>
+  <text x="1343" y="360" class="small">Model/provider policy</text>
+  <text x="1343" y="421" class="tiny">Already separate today</text>
+
+  <rect class="external" x="1630" y="250" width="290" height="195" rx="18"/>
+  <text x="1653" y="293" class="name">Model Provider</text>
+  <text x="1653" y="332" class="small">OpenRouter / upstream</text>
+  <text x="1653" y="360" class="small">Inference responses</text>
+  <text x="1653" y="421" class="tiny">External integration</text>
+
+  <path class="event" d="M360 335H386"/>
+  <path class="event" d="M670 335H696"/>
+  <path class="flow" d="M980 312H1006"/>
+  <path class="flow" d="M1010 407H984"/>
+  <path class="flow" d="M1290 335H1316"/>
+  <path class="flow" d="M1600 335H1626"/>
+
+  <rect class="lane" x="50" y="625" width="1900" height="330" rx="22"/>
+  <text x="80" y="669" class="tag">02  VALIDATION AND DECISIONS</text>
+
+  <rect class="external" x="390" y="705" width="280" height="195" rx="18"/>
+  <text x="413" y="748" class="name">Docker Hub + HF</text>
+  <text x="413" y="787" class="small">Public release targets</text>
+  <text x="413" y="815" class="small">Images + task rows</text>
+  <text x="413" y="866" class="tiny">Never publish early</text>
+
+  <rect class="core" x="1010" y="705" width="280" height="195" rx="18"/>
+  <text x="1033" y="748" class="name">Validation</text>
+  <text x="1033" y="787" class="small">Jobs + claim leases</text>
+  <text x="1033" y="815" class="small">Validator score API</text>
+  <text x="1033" y="866" class="tiny">Only writer of validations</text>
+
+  <rect class="result" x="1320" y="705" width="600" height="195" rx="18"/>
+  <text x="1343" y="748" class="name">Scoring &amp; Results</text>
+  <text x="1343" y="787" class="small">Baseline-relative stage gates, winners and incentives</text>
+  <text x="1343" y="815" class="small">Frontend status / leaderboard / operator approval API</text>
+  <text x="1343" y="866" class="tiny">One source of truth for the selected cohort</text>
+
+  <path class="flow" d="M530 445V701"/>
+  <path class="event" d="M915 445V580H1150V701"/>
+  <path class="event" d="M1290 795H1316"/>
+  <path class="event" d="M1450 900V1025H750V449"/>
+
+  <rect class="badge" x="684" y="558" width="197" height="36" rx="18"/>
+  <text x="699" y="582" class="num">run.created / finished</text>
+  <rect class="badge" x="808" y="991" width="170" height="34" rx="17"/>
+  <text x="824" y="1014" class="num">stage.decided</text>
+  <text x="1008" y="477" class="tiny">callback to Coordinator</text>
+  <text x="82" y="1011" class="small">Every arrow names one owner-to-owner contract. Shared storage connections are deliberately omitted.</text>
+
+  <rect class="infra" x="50" y="1070" width="1900" height="145" rx="22"/>
+  <text x="80" y="1112" class="tag">SHARED INFRASTRUCTURE, SCOPED ACCESS</text>
+  <text x="80" y="1152" class="small">PostgreSQL: owner-specific write roles + transactional outbox</text>
+  <text x="80" y="1185" class="small">S3: scripts, diffs, trajectories and read-model snapshots</text>
+  <text x="1080" y="1152" class="small">Durable event transport + idempotent consumers</text>
+  <text x="1080" y="1185" class="small">Secrets / metagraph / metrics / audit logs</text>
+  <text x="80" y="1248" class="tiny">Target design only. See microservices-architecture.md for owners, event contracts and migration steps.</text>
+</svg>

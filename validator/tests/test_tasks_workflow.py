@@ -12,13 +12,10 @@ import pytest
 
 TESTS_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../.."))
-MCP_PLATFORM_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../../mcp_platform"))
 os.environ.setdefault("VALIDATOR_DISABLE_APP_INIT", "1")
 
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
-if MCP_PLATFORM_DIR not in sys.path:
-    sys.path.insert(0, MCP_PLATFORM_DIR)
 
 from soma_shared.contracts.common.signatures import Signature, SignedEnvelope
 from soma_shared.contracts.validator.v1.messages import (
@@ -221,6 +218,8 @@ async def test_get_tasks_for_eval_returns_typed_response():
     validator = _make_validator()
     response_payload = SweBenchValidationTask(
         validation_id=1,
+        benchmark="SWE-bench/SWE-bench_Verified",
+        benchmark_type="swebench_verified",
         instance_id="django__django-11119",
         diff="diff --git a/foo.py b/foo.py\n",
     )
@@ -242,6 +241,8 @@ async def test_evaluate_delegates_to_evaluator():
 
     task = SweBenchValidationTask(
         validation_id=1,
+        benchmark="SWE-bench/SWE-bench_Verified",
+        benchmark_type="swebench_verified",
         instance_id="django__django-11119",
         diff="diff --git a/foo.py b/foo.py\n",
     )
@@ -258,6 +259,8 @@ async def test_report_results_posts_to_platform():
     validator = _make_validator()
     task = SweBenchValidationTask(
         validation_id=2,
+        benchmark="SWE-bench/SWE-bench_Verified",
+        benchmark_type="swebench_verified",
         instance_id="django__django-11119",
         diff="diff --git a/foo.py b/foo.py\n",
     )
@@ -296,6 +299,8 @@ async def test_report_batch_error_posts_error_submission():
     validator = _make_validator()
     task = SweBenchValidationTask(
         validation_id=3,
+        benchmark="SWE-bench/SWE-bench_Verified",
+        benchmark_type="swebench_verified",
         instance_id="django__django-11119",
         diff="diff --git a/foo.py b/foo.py\n",
     )
@@ -343,6 +348,8 @@ async def test_end_to_end_scores_and_reports():
 
     response_payload = SweBenchValidationTask(
         validation_id=4,
+        benchmark="SWE-bench/SWE-bench_Verified",
+        benchmark_type="swebench_verified",
         instance_id="django__django-11119",
         diff="diff --git a/foo.py b/foo.py\n",
     )
@@ -465,6 +472,8 @@ def test_has_task_payload_accepts_swebench_validation_task():
     validator = _make_validator()
     task = SweBenchValidationTask(
         validation_id=42,
+        benchmark="SWE-bench/SWE-bench_Verified",
+        benchmark_type="swebench_verified",
         instance_id="django__django-11119",
         diff="diff --git a/foo.py b/foo.py\n",
     )
@@ -502,6 +511,8 @@ async def test_validator_e2e_with_mocked_task_uses_sandbox_controls(monkeypatch)
 
         task = SweBenchValidationTask(
             validation_id=6,
+            benchmark="SWE-bench/SWE-bench_Verified",
+            benchmark_type="swebench_verified",
             instance_id="django__django-11119",
             diff=row["patch"],
             arch="x86_64",

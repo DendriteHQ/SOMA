@@ -17,10 +17,11 @@ enough that it can no longer plausibly be a workspace still being set up, and
 removes it. It never touches a volume that is in use by a running container -
 `docker volume rm` refuses that regardless.
 
-Imported and run on a background thread inside sandbox_service's own process
-(see main.py's startup hook) rather than as a separate pm2 process, so it
-shares the service's lifecycle and logging config. Does not configure
-logging itself - relies on the host process (main.py) having done so.
+Superseded by teardown by ownership (app/teardown.py): every run's volumes are
+now labelled with its compose project and removed by the API after the run. This
+sweep stays as a check on that, in dry-run mode by default (see
+SANDBOX_LEGACY_VOLUME_SWEEP in main.py): it logs what it would remove, so a
+quiet stretch shows teardown leaves nothing behind before it is retired.
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ def _parse_docker_timestamp(raw: str) -> float | None:
         return None
 
 
-def sweep() -> None:
+def sweep(*, dry_run: bool = False) -> None:
     listing = _run(["docker", "volume", "ls", "-f", "dangling=true", "-q"])
     if listing.returncode != 0:
         logger.warning("failed to list dangling volumes: %s", (listing.stderr or "").strip())
@@ -81,6 +82,15 @@ def sweep() -> None:
             skipped_young += 1
             continue
 
+        if dry_run:
+            logger.info(
+                "legacy sweep (dry run) would remove dangling volume %s, age %ds",
+                name,
+                int(age_seconds),
+            )
+            removed += 1
+            continue
+
         rm = _run(["docker", "volume", "rm", "-f", name])
         if rm.returncode == 0:
             removed += 1
@@ -90,7 +100,9 @@ def sweep() -> None:
             logger.warning("failed to remove volume %s: %s", name, (rm.stderr or "").strip())
 
     if removed or skipped_young:
-        logger.info(
-            "sweep done: removed=%d skipped_too_young=%d (min_age=%ds)",
-            removed, skipped_young, MIN_AGE_SECONDS,
+        # A dry run that finds something means teardown missed a volume: worth a warning.
+        log = logger.warning if dry_run and removed else logger.info
+        log(
+            "sweep done: %s=%d skipped_too_young=%d (min_age=%ds)",
+            "would_remove" if dry_run else "removed", removed, skipped_young, MIN_AGE_SECONDS,
         )

@@ -13,14 +13,11 @@ from huggingface_hub.errors import HfHubHTTPError
 
 TESTS_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../.."))
-MCP_PLATFORM_DIR = os.path.abspath(os.path.join(TESTS_DIR, "../../mcp_platform"))
 FIXTURES_DIR = Path(TESTS_DIR) / "fixtures"
 os.environ.setdefault("VALIDATOR_DISABLE_APP_INIT", "1")
 
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
-if MCP_PLATFORM_DIR not in sys.path:
-    sys.path.insert(0, MCP_PLATFORM_DIR)
 
 from validator.evaluation.evaluator import BatchScoringError, Evaluator
 from validator.evaluation.swebench_evaluator import SWEBenchContainerEvaluator, SWEBenchEvaluationError
@@ -152,6 +149,8 @@ def test_sync_runner_uses_explicit_image_and_returns_binary_success(monkeypatch)
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
         "pids_limit": 512,
+        "mem_limit": "5g",
+        "memswap_limit": "5g",
     }
 
 
@@ -210,6 +209,8 @@ def test_sync_runner_can_disable_image_cleanup(monkeypatch):
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
         "pids_limit": 512,
+        "mem_limit": "5g",
+        "memswap_limit": "5g",
     }
 
 

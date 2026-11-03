@@ -1,7 +1,7 @@
 # SWE Scoring
 
 This document describes the current SWE scoring logic implemented in
-`mcp_platform/app/api/routes/scoring.py`.
+`mcp_platform_services/common/app/api/routes/scoring.py`.
 
 ## Task types and scoring paths
 

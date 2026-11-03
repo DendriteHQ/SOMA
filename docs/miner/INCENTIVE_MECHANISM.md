@@ -17,7 +17,7 @@ dataset an instance is resolved from, not how it is scored:
 | Screener stage 1 | `SWE-bench/SWE-bench_Verified` (public Hugging Face) | SWE-bench naming conventions |
 | Screener stage 2, full evaluation | SOMA task lists (e.g. `soma-is-tasks`) | Each row ships its own env/test image |
 
-See [`mcp_platform/app/services/benchmarks.py`](../../mcp_platform/app/services/benchmarks.py)
+See [`benchmarks.py`](../../mcp_platform_services/run-coordinator/app/services/benchmarks.py)
 for how a task's dataset is resolved, and
 [Task images and repository visibility](#task-images-and-repository-visibility) below for
 how validators obtain the images they grade with.

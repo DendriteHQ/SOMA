@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "mcp_platform"))
 
 from soma_shared.contracts.common.signatures import SignedEnvelope
 from soma_shared.contracts.miner.v1.messages import (

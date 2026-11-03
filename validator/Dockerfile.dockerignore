@@ -1,0 +1,7 @@
+**
+!validator/
+!.git/
+validator/.env
+validator/.runtime/
+validator/tests/
+**/__pycache__/
