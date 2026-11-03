@@ -1018,17 +1018,21 @@ async def proxy_openai_compatible(
                 parsed.get("provider"),
             )
 
+    reasoning_model = (os.getenv("SWEBENCH_DEFAULT_MODEL") or "").strip()
+    reasoning_effort = (os.getenv("GATEWAY_REASONING_EFFORT") or "").strip()
     if (
-        path == "chat/completions"
+        reasoning_model
+        and reasoning_effort
+        and path == "chat/completions"
         and method == "POST"
         and isinstance(parsed, dict)
-        and parsed.get("model") == "openai/gpt-6-luna"
+        and parsed.get("model") == reasoning_model
     ):
         reasoning = parsed.get("reasoning")
         reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
         reasoning.pop("max_tokens", None)
         reasoning.pop("enabled", None)
-        reasoning["effort"] = "medium"
+        reasoning["effort"] = reasoning_effort
         parsed["reasoning"] = reasoning
         parsed.pop("reasoning_effort", None)
         body_bytes = json.dumps(parsed).encode()
