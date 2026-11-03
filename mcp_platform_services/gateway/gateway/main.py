@@ -754,19 +754,117 @@ async def _stream_upstream_response(
     raise RuntimeError("provider retry loop exhausted unexpectedly")
 
 
+def _provider_from_json(data: object) -> str | None:
+    if isinstance(data, dict):
+        provider = data.get("provider")
+        if isinstance(provider, str) and provider.strip():
+            return provider.strip()
+    return None
+
+
+def _provider_from_sse_line(line: bytes) -> str | None:
+    line = line.strip()
+    if not line.startswith(b"data:"):
+        return None
+    payload = line[5:].strip()
+    if not payload or payload == b"[DONE]":
+        return None
+    try:
+        return _provider_from_json(json.loads(payload))
+    except Exception:
+        return None
+
+
 def _extract_actual_provider(headers: httpx.Headers, body: bytes | None = None) -> str | None:
     provider = headers.get("x-openrouter-provider") or headers.get("x-provider")
     if provider:
         return provider.strip()
     if body:
+        # OpenRouter names the serving provider in the response body ("provider":
+        # "Azure"), in every chunk when streaming.
         try:
-            data = json.loads(body)
-            model = data.get("model") or ""
-            if "/" in model:
-                return model.split("/")[0]
+            return _provider_from_json(json.loads(body))
         except Exception:
             pass
+        for line in body.splitlines():
+            provider = _provider_from_sse_line(line)
+            if provider:
+                return provider
     return None
+
+
+def _provider_matches(forced_provider: str, actual_provider: str) -> bool:
+    """Compare a forced provider slug ("azure/global") with OpenRouter's display
+    name ("Azure"). The response names no region, so only the provider is checked."""
+    forced = forced_provider.strip().lower().split("/", 1)[0]
+    actual = actual_provider.strip().lower().replace(" ", "-")
+    return forced == actual or forced.startswith(f"{actual}-")
+
+
+def _log_provider_verification(
+    *,
+    run_id: int,
+    force_provider: str,
+    actual_provider: str | None,
+    stream: bool,
+) -> None:
+    match = _provider_matches(force_provider, actual_provider) if actual_provider else None
+    suffix = " stream=true" if stream else ""
+    logger.info(
+        "gateway_provider_verification run_id=%s forced_provider=%s actual_provider=%s match=%s" + suffix,
+        run_id,
+        force_provider,
+        actual_provider or "unknown",
+        match,
+    )
+    if match is False:
+        logger.warning(
+            "gateway_provider_mismatch run_id=%s forced_provider=%s actual_provider=%s" + suffix,
+            run_id,
+            force_provider,
+            actual_provider,
+        )
+
+
+async def _verify_stream_provider(
+    stream: AsyncIterator[bytes],
+    *,
+    run_id: int,
+    force_provider: str,
+) -> AsyncIterator[bytes]:
+    """Pass the stream through unchanged, reading the provider from its first data
+    event that names one. Verification is logged once, when found or at stream end."""
+    pending = b""
+    actual_provider: str | None = None
+    try:
+        async for chunk in stream:
+            if actual_provider is None:
+                pending += chunk
+                *lines, pending = pending.split(b"\n")
+                for line in lines:
+                    actual_provider = _provider_from_sse_line(line)
+                    if actual_provider:
+                        _log_provider_verification(
+                            run_id=run_id,
+                            force_provider=force_provider,
+                            actual_provider=actual_provider,
+                            stream=True,
+                        )
+                        pending = b""
+                        break
+            yield chunk
+    finally:
+        # Closing this wrapper early must still release the upstream connection.
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
+        if actual_provider is None:
+            _log_provider_verification(
+                run_id=run_id,
+                force_provider=force_provider,
+                actual_provider=_provider_from_sse_line(pending),
+                stream=True,
+            )
 
 
 def _select_passthrough_response_headers(headers: httpx.Headers) -> dict[str, str]:
@@ -1008,25 +1106,16 @@ async def proxy_openai_compatible(
                 exception_message=str(exc),
             )
             raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
-        if provider_was_forced:
-            actual_provider = _extract_actual_provider(upstream_headers or httpx.Headers(), error_body)
-            match = actual_provider.lower() == force_provider.lower() if actual_provider else None
-            logger.info(
-                "gateway_provider_verification run_id=%s forced_provider=%s actual_provider=%s match=%s stream=true",
-                run_id,
-                force_provider,
-                actual_provider or "unknown",
-                match,
+        actual_provider = _extract_actual_provider(upstream_headers or httpx.Headers(), error_body)
+        if provider_was_forced and stream is None:
+            _log_provider_verification(
+                run_id=run_id,
+                force_provider=force_provider,
+                actual_provider=actual_provider,
+                stream=True,
             )
-            if match is False:
-                logger.warning(
-                    "gateway_provider_mismatch run_id=%s forced_provider=%s actual_provider=%s stream=true",
-                    run_id,
-                    force_provider,
-                    actual_provider,
-                )
-        else:
-            actual_provider = _extract_actual_provider(upstream_headers or httpx.Headers(), error_body)
+        elif provider_was_forced and stream is not None:
+            stream = _verify_stream_provider(stream, run_id=run_id, force_provider=force_provider)
         if stream is None:
             if status_code >= 500:
                 error_body = _provider_unavailable_response(error_body or b"")
@@ -1120,25 +1209,14 @@ async def proxy_openai_compatible(
         raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc}") from exc
 
     passthrough_headers = _select_passthrough_response_headers(resp.headers)
+    actual_provider = _extract_actual_provider(resp.headers, resp.content)
     if provider_was_forced:
-        actual_provider = _extract_actual_provider(resp.headers, resp.content)
-        match = actual_provider.lower() == force_provider.lower() if actual_provider else None
-        logger.info(
-            "gateway_provider_verification run_id=%s forced_provider=%s actual_provider=%s match=%s",
-            run_id,
-            force_provider,
-            actual_provider or "unknown",
-            match,
+        _log_provider_verification(
+            run_id=run_id,
+            force_provider=force_provider,
+            actual_provider=actual_provider,
+            stream=False,
         )
-        if match is False:
-            logger.warning(
-                "gateway_provider_mismatch run_id=%s forced_provider=%s actual_provider=%s",
-                run_id,
-                force_provider,
-                actual_provider,
-            )
-    else:
-        actual_provider = _extract_actual_provider(resp.headers, resp.content)
     if resp.status_code >= 400:
         await _dump_failed_call(
             run_id=run_id,

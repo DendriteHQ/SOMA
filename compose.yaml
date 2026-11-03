@@ -130,6 +130,7 @@ services:
       dockerfile: mcp_platform_services/ingress/Dockerfile
     ports:
       - ${SOMA_BIND_ADDRESS:-0.0.0.0}:${SOMA_API_PORT:-8000}:8000
+      - ${SOMA_BIND_ADDRESS:-0.0.0.0}:${SOMA_HTTP_PORT:-80}:8000
       - ${SOMA_BIND_ADDRESS:-0.0.0.0}:${SOMA_GATEWAY_PORT:-8050}:8050
     depends_on:
       platform-api: {condition: service_healthy}
