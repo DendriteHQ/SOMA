@@ -92,6 +92,7 @@ class TaskImageSnapshot:
     ready_instance_ids: frozenset[str]
     pending_instance_ids: frozenset[str]
     updated_at: datetime
+    present_tags: frozenset[str] = frozenset()
 
 
 _SNAPSHOT: TaskImageSnapshot | None = None
@@ -430,6 +431,7 @@ async def run_task_sync_tick(
             ready_instance_ids=frozenset(ready),
             pending_instance_ids=frozenset(desired_instance_ids - ready),
             updated_at=now,
+            present_tags=frozenset(present_tags),
         )
     )
 
@@ -489,5 +491,13 @@ def dispatch_block_reason(
     if _PUBLIC is False:
         return BLOCK_REASON_REPOSITORY_PRIVATE
     if instance in snapshot.ready_instance_ids:
+        return None
+    # Screener 1 runs in the upload window, before any competition's public window
+    # opens, so it is released on what the public repository already holds.
+    if (
+        screener_stage == benchmark_registry.STAGE1
+        and _PUBLIC is True
+        and all(tag in snapshot.present_tags for tag in task_tags(instance))
+    ):
         return None
     return BLOCK_REASON_IMAGES_MISSING
