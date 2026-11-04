@@ -137,7 +137,9 @@ that quick when nothing changed). The heartbeat reports the commit the image was
 from.
 
 **Updating:** `git pull`, then the same `up` command. Nothing is fetched or installed
-inside a running container, and there is no automatic update as with the PM2 watcher.
+inside a running container. To update automatically, run the [PM2 watcher](#-using-pm2):
+when Docker with the Compose plugin is usable it resets the checkout to each new upstream
+commit, rebuilds the image and restarts the container.
 
 What the compose file sets up:
 
@@ -178,7 +180,9 @@ pm2 stop mcp-validator-watch
 pm2 restart mcp-validator-watch
 ```
 
-> **ℹ️ Note:** `run_validator.sh` checks the repo for new commits, fast-forwards, and restarts the validator process when updates are found. It runs the actual validator in a separate PM2 process named `mcp-validator`, so when troubleshooting you may need to check logs for both `mcp-validator-watch` (the watcher) and `mcp-validator` (the validator itself).
+> **ℹ️ Note:** `run_validator.sh` checks the repo for new commits, fast-forwards, and restarts the validator when updates are found. When Docker with the Compose plugin is usable it runs the validator in the compose container (see [Using Docker](#-using-docker-recommended)); otherwise it runs it in a separate PM2 process named `mcp-validator`. Set `VALIDATOR_RUNTIME=docker` or `VALIDATOR_RUNTIME=pm2` to force one. When troubleshooting, check the watcher's logs (`pm2 logs mcp-validator-watch`) and the validator's (`docker compose logs -f validator` or `pm2 logs mcp-validator`).
+>
+> **Moving from PM2 to Docker:** an existing watcher switches on its own. After pulling a version with Docker support it restarts itself, builds the image, removes the `mcp-validator` PM2 process and starts the container on the same port with the same `validator/.env`. If the build fails, the PM2 validator keeps running. The container keeps its state in Docker volumes, so it re-downloads the task dataset and does not see the PM2 validator's `validator/.runtime`.
 
 ---
 
