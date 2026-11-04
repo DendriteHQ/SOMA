@@ -88,6 +88,7 @@ class TaskDatasetSnapshot:
     ready_instance_ids: frozenset[str]
     pending_instance_ids: frozenset[str]
     updated_at: datetime
+    published_instance_ids: frozenset[str] = frozenset()
 
 
 _SNAPSHOT: TaskDatasetSnapshot | None = None
@@ -441,6 +442,7 @@ async def run_dataset_sync_tick(
             ready_instance_ids=frozenset(ready),
             pending_instance_ids=frozenset(set(desired) | missing_from_source) - ready,
             updated_at=now,
+            published_instance_ids=frozenset(published_instance_ids),
         )
     )
 
@@ -503,5 +505,12 @@ def dispatch_block_reason(
     if _PUBLIC is False:
         return BLOCK_REASON_DATASET_PRIVATE
     if instance in snapshot.ready_instance_ids:
+        return None
+    # Same screener-1 release as the image gate (see dockerhub_task_sync).
+    if (
+        screener_stage == benchmark_registry.STAGE1
+        and _PUBLIC is True
+        and instance in snapshot.published_instance_ids
+    ):
         return None
     return BLOCK_REASON_ROW_MISSING
