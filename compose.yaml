@@ -70,7 +70,7 @@ services:
       COORDINATOR_RESTARTER_ENABLED: "false"
     volumes:
       - ${SOMA_RUNTIME_DIR:-../SOMA/runtime}/run-coordinator:/var/lib/soma
-      - ${SOMA_TASKS_DIR:-./tasks}:/data/tasks:ro
+      - ${SOMA_TASKS_DIR:-/root/SOMA/tasks}:/data/tasks:ro
 
   auto-run-restarter:
     <<: *python-service
@@ -130,7 +130,7 @@ services:
       dockerfile: mcp_platform_services/ingress/Dockerfile
     ports:
       - ${SOMA_BIND_ADDRESS:-0.0.0.0}:${SOMA_API_PORT:-8000}:8000
-      - ${SOMA_BIND_ADDRESS:-0.0.0.0}:${SOMA_GATEWAY_PORT:-8050}:8050
+      - ${SOMA_BIND_ADDRESS:-0.0.0.0}:${SOMA_GATEWAY_PORT:-8010}:8050
     depends_on:
       platform-api: {condition: service_healthy}
       run-coordinator: {condition: service_healthy}

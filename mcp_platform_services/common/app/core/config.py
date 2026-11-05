@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     miner_max_solution_size_bytes: int = Field(
         default=10 * 1024 * 1024, alias="MINER_MAX_SOLUTION_SIZE_BYTES"
     )
+    miner_upload_allowed_frequency: int = Field(
+        default=14400, alias="MINER_UPLOAD_ALLOWED_FREQUENCY"
+    )
+    batch_cleanup_interval_secs: int = Field(
+        default=120, alias="BATCH_CLEANUP_INTERVAL_SECS"
+    )
+    batch_assignment_timeout_hours: float = Field(
+        default=0.5, alias="BATCH_ASSIGNMENT_TIMEOUT_HOURS"
+    )
     # Per-hotkey limit on /miner/run-logs (sliding window); 0 disables it.
     miner_run_logs_rate_limit_requests: int = Field(
         default=5, alias="MINER_RUN_LOGS_RATE_LIMIT_REQUESTS"
@@ -81,9 +90,9 @@ class Settings(BaseSettings):
     bt_network: str = Field(default="finney", alias="BT_NETWORK")
     bt_chain_endpoint: str | None = Field(default=None, alias="BT_CHAIN_ENDPOINT")
     bt_metagraph_epoch_length: int = Field(
-        default=100, alias="BT_METAGRAPH_EPOCH_LENGTH"
+        default=0, alias="BT_METAGRAPH_EPOCH_LENGTH"
     )
-    bt_metagraph_sync_secs: int = Field(default=360, alias="BT_METAGRAPH_SYNC_SECS")
+    bt_metagraph_sync_secs: int = Field(default=60, alias="BT_METAGRAPH_SYNC_SECS")
     bt_metagraph_sync_timeout_secs: int = Field(
         default=30, alias="BT_METAGRAPH_SYNC_TIMEOUT_SECS"
     )
@@ -188,12 +197,12 @@ class Settings(BaseSettings):
 
     # Sandbox timeout configuration
     sandbox_timeout_per_task_seconds: float = Field(
-        default=10.0,
+        default=3000.0,
         alias="SANDBOX_TIMEOUT_PER_TASK_SECONDS",
         description="Maximum execution time forwarded to one sandbox task",
     )
     sandbox_submission_timeout_seconds: float = Field(
-        default=10.0,
+        default=60.0,
         alias="SANDBOX_SUBMISSION_TIMEOUT_SECONDS",
         description="Timeout for waiting on sandbox task acceptance response",
     )
@@ -252,15 +261,15 @@ class Settings(BaseSettings):
     dockerhub_username: str | None = Field(default=None, alias="DOCKERHUB_USERNAME")
     dockerhub_token: str | None = Field(default=None, alias="DOCKERHUB_TOKEN")
     dockerhub_task_repositories: list[str] = Field(
-        default_factory=list,
+        default_factory=lambda: ["dendritexhq/soma-competition-tasks-dind"],
         alias="DOCKERHUB_TASK_REPOSITORIES",
     )
     dockerhub_visibility_enabled: bool = Field(
-        default=False,
+        default=True,
         alias="DOCKERHUB_VISIBILITY_ENABLED",
     )
     dockerhub_visibility_interval_seconds: float = Field(
-        default=300.0,
+        default=60.0,
         alias="DOCKERHUB_VISIBILITY_INTERVAL_SECONDS",
     )
     # Which timeframe boundary opens the public window. Screener stage 2 and full
@@ -294,7 +303,7 @@ class Settings(BaseSettings):
     # competition repository, so the repository it publishes contains exactly the
     # current competition's hidden tasks and nothing else.
     dockerhub_task_sync_enabled: bool = Field(
-        default=False,
+        default=True,
         alias="DOCKERHUB_TASK_SYNC_ENABLED",
     )
     dockerhub_task_source_repository: str = Field(
@@ -335,7 +344,7 @@ class Settings(BaseSettings):
     # moments has no useful meaning.
     huggingface_token: str | None = Field(default=None, alias="HUGGINGFACE_TOKEN")
     hf_dataset_enabled: bool = Field(
-        default=False,
+        default=True,
         alias="HF_DATASET_ENABLED",
     )
     # The dataset repository the platform publishes. It must already exist: the
@@ -350,7 +359,7 @@ class Settings(BaseSettings):
     # competition uses, not their content, so the rows come from the same file the
     # importer was fed and the database decides which of them get published.
     hf_dataset_source_file: str = Field(
-        default="tasks/soma_tasks.jsonl",
+        default="/data/tasks/soma_tasks.jsonl",
         alias="HF_DATASET_SOURCE_FILE",
     )
     hf_dataset_target_path: str = Field(
@@ -375,7 +384,7 @@ class Settings(BaseSettings):
     # default: it only becomes true once the sandbox and validator actually read the
     # dataset instead of a file provisioned onto the host.
     hf_dataset_block_dispatch: bool = Field(
-        default=False,
+        default=True,
         alias="HF_DATASET_BLOCK_DISPATCH",
     )
     # Commits above this size have to go through LFS, which this client does not
@@ -390,15 +399,16 @@ class Settings(BaseSettings):
         alias="HF_API_TIMEOUT_SECONDS",
     )
     swebench_default_model: str = Field(
-        default="qwen/qwen3-coder",
+        default="anthropic/claude-haiku-5.5",
         alias="SWEBENCH_DEFAULT_MODEL",
     )
+    swebench_task_repeats: int = Field(default=3, alias="REPEATS")
     swebench_orchestrator_interval_seconds: float = Field(
         default=2.0,
         alias="SWEBENCH_ORCHESTRATOR_INTERVAL_SECONDS",
     )
     swebench_dispatch_batch_size: int = Field(
-        default=8,
+        default=400,
         alias="SWEBENCH_DISPATCH_BATCH_SIZE",
     )
     swebench_dispatch_strict_fifo: bool = Field(
@@ -406,7 +416,7 @@ class Settings(BaseSettings):
         alias="SWEBENCH_DISPATCH_STRICT_FIFO",
     )
     swebench_full_eval_enabled: bool = Field(
-        default=False,
+        default=True,
         alias="SWEBENCH_FULL_EVAL_ENABLED",
     )
     swebench_dispatch_window_seconds: float = Field(
@@ -414,11 +424,11 @@ class Settings(BaseSettings):
         alias="SWEBENCH_DISPATCH_WINDOW_SECONDS",
     )
     swebench_dispatch_max_runs_per_window: int = Field(
-        default=20,
+        default=400,
         alias="SWEBENCH_DISPATCH_MAX_RUNS_PER_WINDOW",
     )
     swebench_max_concurrent_dispatched_per_miner: int = Field(
-        default=30,
+        default=20,
         alias="SWEBENCH_MAX_CONCURRENT_DISPATCHED_PER_MINER",
     )
     swebench_max_concurrent_dispatched_baseline_runs: int = Field(
@@ -426,11 +436,11 @@ class Settings(BaseSettings):
         alias="SWEBENCH_MAX_CONCURRENT_DISPATCHED_BASELINE_RUNS",
     )
     swebench_dispatched_ttl_seconds: int = Field(
-        default=2400,
+        default=3600,
         alias="SWEBENCH_DISPATCHED_TTL_SECONDS",
     )
     harness_agent_name: str = Field(
-        default="copilot",
+        default="claude_code",
         alias="HARNESS_AGENT_NAME",
     )
     swebench_retry_base_seconds: float = Field(

@@ -87,7 +87,7 @@ class Settings:
         )
         _load_env_file(env_file)
 
-        batch_size = max(1, _read_int("AUTO_RUN_RESTARTER_BATCH_SIZE", 100))
+        batch_size = max(1, _read_int("AUTO_RUN_RESTARTER_BATCH_SIZE", 200))
         fetch_limit = max(
             batch_size,
             _read_int("AUTO_RUN_RESTARTER_FETCH_LIMIT", batch_size * 20),

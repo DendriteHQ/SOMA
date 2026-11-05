@@ -48,10 +48,7 @@ COMPRESSION_SERVICE_IMAGE_NAME = "soma-copilot-compression-service:latest"
 BENCHMARK_PACKAGE_NAME = "soma_bench"
 SWE_EXEC_ASSET_NAMES = ("swe_exec_broker.py", "swe-exec")
 SOMA_TASK_DIND_PREBAKED_REPO_ENV = "SOMA_TASK_DIND_PREBAKED_REPO"
-# Docker Hub repo the pre-baked dind image of a SOMA task is pulled from. Without
-# this, SOMA-benchmark derives the repo from the task row's own env image reference,
-# which points at the build-time repo rather than the one the competition serves.
-DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO = "dendritexhq/soma-competition-tasks-dind"
+SWEBENCH_DIND_PREBAKED_REPO_ENV = "SOMA_SWEBENCH_DIND_PREBAKED_REPO"
 
 
 class UnsupportedAgentError(ValueError):
@@ -647,7 +644,8 @@ class CompactBenchExecutor:
         # setdefault, so a host that configures its own repo keeps it. Pulling from
         # it needs DOCKERHUB_USERNAME/DOCKERHUB_TOKEN in the runner environment
         # while the repo is private; both are inherited through os.environ above.
-        env.setdefault(SOMA_TASK_DIND_PREBAKED_REPO_ENV, DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO)
+        env.setdefault(SOMA_TASK_DIND_PREBAKED_REPO_ENV, settings.soma_task_dind_prebaked_repo())
+        env.setdefault(SWEBENCH_DIND_PREBAKED_REPO_ENV, settings.swebench_dind_prebaked_repo())
         return env
 
     def _upload_trajectory(

@@ -18,6 +18,7 @@ from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from gateway.services.ssm.client import get_ssm_client
+from gateway.settings import settings
 
 
 logger = logging.getLogger("soma.gateway")
@@ -324,27 +325,15 @@ def _provider_retry_max_attempts() -> int:
 
 
 def _provider_retry_base_delay_seconds() -> float:
-    try:
-        value = float(os.getenv("GATEWAY_PROVIDER_RETRY_BASE_DELAY_SECONDS", "0.75"))
-    except ValueError:
-        value = 0.75
-    return max(0.0, value)
+    return max(0.0, settings.provider_retry_base_delay_seconds)
 
 
 def _provider_retry_max_delay_seconds() -> float:
-    try:
-        value = float(os.getenv("GATEWAY_PROVIDER_RETRY_MAX_DELAY_SECONDS", "3.0"))
-    except ValueError:
-        value = 3.0
-    return max(0.0, value)
+    return max(0.0, settings.provider_retry_max_delay_seconds)
 
 
 def _provider_retry_jitter_seconds() -> float:
-    try:
-        value = float(os.getenv("GATEWAY_PROVIDER_RETRY_JITTER_SECONDS", "0.35"))
-    except ValueError:
-        value = 0.35
-    return max(0.0, value)
+    return max(0.0, settings.provider_retry_jitter_seconds)
 
 
 def _find_invalid_assistant_message_index(payload: object) -> int | None:
@@ -992,7 +981,7 @@ async def proxy_openai_compatible(
             bool(requested_model),
         )
 
-    force_provider = (os.getenv("GATEWAY_FORCE_PROVIDER") or "").strip()
+    force_provider = settings.force_provider.strip()
     provider_was_forced = False
     # The pin is for the agent's LLM. A compressor-service call - Jev on OpenRouter's
     # System One API, made by the benchmark proxy for the miner's compressor - must
@@ -1018,8 +1007,8 @@ async def proxy_openai_compatible(
                 parsed.get("provider"),
             )
 
-    reasoning_model = (os.getenv("SWEBENCH_DEFAULT_MODEL") or "").strip()
-    reasoning_effort = (os.getenv("GATEWAY_REASONING_EFFORT") or "medium").strip()
+    reasoning_model = settings.default_model.strip()
+    reasoning_effort = settings.reasoning_effort.strip()
     if (
         reasoning_effort
         and path == "messages"

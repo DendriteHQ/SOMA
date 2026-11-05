@@ -20,6 +20,8 @@ COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 # and each agent's compose file declares the workspace volume under this name.
 COMPOSE_PROJECT_PREFIX = "soma-copilot-run-"
 WORKSPACE_VOLUME_BASENAME = "copilot-workspace"
+DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO = "dendritexhq/soma-competition-tasks-dind"
+DEFAULT_SWEBENCH_DIND_PREBAKED_REPO = "dendritehq/soma-swebench-dind"
 
 
 def debug_preserve_outputs() -> bool:
@@ -59,6 +61,14 @@ def callback_queue_path() -> Path:
 def benchmark_cache_dir() -> Path:
     """soma_bench's row cache; the API materializes SOMA task rows here, runners read it."""
     return _path_env("SOMA_BENCHMARK_CACHE_DIR", str(data_dir() / "benchmark-cache"))
+
+
+def soma_task_dind_prebaked_repo() -> str:
+    return (os.getenv("SOMA_TASK_DIND_PREBAKED_REPO") or "").strip() or DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO
+
+
+def swebench_dind_prebaked_repo() -> str:
+    return (os.getenv("SOMA_SWEBENCH_DIND_PREBAKED_REPO") or "").strip() or DEFAULT_SWEBENCH_DIND_PREBAKED_REPO
 
 
 def assets_dir() -> Path:
