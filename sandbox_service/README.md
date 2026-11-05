@@ -30,9 +30,11 @@ per-run stack (proxy, compression-service, dind, swe-exec-broker), the same tear
 the same report. soma_bench still names that harness's settings `SOMA_COPILOT_*` and
 the run's compose project `soma-copilot-run-<run_id>` for either agent.
 
-Claude Code speaks the Anthropic Messages API. For any model not served by Anthropic
-the run's proxy translates its requests to OpenAI chat completions for the gateway
-(`PROXY_OPENAI_TRANSLATION`, on by default for such models).
+Claude Code speaks the Anthropic Messages API and runs on an Anthropic model. Its
+requests go through the proxy and the gateway to OpenRouter's `/v1/messages`
+unchanged. The runner pins `PROXY_OPENAI_TRANSLATION=0`, because translating them to
+OpenAI chat completions drops fields Anthropic relies on (`cache_control`, thinking
+signatures, system blocks).
 
 
 ## Lifecycle of a run
