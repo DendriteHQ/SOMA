@@ -1019,8 +1019,21 @@ async def proxy_openai_compatible(
             )
 
     reasoning_model = (os.getenv("SWEBENCH_DEFAULT_MODEL") or "").strip()
-    reasoning_effort = (os.getenv("GATEWAY_REASONING_EFFORT") or "").strip()
+    reasoning_effort = (os.getenv("GATEWAY_REASONING_EFFORT") or "medium").strip()
     if (
+        reasoning_effort
+        and path == "messages"
+        and method == "POST"
+        and isinstance(parsed, dict)
+    ):
+        # Anthropic Messages (Claude Code): effort lives in output_config, and it
+        # overrides whatever the agent asked for.
+        output_config = parsed.get("output_config")
+        output_config = dict(output_config) if isinstance(output_config, dict) else {}
+        output_config["effort"] = reasoning_effort
+        parsed["output_config"] = output_config
+        body_bytes = json.dumps(parsed).encode()
+    elif (
         reasoning_model
         and reasoning_effort
         and path == "chat/completions"

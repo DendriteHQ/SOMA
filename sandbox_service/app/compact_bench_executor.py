@@ -638,6 +638,12 @@ class CompactBenchExecutor:
         env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
         env["SOMA_COPILOT_COMPRESSION_SCRIPT_PATH"] = str(miner_module_path)
         env["SOMA_COPILOT_SWE_EXEC_ASSETS_DIR"] = str(stage_swe_exec_assets())
+        # Claude Code runs on an Anthropic model, so its Messages requests go to the
+        # gateway (and OpenRouter's /v1/messages) unchanged. The proxy's Anthropic -> OpenAI
+        # translation would drop fields Anthropic needs (cache_control, thinking signatures,
+        # system blocks); pinned off so neither a host variable nor soma_bench's per-model
+        # default can turn it on. Copilot sends chat completions, which it never touches.
+        env["PROXY_OPENAI_TRANSLATION"] = "0"
         # setdefault, so a host that configures its own repo keeps it. Pulling from
         # it needs DOCKERHUB_USERNAME/DOCKERHUB_TOKEN in the runner environment
         # while the repo is private; both are inherited through os.environ above.

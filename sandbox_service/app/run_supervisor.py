@@ -43,7 +43,6 @@ _FORWARDED_ENV_PREFIXES = (
     "SOMA_",
     "COPILOT_",  # Copilot agent image
     "CLAUDE_CODE_",  # Claude Code agent image
-    "PROXY_OPENAI_",  # the proxy's Anthropic -> OpenAI translation, for Claude Code
     "LLM_",
     "OPENROUTER_",
     "DOCKERHUB_",
