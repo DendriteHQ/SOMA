@@ -251,7 +251,7 @@ def _classify_restart_reason(
         return "provider_400"
     if "429 Rate limit exceeded: new-account-rpm/deepseek/deepseek-v4-pro-" in error:
         return "provider_new_account_rpm_429"
-    if "ENOTFOUND" in error:
+    if "ENOTFOUND" in error or "Name or service not known" in error:
         return "proxy_dns_failure"
     if "500 Internal Server Error" in error:
         return "provider_500"
@@ -350,6 +350,7 @@ _FETCH_CANDIDATE_ROWS_SQL = sa.text(
           OR btrim(r.last_error) = '400 Provider returned error'
           OR r.last_error LIKE '%429 Rate limit exceeded: new-account-rpm/deepseek/deepseek-v4-pro-%'
           OR r.last_error LIKE '%ENOTFOUND%'
+          OR r.last_error LIKE '%Name or service not known%'
           OR r.last_error LIKE '%500 Internal Server Error%'
           OR r.last_error LIKE '%"code"' || chr(58) || '520%'
           OR r.last_error LIKE '%error code: 520%'

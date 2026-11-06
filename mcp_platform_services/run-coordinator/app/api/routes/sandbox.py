@@ -116,7 +116,9 @@ async def _persist_compact_bench_report(
 ) -> bool:
     run = (
         await db.execute(
-            select(SweBenchRun).where(SweBenchRun.id == payload.run_id)
+            select(SweBenchRun)
+            .where(SweBenchRun.id == payload.run_id)
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if run is None:
@@ -128,6 +130,16 @@ async def _persist_compact_bench_report(
         )
         # Acknowledge orphaned callbacks to avoid endless retries in sandbox
         # after data resets / test cleanups on platform side.
+        return True
+
+    # A retrying sandbox callback must not replace a result that has already
+    # been persisted, including its patch artifact. Locking the row makes this
+    # check safe when duplicate callbacks arrive concurrently.
+    if run.status in {"completed", "failed"}:
+        logger.info(
+            "compact_bench_report_duplicate_ignored",
+            extra={"run_id": payload.run_id, "status": run.status},
+        )
         return True
 
     logger.debug(

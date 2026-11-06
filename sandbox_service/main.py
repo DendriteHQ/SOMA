@@ -113,7 +113,7 @@ def _get_callback_retry_max_seconds() -> float:
 def _compute_callback_backoff_seconds(attempt: int) -> float:
     base = _get_callback_retry_base_seconds()
     max_seconds = _get_callback_retry_max_seconds()
-    exponent = max(0, attempt - 1)
+    exponent = min(max(0, attempt - 1), 30)
     return min(max_seconds, base * (2 ** exponent))
 
 
