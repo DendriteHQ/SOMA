@@ -18,6 +18,8 @@ from app.services.blob.compression_log_artifact_storage import CompressionLogArt
 from app.services.blob.s3 import S3BlobStorage
 from app.services.blob.text_artifact_storage import TextArtifactStorage
 from app.services.blob.trajectory_artifact_storage import TrajectoryArtifactStorage
+from app.services.sandbox import dispatch_journal
+from app.services.sandbox.dispatch_journal import DispatchAttempt
 from app.services.sandbox.remote_compact_bench_manager import RemoteCompactBenchManager
 from app.services import benchmarks as benchmark_registry
 from app.services import dockerhub_task_sync
@@ -58,6 +60,7 @@ _DISPATCH_FETCH_LOOKAHEAD_MULTIPLIER = 10000
 _DISPATCH_FETCH_LIMIT_CAP = 100000
 _DISPATCH_FETCH_GROUP_LIMIT = 60
 _DISPATCH_FETCH_ROWS_PER_GROUP_LIMIT = 40
+_DISPATCH_JOURNAL_PRUNE_INTERVAL_SECONDS = 3600.0
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 @dataclass(frozen=True)
@@ -234,6 +237,7 @@ async def _run_orchestration_tick(app) -> None:
                     now=now,
                 )
             recovered_runs = await _recover_stale_dispatched_runs(db=db, now=now)
+            await _maybe_prune_dispatch_journal(app, db)
             await db.commit()
             _maybe_log_seed_pass(
                 active_competitions=len(active_competitions),
@@ -398,7 +402,26 @@ async def _recover_stale_dispatched_runs(
                 "last_error": last_error,
             },
         )
+    await dispatch_journal.close_ttl_expired(db, stale_run_ids)
     return len(stale_run_ids)
+
+
+async def _maybe_prune_dispatch_journal(app, db: AsyncSession) -> None:
+    """Apply the sandbox_dispatches retention at most once an hour."""
+    retention_days = int(settings.sandbox_dispatch_retention_days)
+    if retention_days <= 0:
+        return
+    now_monotonic = time.monotonic()
+    last_pruned_at = getattr(app.state, "sandbox_dispatch_journal_pruned_at", None)
+    if last_pruned_at is not None and now_monotonic - last_pruned_at < _DISPATCH_JOURNAL_PRUNE_INTERVAL_SECONDS:
+        return
+    app.state.sandbox_dispatch_journal_pruned_at = now_monotonic
+    deleted = await dispatch_journal.prune(db, retention_days=retention_days)
+    if deleted:
+        logger.info(
+            "sandbox_dispatch_journal_pruned",
+            extra={"deleted_rows": deleted, "retention_days": retention_days},
+        )
 
 
 async def _get_active_competitions(db: AsyncSession, now: datetime) -> list[tuple[int, datetime]]:
@@ -1924,7 +1947,7 @@ async def _dispatch_due_runs(
 
         async def _dispatch_one(
             prepared: tuple[dict, int, str, str | None, str | None],
-        ) -> tuple[dict, int, bool, str | None, bool]:
+        ) -> tuple[dict, int, bool, str | None, bool, list[DispatchAttempt]]:
             row, run_id, script_presigned_url, trajectory_presigned_url, compression_logs_presigned_url = prepared
             try:
                 run_benchmark_type = str(
@@ -1938,7 +1961,7 @@ async def _dispatch_due_runs(
                     row.get("benchmark_name"),
                     screener_stage=_coerce_optional_int(row.get("screener_stage")),
                 )
-                ok, error, retryable = await manager.dispatch_swebench_run(
+                result = await manager.dispatch_swebench_run(
                     run_id=run_id,
                     benchmark=run_benchmark,
                     instance_id=str(row["instance_id"]),
@@ -1960,17 +1983,35 @@ async def _dispatch_due_runs(
                         "agent_name": settings.harness_agent_name,
                     },
                 )
-                return row, run_id, bool(ok), error, bool(retryable)
+                return (
+                    row,
+                    run_id,
+                    bool(result.ok),
+                    result.error,
+                    bool(result.retryable),
+                    list(result.attempts),
+                )
             except Exception as exc:
-                return row, run_id, False, f"Dispatch exception: {exc}", True
+                return row, run_id, False, f"Dispatch exception: {exc}", True, []
 
-        dispatch_results: list[tuple[dict, int, bool, str | None, bool]] = []
+        dispatch_results: list[tuple[dict, int, bool, str | None, bool, list[DispatchAttempt]]] = []
         if prepared_dispatches:
             dispatch_results = list(
                 await asyncio.gather(*(_dispatch_one(prepared) for prepared in prepared_dispatches))
             )
 
-        for row, run_id, ok, error, retryable in dispatch_results:
+        # Journal every sandbox attempt before this transaction commits: the runs stay
+        # row-locked until then, so a result callback cannot outrun its journal row.
+        await dispatch_journal.record_dispatch_attempts(
+            db,
+            [
+                journal_row
+                for row, run_id, _ok, _error, _retryable, attempts in dispatch_results
+                for journal_row in dispatch_journal.attempt_rows({**row, "run_id": run_id}, attempts)
+            ],
+        )
+
+        for row, run_id, ok, error, retryable, _attempts in dispatch_results:
             if ok:
                 await db.execute(
                     text(

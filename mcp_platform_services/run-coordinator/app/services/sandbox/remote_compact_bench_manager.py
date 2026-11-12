@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import random
+import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from soma_shared.contracts.sandbox.v1.messages import (
 )
 
 from app.core.logging import get_logger
+from app.services.sandbox.dispatch_journal import DispatchAttempt
 logger = get_logger(__name__)
 _SWEBENCH_OPENCLAW_TIMEOUT_FALLBACK_SECONDS = 1800
 _CAPACITY_ERROR = (
@@ -47,6 +50,41 @@ def _append_dispatch_metadata(record: dict[str, Any]) -> Path:
     finally:
         os.close(fd)
     return output_path
+
+
+@dataclass(frozen=True)
+class DispatchResult:
+    """Outcome of delivering one run, with every sandbox attempt made for it."""
+
+    ok: bool
+    error: str | None
+    retryable: bool
+    attempts: list[DispatchAttempt] = field(default_factory=list)
+
+
+def _attempt_outcome_for_error(exc: Exception) -> str:
+    # A request that timed out after it was sent may still have been accepted by the
+    # sandbox; one that never connected cannot have been.
+    if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+        return "error"
+    if isinstance(exc, httpx.TimeoutException):
+        return "ack_timeout"
+    return "error"
+
+
+def _response_identity(body: object) -> tuple[str | None, str | None]:
+    """(sandbox_id, dispatch_id) a sandbox reported in its acknowledgement, if any.
+
+    Read from the raw body so they are picked up even under a soma_shared version
+    whose response model predates these fields.
+    """
+    if not isinstance(body, dict):
+        return None, None
+    values = []
+    for key in ("sandbox_id", "dispatch_id"):
+        value = body.get(key)
+        values.append(value.strip() or None if isinstance(value, str) else None)
+    return values[0], values[1]
 
 
 class RemoteCompactBenchManager:
@@ -110,6 +148,8 @@ class RemoteCompactBenchManager:
         outcome: str,
         http_status: int | None = None,
         error: str | None = None,
+        dispatch_id: str | None = None,
+        sandbox_id: str | None = None,
     ) -> None:
         try:
             await asyncio.to_thread(
@@ -119,6 +159,8 @@ class RemoteCompactBenchManager:
                     "instance_id": instance_id,
                     "benchmark_type": benchmark_type,
                     "sandbox_url": sandbox_url,
+                    "sandbox_id": sandbox_id,
+                    "dispatch_id": dispatch_id,
                     "attempt_index": attempt_index,
                     "candidate_count": candidate_count,
                     "outcome": outcome,
@@ -202,7 +244,15 @@ class RemoteCompactBenchManager:
         client: httpx.AsyncClient,
         payload: CompactBenchRunTaskRequest,
         timeout: float,
+        attempts: list[DispatchAttempt],
     ) -> CompactBenchRunTaskResponse:
+        """Deliver the run to the first sandbox that takes it.
+
+        Every URL tried gets its own dispatch id, so two sandboxes that both started the
+        run (an acknowledgement timed out, then a fallback accepted) stay distinguishable.
+        Each attempt is appended to ``attempts`` (capacity rejections excepted), also
+        when this method raises.
+        """
         last_exc: Exception | None = None
         candidate_urls = self._pick_sandbox_urls()
         run_id = int(payload.run_id)
@@ -220,8 +270,13 @@ class RemoteCompactBenchManager:
                 "attempt_no": metadata.get("attempt_no"),
             },
         )
+        request_body = payload.model_dump(mode="json")
 
         for index, sandbox_url in enumerate(candidate_urls):
+            # Set on the JSON body rather than the model, so it is sent even under a
+            # soma_shared version whose request model predates the field.
+            dispatch_id = uuid.uuid4().hex
+            attempted_at = datetime.now(UTC)
             try:
                 logger.debug(
                     "compact_bench_dispatch_attempt",
@@ -230,39 +285,47 @@ class RemoteCompactBenchManager:
                         "instance_id": payload.instance_id,
                         "benchmark_type": payload.benchmark_type,
                         "sandbox_url": sandbox_url,
+                        "dispatch_id": dispatch_id,
                         "attempt_index": index + 1,
                         "candidate_count": len(candidate_urls),
                     },
                 )
                 response = await client.post(
                     f"{sandbox_url}/run_compact_bench_task",
-                    json=payload.model_dump(mode="json"),
+                    json={**request_body, "dispatch_id": dispatch_id},
                     timeout=timeout,
                 )
                 response.raise_for_status()
-                dispatch_response = CompactBenchRunTaskResponse.model_validate(response.json())
-                if dispatch_response.success:
-                    await self._record_dispatch_attempt(
-                        run_id=run_id,
-                        instance_id=payload.instance_id,
-                        benchmark_type=payload.benchmark_type,
+                response_body = response.json()
+                dispatch_response = CompactBenchRunTaskResponse.model_validate(response_body)
+                sandbox_id, executing_dispatch_id = _response_identity(response_body)
+                # A sandbox already running this run keeps its earlier dispatch and says
+                # so; its result callback will carry that id, not the one just sent.
+                effective_dispatch_id = executing_dispatch_id or dispatch_id
+                outcome = "accepted" if dispatch_response.success else "rejected"
+                attempts.append(
+                    DispatchAttempt(
+                        dispatch_id=effective_dispatch_id,
                         sandbox_url=sandbox_url,
                         attempt_index=index + 1,
-                        candidate_count=len(candidate_urls),
-                        outcome="accepted",
+                        outcome=outcome,
+                        attempted_at=attempted_at,
                         http_status=response.status_code,
+                        sandbox_id=sandbox_id,
                     )
-                else:
-                    await self._record_dispatch_attempt(
-                        run_id=run_id,
-                        instance_id=payload.instance_id,
-                        benchmark_type=payload.benchmark_type,
-                        sandbox_url=sandbox_url,
-                        attempt_index=index + 1,
-                        candidate_count=len(candidate_urls),
-                        outcome="rejected",
-                        http_status=response.status_code,
-                    )
+                )
+                await self._record_dispatch_attempt(
+                    run_id=run_id,
+                    instance_id=payload.instance_id,
+                    benchmark_type=payload.benchmark_type,
+                    sandbox_url=sandbox_url,
+                    attempt_index=index + 1,
+                    candidate_count=len(candidate_urls),
+                    outcome=outcome,
+                    http_status=response.status_code,
+                    dispatch_id=effective_dispatch_id,
+                    sandbox_id=sandbox_id,
+                )
                 logger.debug(
                     "compact_bench_dispatch_accepted",
                     extra={
@@ -270,6 +333,8 @@ class RemoteCompactBenchManager:
                         "instance_id": payload.instance_id,
                         "benchmark_type": payload.benchmark_type,
                         "sandbox_url": sandbox_url,
+                        "sandbox_id": sandbox_id,
+                        "dispatch_id": effective_dispatch_id,
                         "attempt_index": index + 1,
                         "candidate_count": len(candidate_urls),
                     },
@@ -281,6 +346,19 @@ class RemoteCompactBenchManager:
                 has_fallback = index < len(candidate_urls) - 1
                 if error != _CAPACITY_ERROR:
                     response = getattr(exc, "response", None)
+                    http_status = getattr(response, "status_code", None)
+                    outcome = _attempt_outcome_for_error(exc)
+                    attempts.append(
+                        DispatchAttempt(
+                            dispatch_id=dispatch_id,
+                            sandbox_url=sandbox_url,
+                            attempt_index=index + 1,
+                            outcome=outcome,
+                            attempted_at=attempted_at,
+                            http_status=http_status,
+                            error=error,
+                        )
+                    )
                     await self._record_dispatch_attempt(
                         run_id=run_id,
                         instance_id=payload.instance_id,
@@ -288,9 +366,10 @@ class RemoteCompactBenchManager:
                         sandbox_url=sandbox_url,
                         attempt_index=index + 1,
                         candidate_count=len(candidate_urls),
-                        outcome="error",
-                        http_status=getattr(response, "status_code", None),
+                        outcome=outcome,
+                        http_status=http_status,
                         error=error,
+                        dispatch_id=dispatch_id,
                     )
                 log_fn = logger.debug if retryable else logger.warning
                 log_fn(
@@ -300,6 +379,7 @@ class RemoteCompactBenchManager:
                         "instance_id": payload.instance_id,
                         "benchmark_type": payload.benchmark_type,
                         "sandbox_url": sandbox_url,
+                        "dispatch_id": dispatch_id,
                         "attempt_index": index + 1,
                         "candidate_count": len(candidate_urls),
                         "retryable": retryable,
@@ -337,7 +417,7 @@ class RemoteCompactBenchManager:
         trajectory_presigned_url: str | None = None,
         compression_logs_presigned_url: str | None = None,
         task_context: dict[str, Any] | None = None,
-    ) -> tuple[bool, str | None, bool]:
+    ) -> DispatchResult:
         context = dict(task_context or {})
         context.setdefault("benchmark", benchmark)
         context.setdefault("instance_id", instance_id)
@@ -354,20 +434,22 @@ class RemoteCompactBenchManager:
             challenge_text="",
         )
         timeout = max(1.0, float(self._submission_timeout_seconds))
+        attempts: list[DispatchAttempt] = []
         async with httpx.AsyncClient() as client:
             try:
                 dispatch_result = await self._dispatch_task(
                     client=client,
                     payload=payload,
                     timeout=timeout,
+                    attempts=attempts,
                 )
             except Exception as exc:
                 error, retryable = self._format_dispatch_error(exc)
-                return False, error, retryable
+                return DispatchResult(False, error, retryable, attempts)
 
         if dispatch_result.success:
-            return True, None, False
-        return False, "Compact-bench service rejected task dispatch", False
+            return DispatchResult(True, None, False, attempts)
+        return DispatchResult(False, "Compact-bench service rejected task dispatch", False, attempts)
 
     def shutdown(self) -> None:
         logger.info("[RemoteCompactBench] Shutdown complete")

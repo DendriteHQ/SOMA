@@ -439,6 +439,11 @@ class Settings(BaseSettings):
         default=3600,
         alias="SWEBENCH_DISPATCHED_TTL_SECONDS",
     )
+    # Days to keep sandbox_dispatches rows (the per-sandbox work journal); 0 keeps them.
+    sandbox_dispatch_retention_days: int = Field(
+        default=30,
+        alias="SANDBOX_DISPATCH_RETENTION_DAYS",
+    )
     harness_agent_name: str = Field(
         default="claude_code",
         alias="HARNESS_AGENT_NAME",

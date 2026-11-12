@@ -161,13 +161,16 @@ class RunSupervisor:
 
     # ── accepting a run ──────────────────────────────────────────────────────
 
-    def accept(self, request: CompactBenchRunTaskRequest) -> bool:
-        """Reserve a slot and persist the request; False if the run is already here."""
+    def accept(self, request: CompactBenchRunTaskRequest) -> str | None:
+        """Reserve a slot and persist the request; returns the run's dispatch id.
+
+        None if the run is already here (see `active_dispatch_id`).
+        """
         run_id = request.run_id
         if run_id in self.slots:
-            return False
+            return None
         plain_env, sensitive_env = runner_env()
-        run_io.write_request(
+        dispatch_id = run_io.write_request(
             io_dir=settings.run_io_dir(run_id),
             secrets_dir=settings.run_secrets_dir(run_id),
             request=request,
@@ -175,7 +178,14 @@ class RunSupervisor:
         )
         self.slots[run_id] = RunSlot(run_id=run_id, phase="launching")
         self._spawn(self._launch(request, plain_env))
-        return True
+        return dispatch_id
+
+    @staticmethod
+    def active_dispatch_id(run_id: int) -> str | None:
+        """Dispatch id of a run already on this host, as its report will carry it."""
+        return run_io.reportable_dispatch_id(
+            run_io.read_dispatch_id(settings.run_io_dir(run_id), run_id=run_id)
+        )
 
     def _spawn(self, coroutine) -> None:
         task = asyncio.create_task(coroutine)

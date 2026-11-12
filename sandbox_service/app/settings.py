@@ -24,6 +24,17 @@ DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO = "dendritexhq/soma-competition-tasks-dind"
 DEFAULT_SWEBENCH_DIND_PREBAKED_REPO = "dendritehq/soma-swebench-dind"
 
 
+def sandbox_instance_id() -> str | None:
+    """Stable identity of this sandbox host, reported to the platform with every run.
+
+    Set by the deployment (e.g. the EC2 instance id or the inventory host name). Not
+    derived from the hostname: inside the API container that is the container id,
+    which changes with every redeploy. None when unset; the platform then falls back
+    to the URL it dispatched to.
+    """
+    return (os.getenv("SANDBOX_INSTANCE_ID") or "").strip() or None
+
+
 def debug_preserve_outputs() -> bool:
     """Keep each run's work dir after teardown, for inspecting a failed run by hand."""
     raw = os.getenv("COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS") or ""
