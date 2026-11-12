@@ -29,7 +29,7 @@ from soma_shared.contracts.sandbox.v1.messages import (
 )
 
 import volume_janitor
-from app import settings
+from app import run_io, settings
 from app.callback_queue import CallbackQueue
 from app.compact_bench_executor import SUPPORTED_AGENTS, unsupported_agent_message
 from app.run_supervisor import RunSupervisor
@@ -201,14 +201,19 @@ async def startup() -> None:
     app.state.volume_sweep_task = asyncio.create_task(_legacy_volume_sweep_loop())
 
     logger.info(
-        "Sandbox initialized: max_concurrent=%d callback_queue=%s cooldown_seconds=%.2f "
+        "Sandbox initialized: sandbox_id=%s max_concurrent=%d callback_queue=%s cooldown_seconds=%.2f "
         "runner_image=%s legacy_volume_sweep=%s",
+        settings.sandbox_instance_id(),
         app.state.max_concurrent,
         settings.callback_queue_path(),
         _get_capacity_cooldown_seconds(),
         _get_runner_image(),
         _volume_sweep_mode(),
     )
+    if settings.sandbox_instance_id() is None:
+        logger.warning(
+            "SANDBOX_INSTANCE_ID is not set: the platform can identify this sandbox only by its URL"
+        )
 
 
 @app.on_event("shutdown")
@@ -387,6 +392,13 @@ async def _drain_due_callbacks(*, limit: int) -> None:
 
 
 async def _enqueue_callback(report: CompactBenchReportRequest, dispatch_id: str) -> None:
+    # Tell the platform which dispatch (and host) this result is for; the stand-in id
+    # of a run dir that lost its dispatch file stays local.
+    report = _with_identity(
+        report,
+        dispatch_id=run_io.reportable_dispatch_id(dispatch_id),
+        sandbox_id=settings.sandbox_instance_id(),
+    )
     logger.info(
         "Compact-bench execution finished: run_id=%s ok_status=%s patch_capture_status=%s "
         "trajectory_upload_status=%s compression_logs_upload_status=%s error=%s execution_time_seconds=%s",
@@ -423,6 +435,21 @@ async def _callback_retry_loop() -> None:
         await asyncio.sleep(_get_callback_retry_poll_seconds())
 
 
+def _with_identity(model, **identity: str | None):
+    """Copy of a contract model with the identity fields its soma_shared version knows."""
+    fields = type(model).model_fields
+    update = {name: value for name, value in identity.items() if name in fields}
+    return model.model_copy(update=update) if update else model
+
+
+def _acknowledgement(dispatch_id: str | None) -> CompactBenchRunTaskResponse:
+    return _with_identity(
+        CompactBenchRunTaskResponse(success=True),
+        sandbox_id=settings.sandbox_instance_id(),
+        dispatch_id=dispatch_id,
+    )
+
+
 @app.post("/run_compact_bench_task", response_model=CompactBenchRunTaskResponse)
 async def run_compact_bench_task(
     request: CompactBenchRunTaskRequest,
@@ -436,25 +463,33 @@ async def run_compact_bench_task(
         raise HTTPException(status_code=503, detail="Sandbox is draining and accepts no new runs.")
     supervisor = _get_supervisor()
     if request.run_id in supervisor.slots:
-        # The platform retried a dispatch that already landed; one run, one report.
-        logger.warning("Duplicate dispatch for an active run ignored: run_id=%s", request.run_id)
-        return CompactBenchRunTaskResponse(success=True)
+        # The platform retried a dispatch that already landed; one run, one report. Tell
+        # it which dispatch keeps running, since that is the id the report will carry.
+        active_dispatch_id = supervisor.active_dispatch_id(request.run_id)
+        logger.warning(
+            "Duplicate dispatch for an active run ignored: run_id=%s dispatch_id=%s active_dispatch_id=%s",
+            request.run_id,
+            getattr(request, "dispatch_id", None),
+            active_dispatch_id,
+        )
+        return _acknowledgement(active_dispatch_id)
     # The capacity check and the reservation in accept() must not be separated by an await.
     _check_capacity(operation_kind="Compact-bench", operation_id=str(request.run_id))
     rejected_by_run_id: dict[int, int] = app.state.rejected_by_run_id
     previous_rejects = rejected_by_run_id.pop(request.run_id, 0)
     if previous_rejects > 0:
         app.state.accepted_after_reject += 1
-    supervisor.accept(request)
+    dispatch_id = supervisor.accept(request)
     logger.info(
-        "Accepted compact-bench task: run_id=%s benchmark=%s instance_id=%s previous_rejects=%s accepted_after_reject=%s",
+        "Accepted compact-bench task: run_id=%s dispatch_id=%s benchmark=%s instance_id=%s previous_rejects=%s accepted_after_reject=%s",
         request.run_id,
+        dispatch_id,
         request.benchmark,
         request.instance_id,
         previous_rejects,
         app.state.accepted_after_reject,
     )
-    return CompactBenchRunTaskResponse(success=True)
+    return _acknowledgement(dispatch_id)
 
 
 class DrainRequest(BaseModel):
@@ -474,9 +509,9 @@ async def drain(body: DrainRequest) -> dict[str, Any]:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health() -> dict[str, str | None]:
     """Health check endpoint."""
-    return {"status": "healthy", "service": "sandbox"}
+    return {"status": "healthy", "service": "sandbox", "sandbox_id": settings.sandbox_instance_id()}
 
 
 @app.get("/health/swebench")
@@ -485,6 +520,7 @@ async def health_swebench() -> dict[str, Any]:
     supervisor = _get_supervisor()
     return {
         "status": "ok",
+        "sandbox_id": settings.sandbox_instance_id(),
         "draining": app.state.draining,
         "max_concurrent": app.state.max_concurrent,
         "active_runs": {
