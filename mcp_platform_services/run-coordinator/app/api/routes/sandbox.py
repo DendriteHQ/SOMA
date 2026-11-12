@@ -16,6 +16,7 @@ from app.api.routes.utils import _require_private_network
 from app.core.logging import get_logger
 from app.services.blob.patch_artifact_storage import PatchArtifactStorage
 from app.services.blob.s3 import S3BlobStorage
+from app.services.sandbox import dispatch_journal
 
 
 logger = get_logger(__name__)
@@ -108,6 +109,24 @@ def _jev_usage_from_report(payload: CompactBenchReportRequest) -> dict[str, obje
     return {"jev_calls": calls, "jev_input_tokens": input_tokens, "jev_cost_usd": cost}
 
 
+async def _journal_unapplied_report(
+    db: AsyncSession,
+    *,
+    payload: CompactBenchReportRequest,
+    run: SweBenchRun | None,
+) -> None:
+    """Journal a callback that does not change its run, and end the transaction."""
+    await dispatch_journal.record_report(
+        db,
+        payload=payload,
+        report_ok=bool(payload.ok_status and payload.patch_capture_status),
+        error=_extract_compact_bench_error(payload),
+        applied=False,
+        run=run,
+    )
+    await db.commit()
+
+
 async def _persist_compact_bench_report(
     db: AsyncSession,
     *,
@@ -126,8 +145,13 @@ async def _persist_compact_bench_report(
             "compact_bench_report_run_missing",
             extra={
                 "run_id": payload.run_id,
+                "dispatch_id": getattr(payload, "dispatch_id", None),
+                "sandbox_id": getattr(payload, "sandbox_id", None),
             },
         )
+        # The run is gone (e.g. deleted by the auto-run-restarter) but the sandbox
+        # still did the work: keep it in the per-sandbox journal.
+        await _journal_unapplied_report(db, payload=payload, run=None)
         # Acknowledge orphaned callbacks to avoid endless retries in sandbox
         # after data resets / test cleanups on platform side.
         return True
@@ -138,8 +162,13 @@ async def _persist_compact_bench_report(
     if run.status in {"completed", "failed"}:
         logger.info(
             "compact_bench_report_duplicate_ignored",
-            extra={"run_id": payload.run_id, "status": run.status},
+            extra={
+                "run_id": payload.run_id,
+                "status": run.status,
+                "dispatch_id": getattr(payload, "dispatch_id", None),
+            },
         )
+        await _journal_unapplied_report(db, payload=payload, run=run)
         return True
 
     logger.debug(
@@ -300,6 +329,14 @@ async def _persist_compact_bench_report(
             {"status": desired_status, "run_id": int(payload.run_id)},
         )
 
+    await dispatch_journal.record_report(
+        db,
+        payload=payload,
+        report_ok=desired_status == "completed",
+        error=resolved_last_error,
+        applied=True,
+        run=run,
+    )
     await db.commit()
     logger.debug(
         "compact_bench_report_persisted",
