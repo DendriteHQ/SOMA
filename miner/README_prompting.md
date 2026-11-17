@@ -310,10 +310,6 @@ they are not part of the context it receives to edit.
 
 ## Questions And Clarifications
 
-The compliance review method (manual, automated, or both) and the stage at which
-it is performed are not specified here. This document also does not establish
-a policy on loop guards.
-
 Miners with questions or uncertainty about these rules may contact team
 members on the discord channel, who can help determine whether a proposed method complies with this
 document.
