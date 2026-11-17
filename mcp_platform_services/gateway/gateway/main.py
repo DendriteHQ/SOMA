@@ -1018,10 +1018,19 @@ async def proxy_openai_compatible(
         # Anthropic Messages (Claude Code): effort lives in output_config, and it
         # overrides whatever the agent asked for.
         output_config = parsed.get("output_config")
+        original_output_config = output_config
         output_config = dict(output_config) if isinstance(output_config, dict) else {}
         output_config["effort"] = reasoning_effort
         parsed["output_config"] = output_config
         body_bytes = json.dumps(parsed).encode()
+        logger.info(
+            "gateway_reasoning_forced run_id=%s path=messages model=%s effort=%s original_output_config=%s original_thinking=%s",
+            run_id,
+            parsed.get("model"),
+            reasoning_effort,
+            original_output_config,
+            parsed.get("thinking"),
+        )
     elif (
         reasoning_model
         and reasoning_effort
@@ -1031,6 +1040,8 @@ async def proxy_openai_compatible(
         and parsed.get("model") == reasoning_model
     ):
         reasoning = parsed.get("reasoning")
+        original_reasoning = reasoning
+        original_reasoning_effort = parsed.get("reasoning_effort")
         reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
         reasoning.pop("max_tokens", None)
         reasoning.pop("enabled", None)
@@ -1038,6 +1049,14 @@ async def proxy_openai_compatible(
         parsed["reasoning"] = reasoning
         parsed.pop("reasoning_effort", None)
         body_bytes = json.dumps(parsed).encode()
+        logger.info(
+            "gateway_reasoning_forced run_id=%s model=%s effort=%s original_reasoning=%s original_reasoning_effort=%s",
+            run_id,
+            reasoning_model,
+            reasoning_effort,
+            original_reasoning,
+            original_reasoning_effort,
+        )
 
     invalid_assistant_message_index = _find_invalid_assistant_message_index(parsed)
     if invalid_assistant_message_index is not None:

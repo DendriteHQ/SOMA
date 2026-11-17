@@ -71,7 +71,8 @@ router = APIRouter(tags=["validator"])
 
 _VALIDATION_PREFETCH_BATCH_SIZE = 400
 _VALIDATION_PREFETCH_REFILL_THRESHOLD = 100
-_VALIDATION_PREFETCH_CACHE_TTL_SECONDS = 30.0
+_VALIDATION_PREFETCH_PARTIAL_REFILL_COOLDOWN_SECONDS = 600.0
+_VALIDATION_PREFETCH_EMPTY_REFILL_COOLDOWN_SECONDS = 600.0
 _VALIDATION_FETCH_MAX_ATTEMPTS = 50
 _VALIDATION_STAGE_PRIORITY: tuple[int | None, ...] = (1, 2, None)
 _ANY_STAGE = object()
@@ -87,17 +88,10 @@ class _ValidationPrefetchCache:
         self._lock = asyncio.Lock()
         self._queue: deque[_ValidationPrefetchCandidate] = deque()
         self._queued_ids: set[int] = set()
-        self._fetched_at: datetime | None = None
+        self._refill_blocked_until: datetime | None = None
 
-    def _clear_unlocked(self) -> None:
-        self._queue.clear()
-        self._queued_ids.clear()
-        self._fetched_at = None
-
-    def _is_stale_unlocked(self, *, now: datetime) -> bool:
-        if self._fetched_at is None:
-            return False
-        return (now - self._fetched_at).total_seconds() >= _VALIDATION_PREFETCH_CACHE_TTL_SECONDS
+    def _refill_blocked_unlocked(self, *, now: datetime) -> bool:
+        return self._refill_blocked_until is not None and now < self._refill_blocked_until
 
     async def _refill_unlocked(
         self,
@@ -108,6 +102,8 @@ class _ValidationPrefetchCache:
         completed_condition,
         request_id: str | None,
     ) -> None:
+        if self._refill_blocked_unlocked(now=now):
+            return
         query_started_at = time.perf_counter()
         rows = []
         for stage in _VALIDATION_STAGE_PRIORITY:
@@ -132,18 +128,34 @@ class _ValidationPrefetchCache:
             self._queue.append(_ValidationPrefetchCandidate(validation_id=validation_id))
             self._queued_ids.add(validation_id)
             added += 1
-        self._fetched_at = now
-        if added or rows:
-            logger.info(
-                "get_swebench_validation_prefetch_refill",
-                extra={
-                    "request_id": request_id,
-                    "fetched_rows": len(rows),
-                    "added_rows": added,
-                    "queue_size": len(self._queue),
-                    "query_seconds": round(query_seconds, 4),
-                },
+        if not rows:
+            self._refill_blocked_until = now + timedelta(
+                seconds=_VALIDATION_PREFETCH_EMPTY_REFILL_COOLDOWN_SECONDS
             )
+        elif len(rows) < _VALIDATION_PREFETCH_BATCH_SIZE:
+            self._refill_blocked_until = now + timedelta(
+                seconds=_VALIDATION_PREFETCH_PARTIAL_REFILL_COOLDOWN_SECONDS
+            )
+        logger.info(
+            "get_swebench_validation_prefetch_refill",
+            extra={
+                "request_id": request_id,
+                "fetched_rows": len(rows),
+                "added_rows": added,
+                "queue_size": len(self._queue),
+                "query_seconds": round(query_seconds, 4),
+                "refill_blocked_until": (
+                    self._refill_blocked_until.isoformat()
+                    if self._refill_blocked_unlocked(now=now)
+                    else None
+                ),
+            },
+        )
+
+    def _pop_unlocked(self) -> _ValidationPrefetchCandidate:
+        candidate = self._queue.popleft()
+        self._queued_ids.discard(candidate.validation_id)
+        return candidate
 
     async def pop(
         self,
@@ -154,9 +166,9 @@ class _ValidationPrefetchCache:
         completed_condition,
         request_id: str | None,
     ) -> _ValidationPrefetchCandidate | None:
+        if self._queue:
+            return self._pop_unlocked()
         async with self._lock:
-            if self._is_stale_unlocked(now=now):
-                self._clear_unlocked()
             if not self._queue:
                 await self._refill_unlocked(
                     db,
@@ -167,17 +179,33 @@ class _ValidationPrefetchCache:
                 )
             if not self._queue:
                 return None
-            candidate = self._queue.popleft()
-            self._queued_ids.discard(candidate.validation_id)
-            if len(self._queue) < _VALIDATION_PREFETCH_REFILL_THRESHOLD:
-                await self._refill_unlocked(
-                    db,
-                    now=now,
-                    claim_ttl_seconds=claim_ttl_seconds,
-                    completed_condition=completed_condition,
-                    request_id=request_id,
-                )
-            return candidate
+            return self._pop_unlocked()
+
+    async def refill_if_low(
+        self,
+        db: AsyncSession,
+        *,
+        now: datetime,
+        claim_ttl_seconds: int,
+        completed_condition,
+        request_id: str | None,
+    ) -> None:
+        if (
+            len(self._queue) >= _VALIDATION_PREFETCH_REFILL_THRESHOLD
+            or self._refill_blocked_unlocked(now=now)
+            or self._lock.locked()
+        ):
+            return
+        async with self._lock:
+            if len(self._queue) >= _VALIDATION_PREFETCH_REFILL_THRESHOLD:
+                return
+            await self._refill_unlocked(
+                db,
+                now=now,
+                claim_ttl_seconds=claim_ttl_seconds,
+                completed_condition=completed_condition,
+                request_id=request_id,
+            )
 
 
 _validation_prefetch_cache = _ValidationPrefetchCache()
@@ -1180,6 +1208,16 @@ async def get_swebench_validation(
         claim_started_at = time.perf_counter()
         await db.commit()
         claim_seconds += time.perf_counter() - claim_started_at
+
+        prefetch_started_at = time.perf_counter()
+        await _validation_prefetch_cache.refill_if_low(
+            db,
+            now=now,
+            claim_ttl_seconds=claim_ttl_seconds,
+            completed_condition=completed_condition,
+            request_id=request_id,
+        )
+        prefetch_seconds += time.perf_counter() - prefetch_started_at
 
         run_status = str(getattr(run_row, "status", "") or "").lower()
         if run_status == "failed":

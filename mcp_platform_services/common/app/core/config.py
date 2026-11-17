@@ -235,6 +235,10 @@ class Settings(BaseSettings):
         default_factory=list,
         alias="COMPACT_BENCH_SERVICE_URLS",
     )
+    compact_bench_max_connections: int = Field(
+        default=100,
+        alias="COMPACT_BENCH_MAX_CONNECTIONS",
+    )
     swebench_benchmark_name: str = Field(
         default="SWE-bench/SWE-bench_Verified",
         alias="SWEBENCH_BENCHMARK_NAME",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 from dataclasses import dataclass
@@ -200,6 +201,28 @@ def _has_steps(candidate: RestartCandidate) -> bool:
     return (candidate.agent_steps or 0) > 0
 
 
+def _ilike_regex(pattern: str) -> re.Pattern[str]:
+    return re.compile(
+        ".*".join(re.escape(part) for part in pattern.strip("%").split("%")),
+        re.IGNORECASE | re.DOTALL,
+    )
+
+
+_CASE_INSENSITIVE_RESTART_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (_ilike_regex(pattern), reason)
+    for pattern, reason in (
+        ("%Too many open files%", "too_many_open_files"),
+        ("%NoneType%object has no attribute%read%", "nonetype_read_attribute_error"),
+        ("%Temporary failure in name resolution%", "dns_temporary_failure"),
+        ("%All connection attempts failed%", "all_connection_attempts_failed"),
+        ("%Connection reset by peer%", "connection_reset_by_peer"),
+        ("%utf-8%codec%decode byte%", "utf8_decode_error"),
+        ("%networks have overlapping IPv4%", "docker_network_overlap"),
+        ("%Command failed with exit code 1%", "command_failed_exit_code_1"),
+    )
+)
+
+
 def _classify_restart_reason(
     status: str,
     last_error: str,
@@ -296,6 +319,10 @@ def _classify_restart_reason(
     ):
         return "docker_cgroup_start_failure"
 
+    for pattern, reason in _CASE_INSENSITIVE_RESTART_PATTERNS:
+        if pattern.search(error):
+            return reason
+
     return None
 
 
@@ -382,6 +409,14 @@ _FETCH_CANDIDATE_ROWS_SQL = sa.text(
               r.last_error LIKE '%unable to apply cgroup configuration%'
               AND r.last_error LIKE '%Message recipient disconnected from message bus%'
           )
+          OR r.last_error ILIKE '%Too many open files%'
+          OR r.last_error ILIKE '%NoneType%object has no attribute%read%'
+          OR r.last_error ILIKE '%Temporary failure in name resolution%'
+          OR r.last_error ILIKE '%All connection attempts failed%'
+          OR r.last_error ILIKE '%Connection reset by peer%'
+          OR r.last_error ILIKE '%utf-8%codec%decode byte%'
+          OR r.last_error ILIKE '%networks have overlapping IPv4%'
+          OR r.last_error ILIKE '%Command failed with exit code 1%'
       )
       AND EXISTS (
           SELECT 1

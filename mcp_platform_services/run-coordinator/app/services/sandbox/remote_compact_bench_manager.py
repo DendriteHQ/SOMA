@@ -60,6 +60,7 @@ class RemoteCompactBenchManager:
         submission_timeout_seconds: float,
         default_model: str | None = None,
         sandbox_service_url: str | None = None,
+        max_connections: int = 100,
     ):
         urls = [str(u).strip().rstrip("/") for u in (sandbox_service_urls or []) if str(u).strip()]
         # Deprecated single-URL fallback: only used when no list was provided.
@@ -69,6 +70,23 @@ class RemoteCompactBenchManager:
         self._execution_timeout_seconds = execution_timeout_seconds
         self._submission_timeout_seconds = submission_timeout_seconds
         self._default_model = (default_model or "").strip() or None
+        self._max_connections = max(1, int(max_connections))
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_connections=self._max_connections,
+                    max_keepalive_connections=self._max_connections,
+                ),
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            await client.aclose()
 
     def resolve_openclaw_timeout_seconds(self, task_context: dict[str, Any] | None = None) -> int:
         """Effective execution timeout forwarded to the sandbox for a task.
@@ -237,7 +255,7 @@ class RemoteCompactBenchManager:
                 response = await client.post(
                     f"{sandbox_url}/run_compact_bench_task",
                     json=payload.model_dump(mode="json"),
-                    timeout=timeout,
+                    timeout=httpx.Timeout(timeout, pool=None),
                 )
                 response.raise_for_status()
                 dispatch_response = CompactBenchRunTaskResponse.model_validate(response.json())
@@ -354,16 +372,15 @@ class RemoteCompactBenchManager:
             challenge_text="",
         )
         timeout = max(1.0, float(self._submission_timeout_seconds))
-        async with httpx.AsyncClient() as client:
-            try:
-                dispatch_result = await self._dispatch_task(
-                    client=client,
-                    payload=payload,
-                    timeout=timeout,
-                )
-            except Exception as exc:
-                error, retryable = self._format_dispatch_error(exc)
-                return False, error, retryable
+        try:
+            dispatch_result = await self._dispatch_task(
+                client=self._get_client(),
+                payload=payload,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            error, retryable = self._format_dispatch_error(exc)
+            return False, error, retryable
 
         if dispatch_result.success:
             return True, None, False

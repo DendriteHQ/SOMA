@@ -179,14 +179,17 @@ def start_swebench_orchestrator_task(app) -> None:
 
 async def stop_swebench_orchestrator_task(app) -> None:
     task = getattr(app.state, "swebench_orchestrator_task", None)
-    if task is None:
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    logger.info("swebench_orchestrator_stopped")
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info("swebench_orchestrator_stopped")
+    manager = getattr(app.state, "swebench_compact_bench_manager", None)
+    if manager is not None:
+        app.state.swebench_compact_bench_manager = None
+        await manager.aclose()
 
 
 async def _run_orchestrator_loop(app, interval_seconds: float) -> None:
@@ -2242,6 +2245,7 @@ def _get_compact_bench_manager(app) -> RemoteCompactBenchManager:
             execution_timeout_seconds=settings.sandbox_timeout_per_task_seconds,
             submission_timeout_seconds=settings.sandbox_submission_timeout_seconds,
             default_model=settings.swebench_default_model,
+            max_connections=settings.compact_bench_max_connections,
         )
         app.state.swebench_compact_bench_manager = manager
     return manager
