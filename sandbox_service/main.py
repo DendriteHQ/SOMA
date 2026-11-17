@@ -29,7 +29,7 @@ from soma_shared.contracts.sandbox.v1.messages import (
 )
 
 import volume_janitor
-from app import run_io, settings
+from app import public_ip, run_io, settings
 from app.callback_queue import CallbackQueue
 from app.compact_bench_executor import SUPPORTED_AGENTS, unsupported_agent_message
 from app.run_supervisor import RunSupervisor
@@ -163,6 +163,32 @@ async def _legacy_volume_sweep_loop() -> None:
         await asyncio.sleep(volume_janitor.SWEEP_INTERVAL_SECONDS)
 
 
+_PUBLIC_IP_RETRY_SECONDS = 60.0
+
+
+async def _detect_sandbox_instance_id() -> bool:
+    """Name this host after its public IP unless SANDBOX_INSTANCE_ID is set; True once named."""
+    if settings.sandbox_instance_id() is not None:
+        return True
+    address = await public_ip.detect_public_ip()
+    if address is None:
+        return False
+    settings.remember_public_ip(address)
+    logger.info("Sandbox named after its public IP: sandbox_id=%s", address)
+    return True
+
+
+async def _public_ip_retry_loop() -> None:
+    """Keep looking up the public IP until it is known (the network may come up late)."""
+    while True:
+        await asyncio.sleep(_PUBLIC_IP_RETRY_SECONDS)
+        try:
+            if await _detect_sandbox_instance_id():
+                return
+        except Exception:
+            logger.exception("Public IP lookup failed")
+
+
 def _prepare_run(request: CompactBenchRunTaskRequest) -> None:
     """Make the run's task row resolvable before its runner starts (runs in a thread)."""
     app.state.task_rows.ensure(
@@ -191,6 +217,12 @@ async def startup() -> None:
     app.state.task_rows = SomaTaskRowCache()
     await asyncio.to_thread(app.state.task_rows.preload)
 
+    # Before the supervisor starts: runs it adopts may report right away, and each
+    # report carries the sandbox id it is queued with.
+    app.state.public_ip_retry_task = None
+    if not await _detect_sandbox_instance_id():
+        app.state.public_ip_retry_task = asyncio.create_task(_public_ip_retry_loop())
+
     app.state.supervisor = RunSupervisor(
         runner_image=_get_runner_image(),
         report_sink=_enqueue_callback,
@@ -212,7 +244,8 @@ async def startup() -> None:
     )
     if settings.sandbox_instance_id() is None:
         logger.warning(
-            "SANDBOX_INSTANCE_ID is not set: the platform can identify this sandbox only by its URL"
+            "SANDBOX_INSTANCE_ID is not set and the public IP lookup failed: the platform "
+            "can identify this sandbox only by its URL until a retry succeeds"
         )
 
 
@@ -222,7 +255,7 @@ async def shutdown() -> None:
     supervisor: RunSupervisor | None = getattr(app.state, "supervisor", None)
     if supervisor is not None:
         await supervisor.stop()
-    for name in ("callback_retry_task", "volume_sweep_task"):
+    for name in ("callback_retry_task", "volume_sweep_task", "public_ip_retry_task"):
         task: asyncio.Task[Any] | None = getattr(app.state, name, None)
         if task is None:
             continue
