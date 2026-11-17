@@ -21,7 +21,7 @@ from soma_shared.contracts.sandbox.v1.messages import (
 from app.core.logging import get_logger
 from app.services.sandbox.dispatch_journal import DispatchAttempt
 logger = get_logger(__name__)
-_SWEBENCH_OPENCLAW_TIMEOUT_FALLBACK_SECONDS = 1800
+_SWEBENCH_AGENT_TIMEOUT_FALLBACK_SECONDS = 1800
 _CAPACITY_ERROR = (
     "Platform is at capacity. The compact-bench service is currently handling the maximum "
     "number of concurrent requests. Please try again later."
@@ -126,7 +126,7 @@ class RemoteCompactBenchManager:
         if client is not None:
             await client.aclose()
 
-    def resolve_openclaw_timeout_seconds(self, task_context: dict[str, Any] | None = None) -> int:
+    def resolve_agent_timeout_seconds(self, task_context: dict[str, Any] | None = None) -> int:
         """Effective execution timeout forwarded to the sandbox for a task.
 
         Single source of truth: also used by the orchestrator to size the expiry
@@ -134,13 +134,13 @@ class RemoteCompactBenchManager:
         always stay in sync.
         """
         context = task_context or {}
-        if context.get("openclaw_timeout") is not None:
-            return int(context["openclaw_timeout"])
+        if context.get("agent_timeout") is not None:
+            return int(context["agent_timeout"])
         return int(
             max(
                 1.0,
                 float(self._execution_timeout_seconds),
-                float(_SWEBENCH_OPENCLAW_TIMEOUT_FALLBACK_SECONDS),
+                float(_SWEBENCH_AGENT_TIMEOUT_FALLBACK_SECONDS),
             )
         )
 
@@ -251,8 +251,7 @@ class RemoteCompactBenchManager:
             agent_name=str(task_context.get("agent_name") or "copilot").strip() or "copilot",
             benchmark_type=str(task_context.get("benchmark_type") or "swebench_verified").strip() or "swebench_verified",
             model=model,
-            openclaw_timeout=self.resolve_openclaw_timeout_seconds(task_context),
-            openclaw_disable_somarizer=bool(task_context.get("openclaw_disable_somarizer", False)),
+            agent_timeout=self.resolve_agent_timeout_seconds(task_context),
             metadata=metadata,
         )
 

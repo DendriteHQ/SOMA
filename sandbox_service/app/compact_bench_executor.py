@@ -373,7 +373,7 @@ class CompactBenchExecutor:
             task.run_id,
             miner_module_path,
         )
-        effective_timeout = task.openclaw_timeout
+        effective_timeout = task.agent_timeout
         agent_timeout = max(1.0, float(effective_timeout)) if effective_timeout is not None else None
         # soma_bench's harness enforces the agent timeout itself (via
         # SOMA_COPILOT_AGENT_TIMEOUT_SECONDS below) and needs extra time afterwards
@@ -633,7 +633,7 @@ class CompactBenchExecutor:
         # Read by the Copilot backend only; Claude Code uses its own compose file from the
         # soma_bench package (SOMA_CLAUDE_CODE_COMPOSE_FILE overrides it).
         env["SOMA_COPILOT_COMPOSE_FILE"] = str(self._copilot_compose_file)
-        env["SOMA_COPILOT_COMPRESSION_SCRIPT_PATH"] = str(miner_module_path)
+        env["SOMA_COMPRESSION_SCRIPT_PATH"] = str(miner_module_path)
         env["SOMA_COPILOT_SWE_EXEC_ASSETS_DIR"] = str(stage_swe_exec_assets())
         # Claude Code runs on an Anthropic model, so its Messages requests go to the
         # gateway (and OpenRouter's /v1/messages) unchanged. The proxy's Anthropic -> OpenAI
@@ -806,14 +806,12 @@ class CompactBenchExecutor:
             "--benchmark-type",
             task.benchmark_type,
             "--execute",
-            "--openclaw-run-id-header-value",
+            "--run-id-header-value",
             str(task.run_id),
-            "--openclaw-ignore-api-key",
+            "--ignore-api-key",
         ]
         if task.model:
             command.extend(["--model", task.model])
-        if task.openclaw_disable_somarizer:
-            command.append("--openclaw-disable-plugin")
         return command
 
     def _materialize_miner_module(self, *, output_dir: Path, script_presigned_url: str) -> Path:

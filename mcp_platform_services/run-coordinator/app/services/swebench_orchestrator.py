@@ -2098,7 +2098,7 @@ async def _resolve_run_artifact_presigned_url(
     # The sandbox uploads artifacts only after the run finishes, so the URL must
     # outlive the exact execution timeout the manager forwards to the sandbox,
     # plus headroom for the callback/upload itself.
-    expires_in = manager.resolve_openclaw_timeout_seconds() + 900
+    expires_in = manager.resolve_agent_timeout_seconds() + 900
     key = artifact_storage.build_key(str(artifact_uuid))
     try:
         return await s3_storage.generate_presigned_url(

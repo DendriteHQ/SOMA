@@ -193,11 +193,11 @@ class RunSupervisor:
         task.add_done_callback(self._tasks.discard)
 
     def _deadline_for(self, request: CompactBenchRunTaskRequest) -> float:
-        if request.openclaw_timeout is None:
+        if request.agent_timeout is None:
             return time.time() + self._max_runtime_seconds
         return (
             time.time()
-            + max(1.0, float(request.openclaw_timeout))
+            + max(1.0, float(request.agent_timeout))
             + get_agent_timeout_grace_seconds()
             + self._deadline_margin_seconds
         )
