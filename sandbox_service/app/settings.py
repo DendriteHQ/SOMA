@@ -24,6 +24,32 @@ DEFAULT_SOMA_TASK_DIND_PREBAKED_REPO = "dendritexhq/soma-competition-tasks-dind"
 DEFAULT_SWEBENCH_DIND_PREBAKED_REPO = "dendritehq/soma-swebench-dind"
 
 
+# This host's public IP, once the API has looked it up (see app.public_ip).
+_detected_public_ip: str | None = None
+
+
+def configured_sandbox_instance_id() -> str | None:
+    """SANDBOX_INSTANCE_ID as the deployment set it, if it did."""
+    return (os.getenv("SANDBOX_INSTANCE_ID") or "").strip() or None
+
+
+def remember_public_ip(address: str) -> None:
+    """Record the public IP the API detected; it names the host from then on."""
+    global _detected_public_ip
+    _detected_public_ip = address
+
+
+def sandbox_instance_id() -> str | None:
+    """Stable identity of this sandbox host, reported to the platform with every run.
+
+    SANDBOX_INSTANCE_ID when the deployment sets it, otherwise the host's public IP,
+    which the API looks up at startup. Not derived from the hostname: inside the API
+    container that is the container id, which changes with every redeploy. None until
+    either is known; the platform then falls back to the URL it dispatched to.
+    """
+    return configured_sandbox_instance_id() or _detected_public_ip
+
+
 def debug_preserve_outputs() -> bool:
     """Keep each run's work dir after teardown, for inspecting a failed run by hand."""
     raw = os.getenv("COMPACT_BENCH_DEBUG_PRESERVE_OUTPUTS") or ""

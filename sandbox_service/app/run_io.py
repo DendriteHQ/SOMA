@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -26,10 +27,16 @@ from soma_shared.contracts.sandbox.v1.messages import (
 REQUEST_FILE = "request.json"
 SECRETS_FILE = "secrets.json"
 RESULT_FILE = "result.json"
-# Identifies this dispatch of the run. The callback queue records which dispatches it
-# has queued a report for, so a report is queued exactly once across polls and API
-# restarts, while a later dispatch of the same run id still gets its own.
+# Identifies this dispatch of the run. The platform assigns it (and sees it again in
+# the acknowledgement and the result callback); older platforms send none and the API
+# makes one up. The callback queue records which dispatches it has queued a report
+# for, so a report is queued exactly once across polls and API restarts, while a later
+# dispatch of the same run id still gets its own.
 DISPATCH_FILE = "dispatch_id"
+# Suffix of the stand-in id for a run dir without a dispatch file; never sent onwards.
+_MISSING_DISPATCH_SUFFIX = "-without-dispatch-id"
+# What a platform-assigned id may look like; it ends up in a file and in a SQLite key.
+_DISPATCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Written by the API when it kills a runner past its deadline, so the fallback report
 # says why the runner exited.
 DEADLINE_MARKER = "deadline-exceeded"
@@ -73,7 +80,7 @@ def write_request(
 
     `runner_env` holds credentials to pass on to the runner.
     """
-    dispatch_id = uuid.uuid4().hex
+    dispatch_id = _platform_dispatch_id(request) or uuid.uuid4().hex
     payload = request.model_dump(mode="json")
     secrets: dict[str, Any] = {field: payload.pop(field, None) for field in SECRET_REQUEST_FIELDS}
     secrets["env"] = dict(runner_env)
@@ -85,13 +92,29 @@ def write_request(
     return dispatch_id
 
 
+def _platform_dispatch_id(request: CompactBenchRunTaskRequest) -> str | None:
+    """The dispatch id the platform assigned, if it sent a usable one."""
+    value = getattr(request, "dispatch_id", None)
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if _DISPATCH_ID_PATTERN.match(value) else None
+
+
 def read_dispatch_id(io_dir: Path, *, run_id: int) -> str:
     try:
         value = (io_dir / DISPATCH_FILE).read_text(encoding="utf-8").strip()
     except OSError:
         value = ""
     # A run dir without one (written by hand, or half-written) still reports once.
-    return value or f"run-{run_id}-without-dispatch-id"
+    return value or f"run-{run_id}{_MISSING_DISPATCH_SUFFIX}"
+
+
+def reportable_dispatch_id(dispatch_id: str | None) -> str | None:
+    """The dispatch id to tell the platform; None for the stand-in of a missing one."""
+    if not dispatch_id or dispatch_id.endswith(_MISSING_DISPATCH_SUFFIX):
+        return None
+    return dispatch_id
 
 
 def read_public_request(io_dir: Path) -> dict[str, Any] | None:
